@@ -5,7 +5,6 @@ use gst::prelude::*;
 use std::fmt;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 #[derive(Args, Clone, Debug)]
 pub struct SendArgs {
@@ -223,7 +222,7 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
             break Ok(());
         }
 
-        if let Some(message) = bus.timed_pop(Duration::from_millis(100).into()) {
+        if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
             use gst::MessageView;
             match message.view() {
                 MessageView::Eos(..) => break Ok(()),
@@ -231,6 +230,7 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
                     let src = error
                         .src()
                         .map(|src| src.path_string())
+                        .map(|src| src.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
                     let debug = error.debug().unwrap_or_else(|| "no debug info".into());
                     break Err(anyhow!(
@@ -242,6 +242,7 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
                     let src = warning
                         .src()
                         .map(|src| src.path_string())
+                        .map(|src| src.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
                     let debug = warning.debug().unwrap_or_else(|| "no debug info".into());
                     eprintln!(

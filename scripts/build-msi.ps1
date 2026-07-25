@@ -42,6 +42,9 @@ dotnet build $wixProject `
     -p:Platform=x64 `
     -p:ProductVersion=$ProductVersion `
     -p:AppExe=$exe
+if ($LASTEXITCODE -ne 0) {
+    throw "MSI build failed"
+}
 
 $msi = Get-ChildItem -Path (Join-Path $repo "installer") -Recurse -Filter "*.msi" |
     Sort-Object LastWriteTime -Descending |

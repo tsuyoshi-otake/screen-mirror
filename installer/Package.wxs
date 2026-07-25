@@ -1,0 +1,63 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Screen Mirror"
+    Manufacturer="tsuyoshi-otake"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="6f8ce011-86e3-42b5-891d-6b8f4d1814c1"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Screen Mirror is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Screen Mirror" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuScreenMirror" Name="Screen Mirror" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Screen Mirror" Level="1">
+      <ComponentGroupRef Id="AppComponents" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="AppComponents" Directory="INSTALLFOLDER">
+      <Component Id="ScreenMirrorExeComponent" Bitness="always64">
+        <File
+          Id="ScreenMirrorExe"
+          Source="$(var.AppExe)"
+          Name="screen-mirror.exe"
+          KeyPath="yes">
+          <Shortcut
+            Id="StartMenuShortcut"
+            Directory="ProgramMenuScreenMirror"
+            Name="Screen Mirror"
+            Arguments="tray"
+            WorkingDirectory="INSTALLFOLDER"
+            Advertise="yes" />
+        </File>
+      </Component>
+
+      <Component Id="ReadmeComponent" Bitness="always64">
+        <File
+          Id="ReadmeFile"
+          Source="$(var.ReadmeFile)"
+          Name="README.md"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenuFolderComponent" Directory="ProgramMenuScreenMirror" Bitness="always64">
+        <RemoveFolder Id="RemoveProgramMenuScreenMirror" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\ScreenMirror"
+          Name="StartMenuFolder"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

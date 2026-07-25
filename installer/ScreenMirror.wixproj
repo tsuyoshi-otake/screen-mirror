@@ -1,0 +1,12 @@
+<Project Sdk="WixToolset.Sdk/7.0.0">
+  <PropertyGroup>
+    <OutputName>ScreenMirror</OutputName>
+    <OutputType>Package</OutputType>
+    <Platforms>x64</Platforms>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.1.0</ProductVersion>
+    <AppExe Condition="'$(AppExe)' == ''">$(MSBuildThisFileDirectory)..\target\release\screen-mirror.exe</AppExe>
+    <ReadmeFile Condition="'$(ReadmeFile)' == ''">$(MSBuildThisFileDirectory)..\README.md</ReadmeFile>
+    <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);AppExe=$(AppExe);ReadmeFile=$(ReadmeFile)</DefineConstants>
+  </PropertyGroup>
+</Project>

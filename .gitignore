@@ -1,0 +1,7 @@
+/target/
+/installer/bin/
+/installer/obj/
+/apps/android/.gradle/
+/apps/android/app/build/
+*.msi
+*.apk

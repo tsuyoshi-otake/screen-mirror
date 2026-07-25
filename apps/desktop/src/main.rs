@@ -2,9 +2,11 @@
 
 mod autostart;
 mod config;
+mod console;
 mod control;
 mod lan;
 mod logging;
+mod monitors;
 mod pipeline;
 mod single_instance;
 mod tray_app;
@@ -35,6 +37,8 @@ enum Command {
     Probe,
     /// Discover receivers on the local network.
     Discover(DiscoverArgs),
+    /// List Windows displays and likely VDD/SuperDisplay-style virtual monitors.
+    Monitors,
     /// Print the generated GStreamer pipeline without running it.
     Print(PrintArgs),
     /// Run an explicit gst-launch-style pipeline.
@@ -73,6 +77,7 @@ fn main() -> Result<()> {
     let _instance_guard = if tray_mode {
         Some(single_instance::acquire_tray_instance()?)
     } else {
+        console::attach_for_cli();
         None
     };
 
@@ -100,14 +105,18 @@ fn main() -> Result<()> {
         Command::Discover(args) => {
             let peers = lan::discover_receivers(std::time::Duration::from_millis(args.timeout_ms))?;
             for peer in peers {
-                println!(
+                console::line(format!(
                     "{} {}:{} ({})",
                     peer.announcement.device_name,
                     peer.address,
                     peer.announcement.stream_port,
                     peer.announcement.instance_id
-                );
+                ));
             }
+            Ok(())
+        }
+        Command::Monitors => {
+            monitors::print_monitors();
             Ok(())
         }
         Command::Print(args) => {
@@ -115,7 +124,7 @@ fn main() -> Result<()> {
                 PrintCommand::Send(send_args) => pipeline::build_sender_pipeline(&send_args)?,
                 PrintCommand::Recv(recv_args) => pipeline::build_receiver_pipeline(&recv_args)?,
             };
-            println!("{pipeline}");
+            console::line(pipeline);
             Ok(())
         }
         Command::Run(args) => run_pipeline(&args.pipeline.join(" ")),

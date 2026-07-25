@@ -1,6 +1,7 @@
 param(
     [string] $StageDir = "installer\stage",
-    [string] $GStreamerRoot = ""
+    [string] $GStreamerRoot = "",
+    [bool] $IncludeVdd = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -55,6 +56,8 @@ function Copy-RuntimeFile([string] $source, [string] $relativeDestination) {
     $script:runtimeFiles += $relativeDestination
 }
 
+Copy-RuntimeFile (Join-Path $repo "scripts\install-bundled-vdd.ps1") "install-bundled-vdd.ps1"
+
 Get-ChildItem -LiteralPath (Join-Path $GStreamerRoot "bin") -File |
     Where-Object { $_.Extension -ieq ".dll" } |
     ForEach-Object { Copy-RuntimeFile $_.FullName $_.Name }
@@ -88,6 +91,36 @@ if (Test-Path -LiteralPath $scannerDir) {
         ForEach-Object { Copy-RuntimeFile $_.FullName (Join-Path "libexec\gstreamer-1.0" $_.Name) }
 }
 
+if ($IncludeVdd) {
+    $vddVersion = "25.7.23"
+    $vddUrl = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$vddVersion/VirtualDisplayDriver-x86.Driver.Only.zip"
+    $vddLicenseUrl = "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/LICENSE"
+    $cache = Join-Path $repo "installer\cache"
+    $vddZip = Join-Path $cache "VirtualDisplayDriver-$vddVersion.Driver.Only.zip"
+    $vddExtract = Join-Path $cache "VirtualDisplayDriver-$vddVersion"
+    New-Item -ItemType Directory -Force -Path $cache | Out-Null
+
+    if (-not (Test-Path -LiteralPath $vddZip)) {
+        Write-Host "Downloading Virtual Display Driver $vddVersion..."
+        Invoke-WebRequest -Uri $vddUrl -OutFile $vddZip
+    }
+
+    Remove-Item -LiteralPath $vddExtract -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -Path $vddZip -DestinationPath $vddExtract -Force
+    $vddSource = Join-Path $vddExtract "VirtualDisplayDriver"
+    $vddStage = Join-Path $stage "vdd"
+    Remove-Item -LiteralPath $vddStage -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $vddStage | Out-Null
+    Get-ChildItem -LiteralPath $vddSource -File |
+        ForEach-Object { Copy-RuntimeFile $_.FullName (Join-Path "vdd" $_.Name) }
+
+    $licenseStage = Join-Path $stage "licenses"
+    New-Item -ItemType Directory -Force -Path $licenseStage | Out-Null
+    $licenseFile = Join-Path $licenseStage "Virtual-Display-Driver-LICENSE.txt"
+    Invoke-WebRequest -Uri $vddLicenseUrl -OutFile $licenseFile
+    $script:runtimeFiles += "licenses\Virtual-Display-Driver-LICENSE.txt"
+}
+
 $wxs = New-Object System.Text.StringBuilder
 [void] $wxs.AppendLine('<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">')
 [void] $wxs.AppendLine('  <Fragment>')
@@ -98,6 +131,8 @@ $wxs = New-Object System.Text.StringBuilder
 [void] $wxs.AppendLine('      <Directory Id="LibexecFolder" Name="libexec">')
 [void] $wxs.AppendLine('        <Directory Id="GStreamerLibexecFolder" Name="gstreamer-1.0" />')
 [void] $wxs.AppendLine('      </Directory>')
+[void] $wxs.AppendLine('      <Directory Id="VddFolder" Name="vdd" />')
+[void] $wxs.AppendLine('      <Directory Id="LicenseFolder" Name="licenses" />')
 [void] $wxs.AppendLine('    </DirectoryRef>')
 [void] $wxs.AppendLine('  </Fragment>')
 [void] $wxs.AppendLine('  <Fragment>')
@@ -111,6 +146,10 @@ foreach ($relative in ($runtimeFiles | Sort-Object)) {
         'GStreamerPluginFolder'
     } elseif ($normalized.StartsWith('libexec/gstreamer-1.0/')) {
         'GStreamerLibexecFolder'
+    } elseif ($normalized.StartsWith('vdd/')) {
+        'VddFolder'
+    } elseif ($normalized.StartsWith('licenses/')) {
+        'LicenseFolder'
     } else {
         'INSTALLFOLDER'
     }

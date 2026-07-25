@@ -42,8 +42,80 @@ Default sender config uses:
 host = "auto"
 port = 5004
 max_receivers = 3
+prefer_virtual_display = true
+enable_virtual_display = true
+sync_virtual_display_resolution = true
+monitor_index = -1
 fps = 60
 bitrate = 12000
+allow_software_encoder = false
+nvidia_tuning = "auto"
+
+[recv]
+fullscreen = true
+```
+
+## Virtual Display Mode
+
+For a SuperDisplay-like extended desktop workflow, screen-mirror uses Virtual Display Driver (VDD) as the Windows virtual monitor and streams that display.
+
+The MSI bundles the signed VDD Driver Only package under the install directory. Use the tray menu item `Install Bundled Virtual Display Driver` to run:
+
+```powershell
+pnputil.exe /add-driver "vdd\MttVDD.inf" /install
+```
+
+This launches the driver install through UAC. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
+
+```powershell
+winget install --id=VirtualDrivers.Virtual-Display-Driver -e
+```
+
+Runtime behavior:
+
+1. Start the receiver on the tablet/second PC.
+2. Receiver discovery advertises its display resolution.
+3. Start the desktop sender.
+4. The sender requests Windows extended-display mode with `DisplaySwitch.exe /extend`.
+5. If a VDD/SuperDisplay-style virtual monitor is visible, the sender tries to match its resolution to the first receiver.
+6. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
+
+List capture indexes:
+
+```powershell
+screen-mirror.exe monitors
+```
+
+Force a specific display or disable VDD automation:
+
+```toml
+[send]
+prefer_virtual_display = false
+enable_virtual_display = false
+sync_virtual_display_resolution = false
+monitor_index = 1
+```
+
+The tray menu includes `Open Virtual Display Driver Page` for manual repair/update.
+
+## GPU Encoding
+
+The sender uses D3D11 screen capture and prefers hardware encoders:
+
+1. `nvd3d11h264enc` for NVIDIA GeForce GTX/RTX
+2. `mfh264enc` for Windows Media Foundation hardware encoders
+3. `qsvh264enc` for Intel Quick Sync
+
+By default `allow_software_encoder = false`, so `auto` will not silently fall back to CPU `x264enc`. Set it to `true` only if software fallback is acceptable.
+
+NVIDIA tuning:
+
+```toml
+[send]
+nvidia_tuning = "auto"        # auto-detects GTX/RTX where possible
+# nvidia_tuning = "gtx"       # strict low-latency NVENC path
+# nvidia_tuning = "rtx"       # low-latency path plus NVENC AQ
+# nvidia_tuning = "low-latency"
 ```
 
 Explicit multi-target sending also works:

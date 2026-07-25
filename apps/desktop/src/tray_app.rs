@@ -12,6 +12,8 @@ const ID_START_SENDER: &str = "start-sender";
 const ID_START_RECEIVER: &str = "start-receiver";
 const ID_STOP: &str = "stop";
 const ID_AUTOSTART: &str = "autostart";
+const ID_INSTALL_VDD: &str = "install-vdd";
+const ID_OPEN_VDD: &str = "open-vdd";
 const ID_OPEN_CONFIG: &str = "open-config";
 const ID_RELOAD_CONFIG: &str = "reload-config";
 const ID_QUIT: &str = "quit";
@@ -110,6 +112,14 @@ impl TrayApp {
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
         let sep3 = PredefinedMenuItem::separator();
+        let install_vdd = MenuItem::with_id(
+            ID_INSTALL_VDD,
+            "Install Bundled Virtual Display Driver",
+            true,
+            None,
+        );
+        let open_vdd =
+            MenuItem::with_id(ID_OPEN_VDD, "Open Virtual Display Driver Page", true, None);
         let open_config = MenuItem::with_id(ID_OPEN_CONFIG, "Open Config", true, None);
         let reload_config = MenuItem::with_id(ID_RELOAD_CONFIG, "Reload Config", true, None);
         let quit = MenuItem::with_id(ID_QUIT, "Quit", true, None);
@@ -121,6 +131,8 @@ impl TrayApp {
         menu.append(&items.stop)?;
         menu.append(&sep2)?;
         menu.append(&items.autostart)?;
+        menu.append(&install_vdd)?;
+        menu.append(&open_vdd)?;
         menu.append(&open_config)?;
         menu.append(&reload_config)?;
         menu.append(&sep3)?;
@@ -171,6 +183,8 @@ impl TrayApp {
                 self.save_config();
             }
             ID_AUTOSTART => self.toggle_autostart(),
+            ID_INSTALL_VDD => self.install_bundled_vdd(),
+            ID_OPEN_VDD => self.open_vdd_page(),
             ID_OPEN_CONFIG => self.open_config(),
             ID_RELOAD_CONFIG => self.reload_config(),
             ID_QUIT => {
@@ -284,6 +298,46 @@ impl TrayApp {
             .spawn()
         {
             eprintln!("failed to open config: {error}");
+        }
+    }
+
+    fn install_bundled_vdd(&self) {
+        let Some(script) = std::env::current_exe().ok().and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("install-bundled-vdd.ps1"))
+        }) else {
+            self.set_error("Failed to resolve bundled VDD installer path".to_string());
+            return;
+        };
+
+        if !script.exists() {
+            self.set_error(format!(
+                "Bundled VDD installer not found: {}",
+                script.display()
+            ));
+            return;
+        }
+
+        if let Err(error) = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script)
+            .spawn()
+        {
+            self.set_error(format!("Failed to start bundled VDD installer: {error}"));
+        }
+    }
+
+    fn open_vdd_page(&self) {
+        if let Err(error) = std::process::Command::new("cmd.exe")
+            .args([
+                "/C",
+                "start",
+                "",
+                "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases",
+            ])
+            .spawn()
+        {
+            eprintln!("failed to open VDD page: {error}");
         }
     }
 

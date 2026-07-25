@@ -43,9 +43,16 @@ impl ControlEvent {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let event: Self = serde_json::from_slice(bytes).context("failed to decode control event")?;
-        anyhow::ensure!(event.protocol == CONTROL_PROTOCOL, "unexpected control protocol");
-        anyhow::ensure!(event.version == CONTROL_VERSION, "unsupported control version");
+        let event: Self =
+            serde_json::from_slice(bytes).context("failed to decode control event")?;
+        anyhow::ensure!(
+            event.protocol == CONTROL_PROTOCOL,
+            "unexpected control protocol"
+        );
+        anyhow::ensure!(
+            event.version == CONTROL_VERSION,
+            "unsupported control version"
+        );
         Ok(event)
     }
 }

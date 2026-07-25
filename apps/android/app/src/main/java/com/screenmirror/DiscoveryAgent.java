@@ -27,13 +27,19 @@ final class DiscoveryAgent {
         final String role;
         final String host;
         final int streamPort;
+        final int displayWidth;
+        final int displayHeight;
+        final int refreshHz;
 
-        Peer(String instanceId, String deviceName, String role, String host, int streamPort) {
+        Peer(String instanceId, String deviceName, String role, String host, int streamPort, int displayWidth, int displayHeight, int refreshHz) {
             this.instanceId = instanceId;
             this.deviceName = deviceName;
             this.role = role;
             this.host = host;
             this.streamPort = streamPort;
+            this.displayWidth = displayWidth;
+            this.displayHeight = displayHeight;
+            this.refreshHz = refreshHz;
         }
 
         @Override
@@ -46,10 +52,10 @@ final class DiscoveryAgent {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread thread;
 
-    void startReceiverBeacon(int streamPort) {
+    void startReceiverBeacon(int streamPort, int displayWidth, int displayHeight, int refreshHz) {
         stop();
         running.set(true);
-        thread = new Thread(() -> runBeacon("receiver", streamPort), "discovery-beacon");
+        thread = new Thread(() -> runBeacon("receiver", streamPort, displayWidth, displayHeight, refreshHz), "discovery-beacon");
         thread.start();
     }
 
@@ -97,11 +103,11 @@ final class DiscoveryAgent {
         return peers;
     }
 
-    private void runBeacon(String role, int streamPort) {
+    private void runBeacon(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz) {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
             while (running.get()) {
-                byte[] payload = announcement(role, streamPort);
+                byte[] payload = announcement(role, streamPort, displayWidth, displayHeight, refreshHz);
                 DatagramPacket packet = new DatagramPacket(
                         payload,
                         payload.length,
@@ -115,7 +121,7 @@ final class DiscoveryAgent {
         }
     }
 
-    private byte[] announcement(String role, int streamPort) throws Exception {
+    private byte[] announcement(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz) throws Exception {
         JSONObject json = new JSONObject();
         json.put("protocol", PROTOCOL);
         json.put("version", VERSION);
@@ -123,6 +129,13 @@ final class DiscoveryAgent {
         json.put("device_name", Build.MODEL);
         json.put("role", role);
         json.put("stream_port", streamPort);
+        JSONObject display = new JSONObject();
+        display.put("width", displayWidth);
+        display.put("height", displayHeight);
+        if (refreshHz > 0) {
+            display.put("refresh_hz", refreshHz);
+        }
+        json.put("display", display);
         json.put("timestamp_ms", System.currentTimeMillis());
         return json.toString().getBytes(StandardCharsets.UTF_8);
     }
@@ -137,12 +150,20 @@ final class DiscoveryAgent {
         if (!(address instanceof Inet4Address)) {
             throw new IllegalArgumentException("only IPv4 discovery is supported");
         }
+        JSONObject display = json.optJSONObject("display");
+        int displayWidth = display == null ? 0 : display.optInt("width", 0);
+        int displayHeight = display == null ? 0 : display.optInt("height", 0);
+        int refreshHz = display == null ? 0 : display.optInt("refresh_hz", 0);
+
         return new Peer(
                 json.getString("instance_id"),
                 json.optString("device_name", "Android"),
                 json.getString("role"),
                 address.getHostAddress(),
-                json.getInt("stream_port")
+                json.getInt("stream_port"),
+                displayWidth,
+                displayHeight,
+                refreshHz
         );
     }
 }

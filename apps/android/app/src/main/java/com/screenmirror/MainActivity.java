@@ -7,12 +7,13 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.util.DisplayMetrics;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.MotionEvent;
+import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
@@ -30,6 +31,7 @@ public final class MainActivity extends Activity {
 
     private SurfaceView surfaceView;
     private TextView status;
+    private LinearLayout toolbar;
     private MediaProjectionManager projectionManager;
     private WifiManager.MulticastLock multicastLock;
 
@@ -90,21 +92,23 @@ public final class MainActivity extends Activity {
         stop.setText("Stop");
         stop.setOnClickListener(view -> stopAll());
 
-        LinearLayout controls = new LinearLayout(this);
-        controls.setOrientation(LinearLayout.VERTICAL);
-        controls.addView(status);
-        controls.addView(startReceiver);
-        controls.addView(discover);
-        controls.addView(startSender);
-        controls.addView(stop);
-        controls.addView(surfaceView, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                720
-        ));
+        toolbar = new LinearLayout(this);
+        toolbar.setOrientation(LinearLayout.VERTICAL);
+        toolbar.addView(status);
+        toolbar.addView(startReceiver);
+        toolbar.addView(discover);
+        toolbar.addView(startSender);
+        toolbar.addView(stop);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(controls);
-        setContentView(scroll);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.addView(toolbar);
+        root.addView(surfaceView, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1.0f
+        ));
+        setContentView(root);
     }
 
     @Override
@@ -131,13 +135,14 @@ public final class MainActivity extends Activity {
 
     private void startReceiver() {
         stopAll();
+        enterReceiverFullscreen();
         SurfaceHolder holder = surfaceView.getHolder();
         holder.addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
                 try {
                     lockMulticast();
-                    discovery.startReceiverBeacon(STREAM_PORT);
+                    discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz());
                     receiver.start(STREAM_PORT, holder.getSurface());
                     setStatus("Status: receiving on :" + STREAM_PORT);
                 } catch (Exception error) {
@@ -157,7 +162,7 @@ public final class MainActivity extends Activity {
         if (holder.getSurface().isValid()) {
             try {
                 lockMulticast();
-                discovery.startReceiverBeacon(STREAM_PORT);
+                discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz());
                 receiver.start(STREAM_PORT, holder.getSurface());
                 setStatus("Status: receiving on :" + STREAM_PORT);
             } catch (Exception error) {
@@ -213,6 +218,7 @@ public final class MainActivity extends Activity {
         discovery.stop();
         receiver.stop();
         sender.stop();
+        leaveReceiverFullscreen();
         if (multicastLock != null && multicastLock.isHeld()) {
             multicastLock.release();
         }
@@ -223,6 +229,41 @@ public final class MainActivity extends Activity {
         if (multicastLock != null && !multicastLock.isHeld()) {
             multicastLock.acquire();
         }
+    }
+
+    private int displayWidth() {
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        return metrics.widthPixels;
+    }
+
+    private int displayHeight() {
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        return metrics.heightPixels;
+    }
+
+    private int displayRefreshHz() {
+        return Math.round(getWindowManager().getDefaultDisplay().getRefreshRate());
+    }
+
+    private void enterReceiverFullscreen() {
+        if (toolbar != null) {
+            toolbar.setVisibility(View.GONE);
+        }
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+        );
+    }
+
+    private void leaveReceiverFullscreen() {
+        if (toolbar != null) {
+            toolbar.setVisibility(View.VISIBLE);
+        }
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
     }
 
     private void setStatus(String text) {

@@ -16,7 +16,17 @@ pub struct PeerAnnouncement {
     pub device_name: String,
     pub role: PeerRole,
     pub stream_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayInfo>,
     pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DisplayInfo {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_hz: Option<u32>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,8 +57,14 @@ impl PeerAnnouncement {
             device_name: device_name.into(),
             role,
             stream_port,
+            display: None,
             timestamp_ms: now_ms(),
         }
+    }
+
+    pub fn with_display(mut self, display: DisplayInfo) -> Self {
+        self.display = Some(display);
+        self
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {

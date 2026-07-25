@@ -7,4 +7,5 @@
 *.apk
 /assets/*.ico
 /installer/stage/
+/installer/cache/
 /installer/RuntimeFiles.wxs

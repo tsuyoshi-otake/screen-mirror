@@ -93,12 +93,15 @@ impl Drop for SenderSupervisor {
 impl Announcer {
     pub fn receiver(stream_port: u16) -> Result<Self> {
         let socket = discovery::bind_ephemeral_broadcast_socket()?;
-        let announcement = PeerAnnouncement::new(
+        let mut announcement = PeerAnnouncement::new(
             instance_id(),
             device_name(),
             PeerRole::Receiver,
             stream_port,
         );
+        if let Some(display) = crate::monitors::primary_display_info() {
+            announcement = announcement.with_display(display);
+        }
         let (stop, stop_rx) = mpsc::channel();
         let thread = thread::spawn(move || loop {
             if stop_rx.try_recv().is_ok() {
@@ -131,6 +134,10 @@ impl Drop for Announcer {
 }
 
 pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
+    if args.enable_virtual_display {
+        crate::monitors::enable_extended_desktop_once();
+    }
+
     if !is_auto_host(&args.host) {
         return Ok(args);
     }
@@ -140,6 +147,25 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
         return Err(anyhow!(
             "no receivers discovered; start receiver mode on another device or set host explicitly"
         ));
+    }
+
+    let target_display = receivers
+        .iter()
+        .find_map(|peer| peer.announcement.display.clone());
+
+    if args.sync_virtual_display_resolution {
+        if let Err(error) =
+            crate::monitors::sync_preferred_virtual_display_mode(target_display.as_ref())
+        {
+            crate::logging::append(format!("virtual display resolution sync failed: {error:#}"));
+        }
+    }
+
+    if args.width.is_none() && args.height.is_none() {
+        if let Some(display) = &target_display {
+            args.width = Some(display.width);
+            args.height = Some(display.height);
+        }
     }
 
     let selected: Vec<String> = receivers

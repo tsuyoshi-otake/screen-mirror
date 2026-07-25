@@ -43,8 +43,12 @@ pub fn start_background_update_checks() {
 
 fn check_and_start_update() -> Result<()> {
     let release = latest_release()?;
-    let latest = parse_version(&release.tag_name)
-        .with_context(|| format!("release tag is not a semantic version: {}", release.tag_name))?;
+    let latest = parse_version(&release.tag_name).with_context(|| {
+        format!(
+            "release tag is not a semantic version: {}",
+            release.tag_name
+        )
+    })?;
     let current = parse_version(env!("CARGO_PKG_VERSION"))?;
 
     if latest <= current {
@@ -55,7 +59,12 @@ fn check_and_start_update() -> Result<()> {
         .assets
         .iter()
         .find(|asset| asset.name.eq_ignore_ascii_case(INSTALLER_ASSET))
-        .or_else(|| release.assets.iter().find(|asset| asset.name.ends_with(".msi")))
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name.ends_with(".msi"))
+        })
         .ok_or_else(|| anyhow!("release {} has no MSI asset", release.tag_name))?;
     let installer = download_installer(&asset.browser_download_url, &release.tag_name)?;
     start_installer_and_exit(&installer)?;
@@ -111,7 +120,15 @@ fn start_installer_and_exit(installer: &PathBuf) -> Result<()> {
         installer.display()
     );
     Command::new("cmd.exe")
-        .args(["/C", "start", "\"ScreenMirrorUpdate\"", "/MIN", "cmd.exe", "/C", &command])
+        .args([
+            "/C",
+            "start",
+            "\"ScreenMirrorUpdate\"",
+            "/MIN",
+            "cmd.exe",
+            "/C",
+            &command,
+        ])
         .spawn()
         .context("failed to start MSI update process")?;
 

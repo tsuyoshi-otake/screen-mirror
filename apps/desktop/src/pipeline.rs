@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
-use clap::{Args, ValueEnum};
-use gstreamer as gst;
+use clap::{ArgAction, Args, ValueEnum};
 use gst::prelude::*;
+use gstreamer as gst;
 use std::fmt;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -20,6 +20,18 @@ pub struct SendArgs {
     #[arg(long, default_value_t = 3)]
     pub max_receivers: u32,
 
+    /// Prefer a detected VDD/SuperDisplay-style virtual monitor when monitor-index is -1.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub prefer_virtual_display: bool,
+
+    /// Ask Windows to switch to extended desktop before sending.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub enable_virtual_display: bool,
+
+    /// Match the preferred virtual display mode to the first receiver display.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub sync_virtual_display_resolution: bool,
+
     /// Capture monitor index. -1 means primary monitor.
     #[arg(long, default_value_t = -1)]
     pub monitor_index: i32,
@@ -35,6 +47,14 @@ pub struct SendArgs {
     /// RTP MTU. 1200 is safe for Wi-Fi and VPN-ish paths.
     #[arg(long, default_value_t = 1200)]
     pub mtu: u32,
+
+    /// Permit auto encoder selection to fall back to CPU x264.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub allow_software_encoder: bool,
+
+    /// NVIDIA NVENC tuning profile.
+    #[arg(long, value_enum, default_value_t = NvidiaTuning::Auto)]
+    pub nvidia_tuning: NvidiaTuning,
 
     /// Encoder to use. auto prefers GPU encoders.
     #[arg(long, value_enum, default_value_t = Encoder::Auto)]
@@ -67,6 +87,10 @@ pub struct RecvArgs {
     #[arg(long, default_value_t = 20)]
     pub jitter_ms: u32,
 
+    /// Render receiver video fullscreen.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub fullscreen: bool,
+
     /// Decoder to use. auto prefers D3D11 GPU decode.
     #[arg(long, value_enum, default_value_t = Decoder::Auto)]
     pub decoder: Decoder,
@@ -83,6 +107,15 @@ pub enum Encoder {
     MediaFoundation,
     QuickSync,
     X264,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum NvidiaTuning {
+    #[default]
+    Auto,
+    Gtx,
+    Rtx,
+    LowLatency,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -123,7 +156,9 @@ impl PipelineHandle {
     pub fn stop(mut self) -> Result<()> {
         let _ = self.stop.send(());
         if let Some(thread) = self.thread.take() {
-            thread.join().map_err(|_| anyhow!("pipeline thread panicked"))??;
+            thread
+                .join()
+                .map_err(|_| anyhow!("pipeline thread panicked"))??;
         }
         Ok(())
     }
@@ -165,16 +200,25 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
         ));
     }
 
-    let encoder = select_encoder(args.encoder)?;
+    let encoder = select_encoder(args.encoder, args.allow_software_encoder)?;
     let clients = multi_udp_clients(&args.host, args.port)?;
+    let monitor_index = crate::monitors::resolve_capture_monitor_index(
+        args.monitor_index,
+        args.prefer_virtual_display,
+    );
     let source = format!(
         "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
         args.capture_api,
-        args.monitor_index,
+        monitor_index,
         if args.no_cursor { "false" } else { "true" }
     );
-    let caps = video_caps(args.fps, args.width, args.height, encoder.uses_d3d11_input());
-    let encoder_chain = encoder.chain(args.bitrate, args.fps);
+    let caps = video_caps(
+        args.fps,
+        args.width,
+        args.height,
+        encoder.uses_d3d11_input(),
+    );
+    let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
 
     Ok(format!(
         "{source} ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
@@ -192,7 +236,7 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     ensure_positive("jitter-ms", args.jitter_ms)?;
 
     let decoder = select_decoder(args.decoder)?;
-    let sink = select_sink(args.sink)?;
+    let sink = select_sink(args.sink, args.fullscreen)?;
 
     Ok(format!(
         "udpsrc port={} buffer-size=2097152 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
@@ -277,7 +321,9 @@ fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) ->
     };
 
     if d3d11 {
-        format!("d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,framerate={fps}/1{size}")
+        format!(
+            "d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,framerate={fps}/1{size}"
+        )
     } else {
         format!("d3d11download ! videoconvert ! video/x-raw,format=NV12,framerate={fps}/1{size}")
     }
@@ -296,12 +342,9 @@ impl SelectedEncoder {
         matches!(self, Self::Nvidia | Self::MediaFoundation | Self::QuickSync)
     }
 
-    fn chain(self, bitrate: u32, fps: u32) -> String {
+    fn chain(self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {
         match self {
-            Self::Nvidia => format!(
-                "nvd3d11h264enc bitrate={bitrate} gop-size={fps} bframes=0 rc-lookahead=0 zerolatency=true repeat-sequence-header=true \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
-            ),
+            Self::Nvidia => nvidia_encoder_chain(bitrate, fps, nvidia_tuning),
             Self::MediaFoundation => format!(
                 "mfh264enc bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=100 \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
@@ -318,9 +361,42 @@ impl SelectedEncoder {
     }
 }
 
-fn select_encoder(requested: Encoder) -> Result<SelectedEncoder> {
+fn nvidia_encoder_chain(bitrate: u32, fps: u32, tuning: NvidiaTuning) -> String {
+    let tuning = resolve_nvidia_tuning(tuning);
+    let vbv_buffer_size = (bitrate / fps.max(1)).max(128);
+    let extra = match tuning {
+        NvidiaTuning::Rtx => " spatial-aq=true temporal-aq=true aq-strength=8",
+        NvidiaTuning::Gtx | NvidiaTuning::LowLatency | NvidiaTuning::Auto => "",
+    };
+
+    format!(
+        "nvd3d11h264enc bitrate={bitrate} max-bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} \
+         gop-size={fps} bframes=0 rc-lookahead=0 zerolatency=true strict-gop=true aud=false repeat-sequence-header=true{extra} \
+         ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
+    )
+}
+
+fn resolve_nvidia_tuning(tuning: NvidiaTuning) -> NvidiaTuning {
+    if tuning != NvidiaTuning::Auto {
+        return tuning;
+    }
+
+    let Some(name) = crate::monitors::detected_nvidia_gpu_name() else {
+        return NvidiaTuning::LowLatency;
+    };
+    let name = name.to_ascii_lowercase();
+    if name.contains(" rtx") || name.contains("rtx ") || name.contains("geforce rtx") {
+        NvidiaTuning::Rtx
+    } else if name.contains(" gtx") || name.contains("gtx ") || name.contains("geforce gtx") {
+        NvidiaTuning::Gtx
+    } else {
+        NvidiaTuning::LowLatency
+    }
+}
+
+fn select_encoder(requested: Encoder, allow_software_encoder: bool) -> Result<SelectedEncoder> {
     match requested {
-        Encoder::Auto => first_available_encoder(),
+        Encoder::Auto => first_available_encoder(allow_software_encoder),
         Encoder::Nvidia => require_element("nvd3d11h264enc", SelectedEncoder::Nvidia),
         Encoder::MediaFoundation => require_element("mfh264enc", SelectedEncoder::MediaFoundation),
         Encoder::QuickSync => require_element("qsvh264enc", SelectedEncoder::QuickSync),
@@ -328,16 +404,26 @@ fn select_encoder(requested: Encoder) -> Result<SelectedEncoder> {
     }
 }
 
-fn first_available_encoder() -> Result<SelectedEncoder> {
-    [
+fn first_available_encoder(allow_software_encoder: bool) -> Result<SelectedEncoder> {
+    let hardware_encoder = [
         ("nvd3d11h264enc", SelectedEncoder::Nvidia),
         ("mfh264enc", SelectedEncoder::MediaFoundation),
         ("qsvh264enc", SelectedEncoder::QuickSync),
-        ("x264enc", SelectedEncoder::X264),
     ]
     .into_iter()
-    .find_map(|(name, encoder)| has_element(name).then_some(encoder))
-    .ok_or_else(|| anyhow!("no supported H.264 encoder found; install GStreamer Bad/Ugly plugins"))
+    .find_map(|(name, encoder)| has_element(name).then_some(encoder));
+
+    if let Some(encoder) = hardware_encoder {
+        return Ok(encoder);
+    }
+
+    if allow_software_encoder {
+        return require_element("x264enc", SelectedEncoder::X264);
+    }
+
+    Err(anyhow!(
+        "no supported GPU H.264 encoder found; install GStreamer Bad plugins or pass --allow-software-encoder true to permit CPU x264"
+    ))
 }
 
 fn select_decoder(requested: Decoder) -> Result<&'static str> {
@@ -348,17 +434,23 @@ fn select_decoder(requested: Decoder) -> Result<&'static str> {
     }
 }
 
-fn select_sink(requested: Sink) -> Result<&'static str> {
+fn select_sink(requested: Sink, fullscreen: bool) -> Result<String> {
+    let d3d11_sink = if fullscreen {
+        "d3d11videosink sync=false qos=true fullscreen-toggle-mode=property fullscreen=true"
+    } else {
+        "d3d11videosink sync=false qos=true"
+    };
+
     match requested {
         Sink::Auto => {
             if has_element("d3d11videosink") {
-                Ok("d3d11videosink sync=false qos=true")
+                Ok(d3d11_sink.to_string())
             } else {
-                Ok("autovideosink sync=false")
+                Ok("autovideosink sync=false".to_string())
             }
         }
-        Sink::D3d11 => require_element("d3d11videosink", "d3d11videosink sync=false qos=true"),
-        Sink::AutoVideo => Ok("autovideosink sync=false"),
+        Sink::D3d11 => require_element("d3d11videosink", d3d11_sink.to_string()),
+        Sink::AutoVideo => Ok("autovideosink sync=false".to_string()),
     }
 }
 
@@ -391,10 +483,10 @@ pub fn probe_elements() {
     ];
 
     for (role, name) in elements {
-        println!(
+        crate::console::line(format!(
             "{role:12} {name:24} {}",
             if has_element(name) { "yes" } else { "no" }
-        );
+        ));
     }
 }
 
@@ -435,8 +527,5 @@ fn has_explicit_port(host: &str) -> bool {
 }
 
 fn gst_string_literal(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    )
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }

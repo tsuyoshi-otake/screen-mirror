@@ -4,7 +4,9 @@ fn main() {
     if std::path::Path::new(icon).exists() {
         let mut resource = winresource::WindowsResource::new();
         resource.set_icon(icon);
-        resource.compile().expect("failed to embed Windows resources");
+        resource
+            .compile()
+            .expect("failed to embed Windows resources");
     }
 }
 

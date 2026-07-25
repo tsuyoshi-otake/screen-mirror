@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use get_if_addrs::{get_if_addrs, IfAddr};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -92,13 +93,37 @@ pub fn bind_ephemeral_broadcast_socket() -> Result<UdpSocket> {
 
 pub fn broadcast(socket: &UdpSocket, announcement: &PeerAnnouncement) -> Result<()> {
     let bytes = announcement.encode()?;
-    socket
-        .send_to(
-            &bytes,
-            SocketAddrV4::new(Ipv4Addr::BROADCAST, DISCOVERY_PORT),
-        )
-        .context("failed to broadcast discovery packet")?;
+    for address in broadcast_addresses()? {
+        socket
+            .send_to(&bytes, SocketAddrV4::new(address, DISCOVERY_PORT))
+            .with_context(|| format!("failed to broadcast discovery packet to {address}"))?;
+    }
     Ok(())
+}
+
+pub fn broadcast_addresses() -> Result<Vec<Ipv4Addr>> {
+    let mut addresses = Vec::new();
+    for interface in get_if_addrs().context("failed to enumerate network interfaces")? {
+        let IfAddr::V4(ipv4) = interface.addr else {
+            continue;
+        };
+        let ip = ipv4.ip;
+        if ip.is_loopback() || ip.octets()[0] == 169 {
+            continue;
+        }
+        let ip_u32 = u32::from(ip);
+        let mask_u32 = u32::from(ipv4.netmask);
+        let broadcast = Ipv4Addr::from(ip_u32 | !mask_u32);
+        if !addresses.contains(&broadcast) {
+            addresses.push(broadcast);
+        }
+    }
+
+    if addresses.is_empty() {
+        addresses.push(Ipv4Addr::BROADCAST);
+    }
+
+    Ok(addresses)
 }
 
 pub fn discover_receivers(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {

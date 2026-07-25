@@ -137,7 +137,13 @@ impl Drop for PipelineHandle {
 
 pub fn spawn_pipeline(description: String) -> PipelineHandle {
     let (stop, stop_rx) = mpsc::channel();
-    let thread = thread::spawn(move || run_pipeline_until_stop(&description, stop_rx));
+    let thread = thread::spawn(move || {
+        let result = run_pipeline_until_stop(&description, stop_rx);
+        if let Err(error) = &result {
+            crate::logging::append(format!("pipeline failed: {error:#}"));
+        }
+        result
+    });
     PipelineHandle {
         stop,
         thread: Some(thread),
@@ -189,7 +195,7 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     let sink = select_sink(args.sink)?;
 
     Ok(format!(
-        "udpsrc port={} buffer-size=2097152 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96\" \
+        "udpsrc port={} buffer-size=2097152 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
          ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=true \
          ! rtph264depay \
          ! h264parse disable-passthrough=true \
@@ -245,10 +251,12 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
                         .map(|src| src.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
                     let debug = warning.debug().unwrap_or_else(|| "no debug info".into());
-                    eprintln!(
+                    let message = format!(
                         "GStreamer warning from {src}: {} ({debug})",
                         warning.error()
                     );
+                    eprintln!("{message}");
+                    crate::logging::append(message);
                 }
                 _ => {}
             }
@@ -334,17 +342,7 @@ fn first_available_encoder() -> Result<SelectedEncoder> {
 
 fn select_decoder(requested: Decoder) -> Result<&'static str> {
     match requested {
-        Decoder::Auto => {
-            if has_element("d3d11h264dec") {
-                Ok("d3d11h264dec")
-            } else if has_element("avdec_h264") {
-                Ok("avdec_h264")
-            } else {
-                Err(anyhow!(
-                    "no supported H.264 decoder found; install GStreamer Bad/Libav plugins"
-                ))
-            }
-        }
+        Decoder::Auto => require_element("decodebin", "decodebin"),
         Decoder::D3d11 => require_element("d3d11h264dec", "d3d11h264dec"),
         Decoder::Avdec => require_element("avdec_h264", "avdec_h264"),
     }

@@ -66,6 +66,7 @@ $pluginAllowList = @(
     'gstlibav.dll',
     'gstmediafoundation.dll',
     'gstnvcodec.dll',
+    'gstplayback.dll',
     'gstqsv.dll',
     'gstrtp.dll',
     'gstrtpmanager.dll',

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use tao::event::{Event, StartCause};
+use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -29,6 +29,7 @@ enum ActiveMode {
 }
 
 pub fn run() -> Result<()> {
+    crate::logging::append("tray run start");
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |event| {
@@ -36,16 +37,17 @@ pub fn run() -> Result<()> {
     }));
 
     let mut app = TrayApp::new()?;
+    crate::logging::append(format!(
+        "config loaded: startup_mode={:?} autostart={}",
+        app.config.startup_mode, app.config.autostart
+    ));
+    app.initialize_tray()?;
+    crate::logging::append("tray initialized");
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::NewEvents(StartCause::Init) => {
-                if let Err(error) = app.initialize_tray() {
-                    eprintln!("{error:?}");
-                }
-            }
             Event::UserEvent(UserEvent::Menu(event)) => {
                 app.handle_menu(event.id().as_ref(), control_flow);
             }
@@ -98,6 +100,7 @@ impl TrayApp {
     }
 
     fn initialize_tray(&mut self) -> Result<()> {
+        crate::logging::append("initialize_tray");
         if self.tray.is_some() {
             return Ok(());
         }
@@ -142,9 +145,15 @@ impl TrayApp {
         }
 
         match self.config.startup_mode {
-            StartupMode::Idle => {}
-            StartupMode::Sender => self.start_sender(),
-            StartupMode::Receiver => self.start_receiver(),
+            StartupMode::Idle => crate::logging::append("startup mode idle"),
+            StartupMode::Sender => {
+                crate::logging::append("startup mode sender");
+                self.start_sender()
+            }
+            StartupMode::Receiver => {
+                crate::logging::append("startup mode receiver");
+                self.start_receiver()
+            }
         }
 
         Ok(())
@@ -214,6 +223,7 @@ impl TrayApp {
     }
 
     fn start_receiver(&mut self) {
+        crate::logging::append("start_receiver requested");
         if let Err(error) = self.stop_current() {
             self.set_error(format!("Stop failed: {error:#}"));
             return;
@@ -222,6 +232,7 @@ impl TrayApp {
         let args = self.config.recv.clone().into();
         match pipeline::build_receiver_pipeline(&args) {
             Ok(description) => {
+                crate::logging::append(format!("receiver pipeline: {description}"));
                 eprintln!("receiver pipeline: {description}");
                 self.pipeline = Some(pipeline::spawn_pipeline(description));
                 match crate::lan::Announcer::receiver(self.config.recv.port) {
@@ -339,6 +350,7 @@ impl TrayApp {
 
     fn set_error(&self, message: String) {
         eprintln!("{message}");
+        crate::logging::append(&message);
         if let Some(items) = self.items.as_ref() {
             items.status.set_text(format!("Error: {message}"));
         }

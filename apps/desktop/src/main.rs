@@ -4,6 +4,7 @@ mod autostart;
 mod config;
 mod control;
 mod lan;
+mod logging;
 mod pipeline;
 mod single_instance;
 mod tray_app;
@@ -55,7 +56,8 @@ struct PrintArgs {
 #[derive(Args, Debug)]
 struct RunArgs {
     /// Full gst-launch-style pipeline description.
-    pipeline: String,
+    #[arg(trailing_var_arg = true)]
+    pipeline: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -116,7 +118,7 @@ fn main() -> Result<()> {
             println!("{pipeline}");
             Ok(())
         }
-        Command::Run(args) => run_pipeline(&args.pipeline),
+        Command::Run(args) => run_pipeline(&args.pipeline.join(" ")),
     }
 }
 

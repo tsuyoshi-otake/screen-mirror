@@ -74,6 +74,7 @@ final class ScreenSender {
             encoder.release();
             encoder = null;
         }
+        packetizer.close();
         if (projection != null) {
             projection.stop();
             projection = null;

@@ -87,7 +87,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             startup_mode: StartupMode::Idle,
-            autostart: false,
+            autostart: true,
             send: SendConfig::default(),
             recv: RecvConfig::default(),
         }

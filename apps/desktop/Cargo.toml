@@ -1,6 +1,6 @@
 [package]
 name = "screen-mirror"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -9,11 +9,15 @@ clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0"
 gstreamer = "0.23"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 sm-core = { path = "../../crates/sm-core" }
 tao = "0.35"
 toml = "0.8"
 tray-icon = "0.24"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.52"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

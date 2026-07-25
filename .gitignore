@@ -5,3 +5,6 @@
 /apps/android/app/build/
 *.msi
 *.apk
+/assets/*.ico
+/installer/stage/
+/installer/RuntimeFiles.wxs

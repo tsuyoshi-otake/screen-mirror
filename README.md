@@ -86,7 +86,7 @@ Build the MSI:
 .\scripts\build-msi.ps1
 ```
 
-The MSI installs `screen-mirror.exe` and a Start Menu shortcut. It does not bundle GStreamer; install GStreamer separately or ensure its `bin` directory is available on the machine PATH.
+The MSI installs `screen-mirror.exe`, the tray/start-menu icon, autostart registration, and the required GStreamer runtime DLL/plugin files.
 
 ## Android APK
 

@@ -135,6 +135,7 @@ impl TrayApp {
         self.items = Some(items);
         self.tray = Some(tray);
         self.sync_menu();
+        crate::updater::start_background_update_checks();
 
         if let Err(error) = autostart::set_enabled(self.config.autostart) {
             self.set_error(format!("Autostart update failed: {error:#}"));

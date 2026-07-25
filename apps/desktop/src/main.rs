@@ -5,7 +5,9 @@ mod config;
 mod control;
 mod lan;
 mod pipeline;
+mod single_instance;
 mod tray_app;
+mod updater;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -65,7 +67,14 @@ struct DiscoverArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tray_mode = matches!(cli.command, None | Some(Command::Tray));
+    let _instance_guard = if tray_mode {
+        Some(single_instance::acquire_tray_instance()?)
+    } else {
+        None
+    };
 
+    configure_bundled_runtime();
     gstreamer::init().context("failed to initialize GStreamer")?;
 
     match cli.command.unwrap_or(Command::Tray) {
@@ -108,5 +117,40 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run(args) => run_pipeline(&args.pipeline),
+    }
+}
+
+fn configure_bundled_runtime() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(app_dir) = exe.parent() else {
+        return;
+    };
+
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = std::env::split_paths(&path).collect::<Vec<_>>();
+    if !paths.iter().any(|path| path == app_dir) {
+        paths.insert(0, app_dir.to_path_buf());
+    }
+    let bin_dir = app_dir.join("bin");
+    if bin_dir.exists() && !paths.iter().any(|path| path == &bin_dir) {
+        paths.insert(0, bin_dir);
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        std::env::set_var("PATH", joined);
+    }
+
+    let plugin_path = app_dir.join("lib").join("gstreamer-1.0");
+    if plugin_path.exists() && std::env::var_os("GST_PLUGIN_PATH").is_none() {
+        std::env::set_var("GST_PLUGIN_PATH", plugin_path);
+    }
+
+    let scanner = app_dir
+        .join("libexec")
+        .join("gstreamer-1.0")
+        .join("gst-plugin-scanner.exe");
+    if scanner.exists() && std::env::var_os("GST_PLUGIN_SCANNER").is_none() {
+        std::env::set_var("GST_PLUGIN_SCANNER", scanner);
     }
 }

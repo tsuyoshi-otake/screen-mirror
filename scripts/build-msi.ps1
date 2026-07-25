@@ -23,6 +23,9 @@ if (-not $ProductVersion) {
     $ProductVersion = $versionLine.Matches[0].Groups[1].Value
 }
 
+Write-Host "Generating icon..."
+& (Join-Path $repo "scripts\generate-icon.ps1")
+
 if ($ProductVersion -notmatch '^\d+\.\d+\.\d+$') {
     throw "MSI ProductVersion must be three numeric fields, for example 0.1.0. Got: $ProductVersion"
 }
@@ -35,13 +38,15 @@ if (-not (Test-Path -LiteralPath $exe)) {
     throw "Expected executable not found: $exe"
 }
 
+Write-Host "Preparing MSI stage..."
+& (Join-Path $repo "scripts\prepare-msi-stage.ps1")
+
 Write-Host "Building MSI..."
 $wixProject = Join-Path $repo "installer\ScreenMirror.wixproj"
 dotnet build $wixProject `
     -c $Configuration `
     -p:Platform=x64 `
-    -p:ProductVersion=$ProductVersion `
-    -p:AppExe=$exe
+    -p:ProductVersion=$ProductVersion
 if ($LASTEXITCODE -ne 0) {
     throw "MSI build failed"
 }

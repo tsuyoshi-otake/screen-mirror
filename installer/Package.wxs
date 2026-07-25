@@ -8,6 +8,8 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Screen Mirror is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon.ico" SourceFile="$(var.StageDir)\screen-mirror.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Screen Mirror" />
@@ -19,7 +21,14 @@
 
     <Feature Id="MainFeature" Title="Screen Mirror" Level="1">
       <ComponentGroupRef Id="AppComponents" />
+      <ComponentGroupRef Id="RuntimeComponents" />
     </Feature>
+    <CustomAction Id="StopExistingScreenMirror" Directory="INSTALLFOLDER" ExeCommand="[SystemFolder]taskkill.exe /IM screen-mirror.exe /F" Execute="immediate" Return="ignore" Impersonate="yes" />
+    <CustomAction Id="LaunchScreenMirror" FileRef="ScreenMirrorExe" ExeCommand="tray" Execute="immediate" Return="asyncNoWait" Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="StopExistingScreenMirror" Before="InstallValidate" Condition="NOT REMOVE" />
+      <Custom Action="LaunchScreenMirror" After="InstallFinalize" Condition="NOT Installed" />
+    </InstallExecuteSequence>
   </Package>
 
   <Fragment>
@@ -27,7 +36,7 @@
       <Component Id="ScreenMirrorExeComponent" Bitness="always64">
         <File
           Id="ScreenMirrorExe"
-          Source="$(var.AppExe)"
+          Source="$(var.StageDir)\screen-mirror.exe"
           Name="screen-mirror.exe"
           KeyPath="yes">
           <Shortcut
@@ -36,15 +45,34 @@
             Name="Screen Mirror"
             Arguments="tray"
             WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon.ico"
             Advertise="yes" />
         </File>
+      </Component>
+
+      <Component Id="AutostartComponent" Bitness="always64">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Run"
+          Name="ScreenMirror"
+          Type="string"
+          Value="&quot;[INSTALLFOLDER]screen-mirror.exe&quot; tray"
+          KeyPath="yes" />
       </Component>
 
       <Component Id="ReadmeComponent" Bitness="always64">
         <File
           Id="ReadmeFile"
-          Source="$(var.ReadmeFile)"
+          Source="$(var.StageDir)\README.md"
           Name="README.md"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="IconComponent" Bitness="always64">
+        <File
+          Id="ScreenMirrorIcon"
+          Source="$(var.StageDir)\screen-mirror.ico"
+          Name="screen-mirror.ico"
           KeyPath="yes" />
       </Component>
 

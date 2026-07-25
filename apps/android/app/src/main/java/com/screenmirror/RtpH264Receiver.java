@@ -11,7 +11,14 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RtpH264Receiver {
+    private static final byte[] START_CODE = new byte[]{0, 0, 0, 1};
+
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final byte[] receiveBuffer = new byte[2048];
+    private final DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
+    private final FuState fuState = new FuState();
+    private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+
     private Thread thread;
     private MediaCodec decoder;
     private volatile String lastSenderHost;
@@ -42,108 +49,105 @@ final class RtpH264Receiver {
             decoder.release();
             decoder = null;
         }
-    }
-
-    private void receiveLoop(int port) {
-        byte[] buffer = new byte[2048];
-        FuState fuState = new FuState();
-        try (DatagramSocket socket = new DatagramSocket(port)) {
-            socket.setReceiveBufferSize(2 * 1024 * 1024);
-            while (running.get()) {
-                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                socket.receive(packet);
-                lastSenderHost = packet.getAddress().getHostAddress();
-                byte[] nal = depacketize(packet.getData(), packet.getLength(), fuState);
-                if (nal != null) {
-                    queueNal(nal);
-                }
-                drainDecoder();
-            }
-        } catch (Exception ignored) {
-        }
+        fuState.reset();
     }
 
     String lastSenderHost() {
         return lastSenderHost;
     }
 
-    private byte[] depacketize(byte[] packet, int length, FuState fuState) {
-        if (length <= 12) {
-            return null;
+    private void receiveLoop(int port) {
+        try (DatagramSocket socket = new DatagramSocket(port)) {
+            socket.setReceiveBufferSize(2 * 1024 * 1024);
+            while (running.get()) {
+                receivePacket.setData(receiveBuffer, 0, receiveBuffer.length);
+                socket.receive(receivePacket);
+                lastSenderHost = receivePacket.getAddress().getHostAddress();
+                depacketizeAndQueue(receiveBuffer, receivePacket.getLength());
+                drainDecoder();
+            }
+        } catch (Exception ignored) {
         }
+    }
+
+    private void depacketizeAndQueue(byte[] packet, int length) throws Exception {
+        if (length <= 12) {
+            return;
+        }
+
         int csrcCount = packet[0] & 0x0f;
         int payloadOffset = 12 + csrcCount * 4;
         if (payloadOffset >= length) {
-            return null;
-        }
-        int nalType = packet[payloadOffset] & 0x1f;
-        if (nalType >= 1 && nalType <= 23) {
-            return withStartCode(packet, payloadOffset, length - payloadOffset);
-        }
-        if (nalType == 28 && payloadOffset + 2 < length) {
-            int fuIndicator = packet[payloadOffset] & 0xff;
-            int fuHeader = packet[payloadOffset + 1] & 0xff;
-            boolean start = (fuHeader & 0x80) != 0;
-            boolean end = (fuHeader & 0x40) != 0;
-            int reconstructedHeader = (fuIndicator & 0xe0) | (fuHeader & 0x1f);
-            int fragmentOffset = payloadOffset + 2;
-            int fragmentLength = length - fragmentOffset;
-            if (start) {
-                fuState.reset();
-                fuState.append((byte) reconstructedHeader);
-            }
-            if (!fuState.active) {
-                return null;
-            }
-            fuState.append(packet, fragmentOffset, fragmentLength);
-            if (end) {
-                byte[] nal = withStartCode(fuState.data, 0, fuState.size);
-                fuState.reset();
-                return nal;
-            }
-        }
-        return null;
-    }
-
-    private void queueNal(byte[] nal) throws Exception {
-        if (decoder == null) {
             return;
         }
-        int index = decoder.dequeueInputBuffer(5_000);
+
+        int nalType = packet[payloadOffset] & 0x1f;
+        if (nalType >= 1 && nalType <= 23) {
+            queueNal(packet, payloadOffset, length - payloadOffset);
+            return;
+        }
+
+        if (nalType != 28 || payloadOffset + 2 >= length) {
+            return;
+        }
+
+        int fuIndicator = packet[payloadOffset] & 0xff;
+        int fuHeader = packet[payloadOffset + 1] & 0xff;
+        boolean start = (fuHeader & 0x80) != 0;
+        boolean end = (fuHeader & 0x40) != 0;
+        int reconstructedHeader = (fuIndicator & 0xe0) | (fuHeader & 0x1f);
+        int fragmentOffset = payloadOffset + 2;
+        int fragmentLength = length - fragmentOffset;
+
+        if (start) {
+            fuState.reset();
+            fuState.append((byte) reconstructedHeader);
+        }
+        if (!fuState.active) {
+            return;
+        }
+        fuState.append(packet, fragmentOffset, fragmentLength);
+        if (end) {
+            queueNal(fuState.data, 0, fuState.size);
+            fuState.reset();
+        }
+    }
+
+    private void queueNal(byte[] source, int offset, int length) throws Exception {
+        MediaCodec activeDecoder = decoder;
+        if (activeDecoder == null || length <= 0) {
+            return;
+        }
+
+        int index = activeDecoder.dequeueInputBuffer(5_000);
         if (index < 0) {
             return;
         }
-        ByteBuffer input = decoder.getInputBuffer(index);
-        if (input == null) {
+
+        ByteBuffer input = activeDecoder.getInputBuffer(index);
+        if (input == null || input.capacity() < length + START_CODE.length) {
             return;
         }
+
         input.clear();
-        input.put(nal);
-        decoder.queueInputBuffer(index, 0, nal.length, System.nanoTime() / 1000, 0);
+        input.put(START_CODE);
+        input.put(source, offset, length);
+        activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, System.nanoTime() / 1000, 0);
     }
 
     private void drainDecoder() {
-        if (decoder == null) {
+        MediaCodec activeDecoder = decoder;
+        if (activeDecoder == null) {
             return;
         }
-        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+
         int output;
         do {
-            output = decoder.dequeueOutputBuffer(info, 0);
+            output = activeDecoder.dequeueOutputBuffer(bufferInfo, 0);
             if (output >= 0) {
-                decoder.releaseOutputBuffer(output, true);
+                activeDecoder.releaseOutputBuffer(output, true);
             }
         } while (output >= 0);
-    }
-
-    private static byte[] withStartCode(byte[] source, int offset, int length) {
-        byte[] out = new byte[length + 4];
-        out[0] = 0;
-        out[1] = 0;
-        out[2] = 0;
-        out[3] = 1;
-        System.arraycopy(source, offset, out, 4, length);
-        return out;
     }
 
     private static final class FuState {

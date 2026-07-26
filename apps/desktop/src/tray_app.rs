@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -68,6 +69,7 @@ pub fn run() -> Result<()> {
             _ => {}
         }
 
+        app.poll_update_status();
         app.reap_finished_pipeline();
     });
 }
@@ -83,6 +85,8 @@ struct TrayApp {
     announcer: Option<crate::lan::Announcer>,
     sleep_guard: Option<crate::power::SleepGuard>,
     render_window: Option<crate::receiver_window::RenderWindowGuard>,
+    update_status_tx: Sender<String>,
+    update_status_rx: Receiver<String>,
     tray: Option<TrayIcon>,
     items: Option<TrayItems>,
 }
@@ -101,6 +105,7 @@ impl TrayApp {
         if let Ok(enabled) = autostart::is_enabled() {
             config.autostart = enabled;
         }
+        let (update_status_tx, update_status_rx) = mpsc::channel();
 
         Ok(Self {
             config,
@@ -113,6 +118,8 @@ impl TrayApp {
             announcer: None,
             sleep_guard: None,
             render_window: None,
+            update_status_tx,
+            update_status_rx,
             tray: None,
             items: None,
         })
@@ -188,7 +195,7 @@ impl TrayApp {
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("screen-mirror")
+            .with_tooltip(app_tooltip())
             .with_icon(app_icon()?)
             .with_menu_on_left_click(false)
             .with_menu_on_right_click(true)
@@ -425,7 +432,7 @@ impl TrayApp {
     }
 
     fn check_for_updates(&self) {
-        crate::updater::start_manual_update_check();
+        crate::updater::start_manual_update_check(self.update_status_tx.clone());
         if let Some(items) = self.items.as_ref() {
             items.status.set_text("Status: update check started");
         }
@@ -632,6 +639,15 @@ impl TrayApp {
         });
     }
 
+    fn poll_update_status(&self) {
+        let Some(items) = self.items.as_ref() else {
+            return;
+        };
+        while let Ok(message) = self.update_status_rx.try_recv() {
+            items.status.set_text(message);
+        }
+    }
+
     fn set_error(&self, message: String) {
         eprintln!("{message}");
         crate::logging::append(&message);
@@ -676,6 +692,10 @@ impl TrayItems {
             autostart,
         })
     }
+}
+
+fn app_tooltip() -> String {
+    format!("Screen Mirror v{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn app_icon() -> Result<Icon> {

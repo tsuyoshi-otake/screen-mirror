@@ -3,7 +3,8 @@ use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::Sender, Once};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(30);
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static START: Once = Once::new();
+static UPDATE_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
@@ -37,8 +39,16 @@ pub fn start_background_update_checks() {
         thread::spawn(|| {
             thread::sleep(FIRST_CHECK_DELAY);
             loop {
-                if let Err(error) = check_and_start_update() {
-                    eprintln!("update check failed: {error:#}");
+                match check_and_start_update() {
+                    Ok(UpdateOutcome::UpdateStarted { latest }) => {
+                        crate::logging::append(format!(
+                            "background update started: v{latest}; exiting for installer"
+                        ));
+                        thread::sleep(Duration::from_secs(2));
+                        std::process::exit(0);
+                    }
+                    Ok(UpdateOutcome::UpToDate { .. }) => {}
+                    Err(error) => eprintln!("update check failed: {error:#}"),
                 }
                 thread::sleep(CHECK_INTERVAL);
             }
@@ -46,18 +56,41 @@ pub fn start_background_update_checks() {
     });
 }
 
-pub fn start_manual_update_check() {
-    thread::spawn(|| {
-        if let Err(error) = check_and_start_update() {
-            eprintln!("manual update check failed: {error:#}");
-            crate::logging::append(format!("manual update check failed: {error:#}"));
-        } else {
-            crate::logging::append("manual update check finished: no update");
+pub fn start_manual_update_check(status: Sender<String>) {
+    thread::spawn(move || {
+        let message = match check_and_start_update() {
+            Ok(UpdateOutcome::UpToDate { current, latest }) => {
+                crate::logging::append(format!(
+                    "manual update check finished: up to date current={current} latest={latest}"
+                ));
+                format!("Status: latest version (v{current})")
+            }
+            Ok(UpdateOutcome::UpdateStarted { latest }) => {
+                crate::logging::append(format!("manual update started: v{latest}"));
+                format!("Status: updating to v{latest}; app will restart")
+            }
+            Err(error) => {
+                eprintln!("manual update check failed: {error:#}");
+                crate::logging::append(format!("manual update check failed: {error:#}"));
+                format!("Error: update check failed: {error:#}")
+            }
+        };
+        if let Err(error) = status.send(message) {
+            crate::logging::append(format!("failed to publish update status: {error}"));
+        }
+        if UPDATE_STARTED.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(2));
+            std::process::exit(0);
         }
     });
 }
 
-fn check_and_start_update() -> Result<()> {
+enum UpdateOutcome {
+    UpToDate { current: String, latest: String },
+    UpdateStarted { latest: String },
+}
+
+fn check_and_start_update() -> Result<UpdateOutcome> {
     let release = latest_release()?;
     let latest = parse_version(&release.tag_name).with_context(|| {
         format!(
@@ -68,7 +101,10 @@ fn check_and_start_update() -> Result<()> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))?;
 
     if latest <= current {
-        return Ok(());
+        return Ok(UpdateOutcome::UpToDate {
+            current: env!("CARGO_PKG_VERSION").to_string(),
+            latest: release.tag_name.trim_start_matches('v').to_string(),
+        });
     }
 
     let asset = release
@@ -83,8 +119,12 @@ fn check_and_start_update() -> Result<()> {
         })
         .ok_or_else(|| anyhow!("release {} has no MSI asset", release.tag_name))?;
     let installer = download_installer(&asset.browser_download_url, &release.tag_name)?;
-    start_installer_and_exit(&installer)?;
-    Ok(())
+    let latest_text = release.tag_name.trim_start_matches('v').to_string();
+    start_update_runner(&installer, &latest_text)?;
+    UPDATE_STARTED.store(true, Ordering::SeqCst);
+    Ok(UpdateOutcome::UpdateStarted {
+        latest: latest_text,
+    })
 }
 
 fn latest_release() -> Result<GithubRelease> {
@@ -130,15 +170,74 @@ fn download_installer(url: &str, tag_name: &str) -> Result<PathBuf> {
     Ok(installer)
 }
 
-fn start_installer_and_exit(installer: &PathBuf) -> Result<()> {
-    hidden_command("msiexec.exe")
-        .arg("/i")
-        .arg(installer)
-        .args(["/qn", "/norestart"])
-        .spawn()
-        .context("failed to start MSI update process")?;
+fn start_update_runner(installer: &PathBuf, latest: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let dir = update_dir()?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let script = dir.join("run-update.ps1");
+    let log = dir.join(format!("ScreenMirror-update-v{latest}.log"));
+    fs::write(&script, update_runner_script())
+        .with_context(|| format!("failed to write {}", script.display()))?;
 
-    std::process::exit(0);
+    hidden_command("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Installer")
+        .arg(installer)
+        .arg("-CurrentExe")
+        .arg(exe)
+        .arg("-LogPath")
+        .arg(log)
+        .spawn()
+        .context("failed to start update runner")?;
+
+    Ok(())
+}
+
+fn update_runner_script() -> &'static str {
+    r#"
+param(
+    [Parameter(Mandatory = $true)]
+    [string] $Installer,
+
+    [Parameter(Mandatory = $true)]
+    [string] $CurrentExe,
+
+    [Parameter(Mandatory = $true)]
+    [string] $LogPath
+)
+
+$ErrorActionPreference = "Continue"
+Start-Sleep -Seconds 2
+
+$arguments = @(
+    "/i",
+    "`"$Installer`"",
+    "/qn",
+    "/norestart",
+    "/L*v",
+    "`"$LogPath`""
+)
+$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+
+if ($process.ExitCode -ne 0) {
+    if (Test-Path -LiteralPath $CurrentExe) {
+        Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
+    }
+    exit $process.ExitCode
+}
+
+Start-Sleep -Seconds 5
+$running = @(Get-Process screen-mirror -ErrorAction SilentlyContinue)
+if ($running.Count -eq 0) {
+    $installedExe = Join-Path $env:ProgramFiles "Screen Mirror\screen-mirror.exe"
+    if (Test-Path -LiteralPath $installedExe) {
+        Start-Process -FilePath $installedExe -ArgumentList "tray" | Out-Null
+    } elseif (Test-Path -LiteralPath $CurrentExe) {
+        Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
+    }
+}
+"#
 }
 
 fn hidden_command(program: &str) -> Command {

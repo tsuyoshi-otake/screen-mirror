@@ -136,19 +136,8 @@ pub fn preferred_virtual_monitor_index() -> Option<i32> {
     preferred_virtual_monitor().and_then(|monitor| monitor.capture_index)
 }
 
-pub fn preferred_virtual_monitor_summary() -> Option<String> {
-    preferred_virtual_monitor().map(|monitor| {
-        format!(
-            "adapter={} description={} capture-index={:?} hmonitor={:?} attached={} bundled-vdd={} device-id={}",
-            monitor.adapter_name,
-            monitor.adapter_description,
-            monitor.capture_index,
-            monitor.monitor_handle,
-            monitor.attached,
-            monitor.bundled_virtual_display,
-            monitor.device_id
-        )
-    })
+pub fn preferred_virtual_capture_target() -> Option<DisplayMonitor> {
+    preferred_virtual_monitor()
 }
 
 pub fn resolve_capture_monitor_index(requested: i32, prefer_virtual_display: bool) -> i32 {
@@ -233,6 +222,21 @@ fn preferred_virtual_monitor() -> Option<DisplayMonitor> {
                     && !looks_like_superdisplay(monitor)
             })
         })
+}
+
+impl DisplayMonitor {
+    pub fn summary(&self) -> String {
+        format!(
+            "adapter={} description={} capture-index={:?} hmonitor={:?} attached={} bundled-vdd={} device-id={}",
+            self.adapter_name,
+            self.adapter_description,
+            self.capture_index,
+            self.monitor_handle,
+            self.attached,
+            self.bundled_virtual_display,
+            self.device_id
+        )
+    }
 }
 
 fn run_bundled_vdd_action(action: &str, force: bool) {
@@ -417,9 +421,10 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
             .filter(|value| !value.is_empty());
 
         let combined = format!(
-            "{adapter_name} {adapter_description} {adapter_device_id} {} {}",
+            "{adapter_name} {adapter_description} {adapter_device_id} {} {} {}",
             monitor_name.as_deref().unwrap_or(""),
-            monitor_description.as_deref().unwrap_or("")
+            monitor_description.as_deref().unwrap_or(""),
+            monitor_device_id.as_deref().unwrap_or("")
         );
 
         let bundled_virtual_display = looks_like_bundled_virtual_display(&combined);
@@ -537,7 +542,7 @@ fn looks_like_virtual_display(value: &str) -> bool {
 
 fn looks_like_bundled_virtual_display(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
-    ["mtt1337", "mttvdd", "vdd by mtt", "virtual display driver"]
+    ["mtt1337", "mttvdd", "vdd by mtt"]
         .iter()
         .any(|needle| value.contains(needle))
 }
@@ -580,4 +585,22 @@ fn wide_array_to_string(buffer: &[u16]) -> String {
 #[cfg(windows)]
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_vdd_requires_mtt_identity() {
+        assert!(looks_like_bundled_virtual_display(
+            r"MONITOR\MTT1337 Generic Monitor (VDD by MTT)"
+        ));
+        assert!(!looks_like_bundled_virtual_display(
+            r"SuperDisplay Virtual Adapter MONITOR\Default_Monitor"
+        ));
+        assert!(!looks_like_bundled_virtual_display(
+            "Virtual Display Driver"
+        ));
+    }
 }

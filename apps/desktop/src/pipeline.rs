@@ -282,26 +282,36 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
 
     let encoder = select_encoder(args.encoder, args.allow_software_encoder)?;
     let clients = multi_udp_clients(&args.host, args.port)?;
-    if args.prefer_virtual_display && args.monitor_index < 0 {
-        match crate::monitors::preferred_virtual_monitor_summary() {
-            Some(summary) => {
-                crate::logging::append(format!("sender preferred virtual display: {summary}"))
-            }
-            None => crate::logging::append("sender preferred virtual display: not found"),
-        }
-    }
     let show_cursor = if args.no_cursor { "false" } else { "true" };
     let source = if args.prefer_virtual_display && args.monitor_index < 0 {
-        let monitor_index =
-            crate::monitors::resolve_capture_monitor_index(args.monitor_index, true);
-        crate::logging::append(format!(
-            "sender capture monitor-index selected: {monitor_index}; capture-api={}",
-            args.capture_api
-        ));
-        format!(
-            "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
-            args.capture_api, monitor_index, show_cursor
-        )
+        match crate::monitors::preferred_virtual_capture_target() {
+            Some(target) => {
+                crate::logging::append(format!(
+                    "sender preferred virtual display: {}",
+                    target.summary()
+                ));
+                if let Some(monitor_handle) = target.monitor_handle {
+                    crate::logging::append(format!(
+                        "sender capture monitor-handle selected: {monitor_handle}; capture-api={}; adapter={}",
+                        args.capture_api, target.adapter_name
+                    ));
+                } else if !target.bundled_virtual_display {
+                    let monitor_index = target.capture_index.unwrap_or(-1);
+                    crate::logging::append(format!(
+                        "sender fallback capture monitor-index selected: {monitor_index}; capture-api={}; adapter={}",
+                        args.capture_api, target.adapter_name
+                    ));
+                }
+                capture_source_for_target(args.capture_api, show_cursor, &target)?
+            }
+            None => {
+                crate::logging::append("sender preferred virtual display: not found");
+                format!(
+                    "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
+                    args.capture_api, args.monitor_index, show_cursor
+                )
+            }
+        }
     } else {
         let monitor_index = crate::monitors::resolve_capture_monitor_index(
             args.monitor_index,
@@ -339,6 +349,30 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
     }
 
     Ok(format!("{video} {}", build_sender_audio_chain(args)?))
+}
+
+fn capture_source_for_target(
+    capture_api: CaptureApi,
+    show_cursor: &str,
+    target: &crate::monitors::DisplayMonitor,
+) -> Result<String> {
+    if let Some(monitor_handle) = target.monitor_handle {
+        return Ok(format!(
+            "d3d11screencapturesrc capture-api={capture_api} monitor-handle={monitor_handle} show-cursor={show_cursor}"
+        ));
+    }
+
+    if target.bundled_virtual_display {
+        return Err(anyhow!(
+            "bundled virtual display {} has no stable monitor handle; refusing ambiguous monitor-index capture",
+            target.adapter_name
+        ));
+    }
+
+    let monitor_index = target.capture_index.unwrap_or(-1);
+    Ok(format!(
+        "d3d11screencapturesrc capture-api={capture_api} monitor-index={monitor_index} show-cursor={show_cursor}"
+    ))
 }
 
 pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
@@ -776,4 +810,51 @@ fn has_explicit_port(host: &str) -> bool {
 
 fn gst_string_literal(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn virtual_monitor(handle: Option<u64>, bundled: bool) -> crate::monitors::DisplayMonitor {
+        crate::monitors::DisplayMonitor {
+            capture_index: Some(2),
+            monitor_handle: handle,
+            adapter_name: r"\\.\DISPLAY24".to_string(),
+            adapter_description: "Virtual Display Driver".to_string(),
+            monitor_name: None,
+            monitor_description: Some("Generic Monitor (VDD by MTT)".to_string()),
+            device_id: r"MONITOR\MTT1337\test".to_string(),
+            attached: true,
+            primary: false,
+            mirroring: false,
+            virtual_candidate: true,
+            bundled_virtual_display: bundled,
+        }
+    }
+
+    #[test]
+    fn stable_monitor_handle_wins_over_ambiguous_index() {
+        let source = capture_source_for_target(
+            CaptureApi::Dxgi,
+            "true",
+            &virtual_monitor(Some(31_199_895), true),
+        )
+        .unwrap();
+
+        assert!(source.contains("capture-api=dxgi"));
+        assert!(source.contains("monitor-handle=31199895"));
+        assert!(!source.contains("monitor-index="));
+    }
+
+    #[test]
+    fn bundled_vdd_without_handle_does_not_fall_back_to_index() {
+        let error =
+            capture_source_for_target(CaptureApi::Dxgi, "true", &virtual_monitor(None, true))
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("refusing ambiguous monitor-index"));
+    }
 }

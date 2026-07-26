@@ -64,7 +64,7 @@ function Invoke-ScreenMirror([string[]] $Arguments) {
     try {
         $process = Start-Process -FilePath $screenMirror `
             -ArgumentList $Arguments `
-            -NoNewWindow `
+            -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath `
             -Wait `
@@ -98,6 +98,98 @@ function Read-Pin {
         return $match.Matches[0].Groups[1].Value
     }
     "0000"
+}
+
+function Get-MonitorHandles {
+    $source = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class ScreenMirrorNativeMonitors {
+    public struct Entry {
+        public string Device;
+        public IntPtr Handle;
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFOEX {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public int dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string szDevice;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    private delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEX lpmi);
+
+    public static Entry[] Enumerate() {
+        var entries = new List<Entry>();
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr handle, IntPtr dc, ref RECT rect, IntPtr data) {
+            var info = new MONITORINFOEX();
+            info.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+            if (GetMonitorInfo(handle, ref info)) {
+                entries.Add(new Entry {
+                    Device = info.szDevice,
+                    Handle = handle,
+                    Left = info.rcMonitor.Left,
+                    Top = info.rcMonitor.Top,
+                    Right = info.rcMonitor.Right,
+                    Bottom = info.rcMonitor.Bottom
+                });
+            }
+            return true;
+        }, IntPtr.Zero);
+        return entries.ToArray();
+    }
+}
+"@
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'ScreenMirrorNativeMonitors').Type) {
+            Add-Type -TypeDefinition $source -ErrorAction Stop
+        }
+        [ScreenMirrorNativeMonitors]::Enumerate() | ForEach-Object {
+            [PSCustomObject]@{
+                Device = $_.Device
+                HMonitor = $_.Handle.ToInt64()
+                Bounds = ("{0},{1} {2}x{3}" -f $_.Left, $_.Top, ($_.Right - $_.Left), ($_.Bottom - $_.Top))
+            }
+        }
+    } catch {
+        "ERROR: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-GstInspect([string[]] $Arguments) {
+    $candidates = @()
+    $appDir = Split-Path -Parent $screenMirror
+    $candidates += (Join-Path $appDir "bin\gst-inspect-1.0.exe")
+    $candidates += (Join-Path $env:ProgramFiles "gstreamer\1.0\msvc_x86_64\bin\gst-inspect-1.0.exe")
+    $candidates += "gst-inspect-1.0.exe"
+    $exe = $candidates | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+    if (-not $exe) {
+        return "gst-inspect-1.0.exe not found"
+    }
+    & $exe @Arguments 2>&1 | Out-String
 }
 
 function Get-BundledVddDevices {
@@ -219,8 +311,16 @@ Add-CommandOutput "Windows Display Devices" {
     Invoke-ScreenMirror @("monitors")
 }
 
+Add-CommandOutput "Windows Monitor Handles" {
+    Get-MonitorHandles | Format-Table -AutoSize
+}
+
 Add-CommandOutput "GStreamer Probe" {
     Invoke-ScreenMirror @("probe")
+}
+
+Add-CommandOutput "GStreamer D3D11 Screen Capture Source" {
+    Invoke-GstInspect @("d3d11screencapturesrc")
 }
 
 Add-CommandOutput "Receiver Discovery" {

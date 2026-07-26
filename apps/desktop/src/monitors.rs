@@ -68,6 +68,9 @@ pub fn print_monitors() {
         if let Some(description) = &monitor.monitor_description {
             crate::console::line(format!("    name: {description}"));
         }
+        if let Some(handle) = monitor.monitor_handle {
+            crate::console::line(format!("    hmonitor: {handle}"));
+        }
         if !monitor.device_id.is_empty() {
             crate::console::line(format!("    id: {}", monitor.device_id));
         }
@@ -96,7 +99,7 @@ pub fn primary_display_info() -> Option<sm_core::discovery::DisplayInfo> {
 pub fn request_extended_desktop() {
     #[cfg(windows)]
     {
-        let result = std::process::Command::new("DisplaySwitch.exe")
+        let result = crate::process::hidden_command("DisplaySwitch.exe")
             .arg("/extend")
             .status();
         if let Err(error) = result {
@@ -133,8 +136,19 @@ pub fn preferred_virtual_monitor_index() -> Option<i32> {
     preferred_virtual_monitor().and_then(|monitor| monitor.capture_index)
 }
 
-pub fn preferred_virtual_monitor_handle() -> Option<u64> {
-    preferred_virtual_monitor().and_then(|monitor| monitor.monitor_handle)
+pub fn preferred_virtual_monitor_summary() -> Option<String> {
+    preferred_virtual_monitor().map(|monitor| {
+        format!(
+            "adapter={} description={} capture-index={:?} hmonitor={:?} attached={} bundled-vdd={} device-id={}",
+            monitor.adapter_name,
+            monitor.adapter_description,
+            monitor.capture_index,
+            monitor.monitor_handle,
+            monitor.attached,
+            monitor.bundled_virtual_display,
+            monitor.device_id
+        )
+    })
 }
 
 pub fn resolve_capture_monitor_index(requested: i32, prefer_virtual_display: bool) -> i32 {
@@ -238,7 +252,7 @@ fn run_bundled_vdd_action(action: &str, force: bool) {
             ));
             return;
         }
-        let mut command = std::process::Command::new("powershell.exe");
+        let mut command = crate::process::hidden_command("powershell.exe");
         command
             .args([
                 "-NoProfile",
@@ -383,13 +397,6 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
         let attached = adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP != 0;
         let mirroring = adapter.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER != 0;
         let primary = adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE != 0;
-        let current_capture_index = if attached && !mirroring {
-            let index = capture_index;
-            capture_index += 1;
-            Some(index)
-        } else {
-            None
-        };
 
         let adapter_name = wide_array_to_string(&adapter.DeviceName);
         let adapter_description = wide_array_to_string(&adapter.DeviceString);
@@ -416,12 +423,21 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
         );
 
         let bundled_virtual_display = looks_like_bundled_virtual_display(&combined);
+        let handle_info = handles
+            .iter()
+            .find(|info| info.device_name.eq_ignore_ascii_case(&adapter_name));
+        let current_capture_index = if attached && !mirroring {
+            let fallback_index = capture_index;
+            capture_index += 1;
+            handle_info
+                .map(|info| info.monitor_index)
+                .or(Some(fallback_index))
+        } else {
+            None
+        };
         monitors.push(DisplayMonitor {
             capture_index: current_capture_index,
-            monitor_handle: handles
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_name))
-                .map(|(_, handle)| *handle),
+            monitor_handle: handle_info.map(|info| info.handle),
             adapter_name,
             adapter_description,
             monitor_name,
@@ -446,7 +462,14 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
 }
 
 #[cfg(windows)]
-fn monitor_handles_by_device_name() -> Vec<(String, u64)> {
+struct MonitorHandleInfo {
+    device_name: String,
+    handle: u64,
+    monitor_index: i32,
+}
+
+#[cfg(windows)]
+fn monitor_handles_by_device_name() -> Vec<MonitorHandleInfo> {
     use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
@@ -458,11 +481,15 @@ fn monitor_handles_by_device_name() -> Vec<(String, u64)> {
         _rect: *mut RECT,
         data: LPARAM,
     ) -> BOOL {
-        let handles = &mut *(data as *mut Vec<(String, u64)>);
+        let handles = &mut *(data as *mut Vec<MonitorHandleInfo>);
         let mut info: MONITORINFOEXW = std::mem::zeroed();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
         if GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut _) != 0 {
-            handles.push((wide_array_to_string(&info.szDevice), monitor as u64));
+            handles.push(MonitorHandleInfo {
+                device_name: wide_array_to_string(&info.szDevice),
+                handle: monitor as u64,
+                monitor_index: handles.len() as i32,
+            });
         }
         TRUE
     }
@@ -473,7 +500,7 @@ fn monitor_handles_by_device_name() -> Vec<(String, u64)> {
             std::ptr::null_mut(),
             std::ptr::null(),
             Some(callback),
-            &mut handles as *mut Vec<(String, u64)> as LPARAM,
+            &mut handles as *mut Vec<MonitorHandleInfo> as LPARAM,
         );
     }
     handles

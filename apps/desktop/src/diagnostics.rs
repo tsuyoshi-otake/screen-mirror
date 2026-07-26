@@ -118,7 +118,7 @@ $path = $args[0]
 Get-Content -LiteralPath $path -Raw | Set-Clipboard
 Start-Process -FilePath "notepad.exe" -ArgumentList "`"$path`""
 "#;
-    std::process::Command::new("powershell.exe")
+    crate::process::hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -172,7 +172,7 @@ fn collect_local_report() -> Result<String> {
         ));
     }
 
-    let output = std::process::Command::new("powershell.exe")
+    let output = crate::process::hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",

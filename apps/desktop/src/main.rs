@@ -10,6 +10,7 @@ mod logging;
 mod monitors;
 mod pipeline;
 mod power;
+mod process;
 mod receiver_window;
 mod single_instance;
 mod tray_app;

@@ -455,7 +455,7 @@ impl TrayApp {
             return;
         }
 
-        if let Err(error) = std::process::Command::new("powershell.exe")
+        if let Err(error) = crate::process::hidden_command("powershell.exe")
             .args([
                 "-NoProfile",
                 "-ExecutionPolicy",
@@ -535,7 +535,7 @@ impl TrayApp {
             return;
         }
 
-        if let Err(error) = std::process::Command::new("powershell.exe")
+        if let Err(error) = crate::process::hidden_command("powershell.exe")
             .args([
                 "-NoProfile",
                 "-ExecutionPolicy",

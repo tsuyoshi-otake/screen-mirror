@@ -282,29 +282,26 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
 
     let encoder = select_encoder(args.encoder, args.allow_software_encoder)?;
     let clients = multi_udp_clients(&args.host, args.port)?;
+    if args.prefer_virtual_display && args.monitor_index < 0 {
+        match crate::monitors::preferred_virtual_monitor_summary() {
+            Some(summary) => {
+                crate::logging::append(format!("sender preferred virtual display: {summary}"))
+            }
+            None => crate::logging::append("sender preferred virtual display: not found"),
+        }
+    }
     let show_cursor = if args.no_cursor { "false" } else { "true" };
     let source = if args.prefer_virtual_display && args.monitor_index < 0 {
-        if let Some(monitor_handle) = crate::monitors::preferred_virtual_monitor_handle() {
-            crate::logging::append(format!(
-                "sender capture monitor-handle selected: {monitor_handle}"
-            ));
-            format!(
-                "d3d11screencapturesrc capture-api={} monitor-handle={} show-cursor={}",
-                args.capture_api, monitor_handle, show_cursor
-            )
-        } else {
-            let monitor_index = crate::monitors::resolve_capture_monitor_index(
-                args.monitor_index,
-                args.prefer_virtual_display,
-            );
-            crate::logging::append(format!(
-                "sender capture monitor-index selected: {monitor_index}"
-            ));
-            format!(
-                "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
-                args.capture_api, monitor_index, show_cursor
-            )
-        }
+        let monitor_index =
+            crate::monitors::resolve_capture_monitor_index(args.monitor_index, true);
+        crate::logging::append(format!(
+            "sender capture monitor-index selected: {monitor_index}; capture-api={}",
+            args.capture_api
+        ));
+        format!(
+            "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
+            args.capture_api, monitor_index, show_cursor
+        )
     } else {
         let monitor_index = crate::monitors::resolve_capture_monitor_index(
             args.monitor_index,
@@ -315,6 +312,7 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
             args.capture_api, monitor_index, show_cursor
         )
     };
+    crate::logging::append(format!("sender pipeline source: {source}"));
     let caps = video_caps(
         args.fps,
         args.width,
@@ -526,7 +524,9 @@ fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) ->
             "d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,framerate={fps}/1{size}"
         )
     } else {
-        format!("d3d11download ! videoconvert ! video/x-raw,format=NV12,framerate={fps}/1{size}")
+        format!(
+            "d3d11convert ! d3d11download ! videoconvert ! video/x-raw,format=NV12,framerate={fps}/1{size}"
+        )
     }
 }
 
@@ -540,7 +540,7 @@ enum SelectedEncoder {
 
 impl SelectedEncoder {
     fn uses_d3d11_input(self) -> bool {
-        matches!(self, Self::Nvidia | Self::MediaFoundation | Self::QuickSync)
+        matches!(self, Self::Nvidia)
     }
 
     fn chain(self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {

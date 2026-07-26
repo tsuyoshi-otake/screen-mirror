@@ -218,7 +218,7 @@ $arguments = @(
     "/L*v",
     "`"$LogPath`""
 )
-$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
 
 if ($process.ExitCode -ne 0) {
     if (Test-Path -LiteralPath $CurrentExe) {

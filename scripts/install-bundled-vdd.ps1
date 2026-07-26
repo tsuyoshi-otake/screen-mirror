@@ -163,7 +163,7 @@ function Invoke-ScreenMirror {
     try {
         $process = Start-Process -FilePath $ExePath `
             -ArgumentList $Arguments `
-            -NoNewWindow `
+            -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath `
             -Wait `

@@ -536,7 +536,14 @@ impl TrayApp {
         }
 
         if let Err(error) = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+            ])
             .arg(script)
             .args(["-Action", action])
             .spawn()
@@ -546,8 +553,8 @@ impl TrayApp {
     }
 
     fn open_display_settings(&self) {
-        if let Err(error) = std::process::Command::new("cmd.exe")
-            .args(["/C", "start", "", "ms-settings:display"])
+        if let Err(error) = std::process::Command::new("explorer.exe")
+            .arg("ms-settings:display")
             .spawn()
         {
             eprintln!("failed to open display settings: {error}");
@@ -555,13 +562,8 @@ impl TrayApp {
     }
 
     fn open_vdd_page(&self) {
-        if let Err(error) = std::process::Command::new("cmd.exe")
-            .args([
-                "/C",
-                "start",
-                "",
-                "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases",
-            ])
+        if let Err(error) = std::process::Command::new("explorer.exe")
+            .arg("https://github.com/VirtualDrivers/Virtual-Display-Driver/releases")
             .spawn()
         {
             eprintln!("failed to open VDD page: {error}");

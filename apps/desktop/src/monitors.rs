@@ -218,7 +218,14 @@ fn run_bundled_vdd_action(action: &str, force: bool) {
         }
         let mut command = std::process::Command::new("powershell.exe");
         command
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+            ])
             .arg(script)
             .args(["-Action", action]);
         if force {

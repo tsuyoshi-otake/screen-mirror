@@ -123,6 +123,8 @@ Start-Process -FilePath "notepad.exe" -ArgumentList "`"$path`""
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
+            "-WindowStyle",
+            "Hidden",
             "-Command",
             script,
         ])
@@ -171,7 +173,14 @@ fn collect_local_report() -> Result<String> {
     }
 
     let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
         .arg(script)
         .args(["-NoClipboard", "-NoNotepad", "-Stdout"])
         .output()

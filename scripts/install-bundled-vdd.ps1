@@ -24,6 +24,8 @@ function Start-ElevatedSelf {
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
+        "-WindowStyle",
+        "Hidden",
         "-File",
         "`"$PSCommandPath`"",
         "-Action",

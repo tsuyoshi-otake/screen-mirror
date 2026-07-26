@@ -333,7 +333,7 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     let sink = select_sink(args.sink, args.fullscreen)?;
 
     let video = format!(
-        "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=3000000000 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
+        "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
          ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
          ! rtph264depay \
@@ -414,6 +414,7 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("pipeline description did not create a GstPipeline"))?;
     let bus = pipeline.bus().context("pipeline has no bus")?;
+    arm_receiver_timeout_after_first_packet(&pipeline);
 
     pipeline
         .set_state(gst::State::Playing)
@@ -474,6 +475,21 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
         .context("failed to stop pipeline")?;
 
     result
+}
+
+fn arm_receiver_timeout_after_first_packet(pipeline: &gst::Pipeline) {
+    let Some(source) = pipeline.by_name("receiver_video_src") else {
+        return;
+    };
+    let Some(pad) = source.static_pad("src") else {
+        return;
+    };
+    let source_for_probe = source.clone();
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        source_for_probe.set_property("timeout", 3_000_000_000_u64);
+        crate::logging::append("receiver video packets started; disconnect timeout armed");
+        gst::PadProbeReturn::Remove
+    });
 }
 
 fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) -> String {

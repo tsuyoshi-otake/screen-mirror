@@ -469,20 +469,17 @@ fn app_icon() -> Result<Icon> {
     let mut rgba = Vec::with_capacity(size * size * 4);
     for y in 0..size {
         for x in 0..size {
-            let screen_border = (4..=27).contains(&x)
-                && (6..=22).contains(&y)
-                && (x <= 6 || x >= 25 || y <= 8 || y >= 20);
-            let arrow = (10..=23).contains(&x) && (13..=17).contains(&y)
-                || (18..=23).contains(&x)
-                    && (10..=20).contains(&y)
-                    && (x + y >= 30)
-                    && (x >= y - 2);
-            let stand = (14..=17).contains(&x) && (23..=25).contains(&y)
-                || (10..=21).contains(&x) && (26..=27).contains(&y);
-            let (red, green, blue, alpha) = if screen_border || arrow || stand {
-                (34, 199, 255, 255)
+            let rear_screen = (1..=24).contains(&x)
+                && (5..=23).contains(&y)
+                && ((x <= 4 || x >= 21 || y <= 7 || y >= 20) && !(x >= 11 && y >= 13));
+            let front_screen = (10..=31).contains(&x)
+                && (11..=26).contains(&y)
+                && (x <= 13 || x >= 28 || y <= 13 || y >= 23);
+            let stand = (17..=23).contains(&x) && (28..=29).contains(&y);
+            let (red, green, blue, alpha) = if rear_screen || front_screen || stand {
+                (17, 17, 17, 255)
             } else {
-                (10, 16, 32, 255)
+                (0, 0, 0, 0)
             };
             rgba.extend_from_slice(&[red, green, blue, alpha]);
         }

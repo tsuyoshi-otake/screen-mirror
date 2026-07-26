@@ -461,28 +461,65 @@ impl TrayItems {
 }
 
 fn app_icon() -> Result<Icon> {
-    if let Ok(icon) = Icon::from_resource(1, Some((32, 32))) {
-        return Ok(icon);
+    let dark_mode = is_dark_system_theme();
+    if let Some(icon_path) = std::env::current_exe().ok().and_then(|path| {
+        path.parent().map(|parent| {
+            parent.join(if dark_mode {
+                "screen-mirror-dark.ico"
+            } else {
+                "screen-mirror.ico"
+            })
+        })
+    }) {
+        if icon_path.exists() {
+            if let Ok(icon) = Icon::from_path(icon_path, Some((32, 32))) {
+                return Ok(icon);
+            }
+        }
     }
 
     let size = 32;
     let mut rgba = Vec::with_capacity(size * size * 4);
+    let color = if dark_mode { 245 } else { 17 };
     for y in 0..size {
         for x in 0..size {
-            let rear_screen = (1..=24).contains(&x)
-                && (5..=23).contains(&y)
-                && ((x <= 4 || x >= 21 || y <= 7 || y >= 20) && !(x >= 11 && y >= 13));
-            let front_screen = (10..=31).contains(&x)
-                && (11..=26).contains(&y)
-                && (x <= 13 || x >= 28 || y <= 13 || y >= 23);
-            let stand = (17..=23).contains(&x) && (28..=29).contains(&y);
-            let (red, green, blue, alpha) = if rear_screen || front_screen || stand {
-                (17, 17, 17, 255)
-            } else {
-                (0, 0, 0, 0)
-            };
+            let border = (3..=28).contains(&x)
+                && (6..=22).contains(&y)
+                && (x <= 5 || x >= 26 || y <= 8 || y >= 20);
+            let divider = (15..=17).contains(&x) && (7..=21).contains(&y);
+            let left_arrow = (9..=16).contains(&x) && (13..=17).contains(&y)
+                || (12..=16).contains(&x) && (10..=20).contains(&y) && x + y >= 26;
+            let right_arrow = (16..=23).contains(&x) && (13..=17).contains(&y)
+                || (16..=20).contains(&x) && (10..=20).contains(&y) && x + y <= 36;
+            let stand = (10..=21).contains(&x) && (26..=27).contains(&y);
+            let (red, green, blue, alpha) =
+                if border || divider || left_arrow || right_arrow || stand {
+                    (color, color, color, 255)
+                } else {
+                    (0, 0, 0, 0)
+                };
             rgba.extend_from_slice(&[red, green, blue, alpha]);
         }
     }
     Icon::from_rgba(rgba, size as u32, size as u32).context("failed to create tray icon image")
+}
+
+#[cfg(windows)]
+fn is_dark_system_theme() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(key) =
+        hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+    else {
+        return false;
+    };
+    let system_uses_light_theme = key.get_value::<u32, _>("SystemUsesLightTheme").unwrap_or(1);
+    system_uses_light_theme == 0
+}
+
+#[cfg(not(windows))]
+fn is_dark_system_theme() -> bool {
+    false
 }

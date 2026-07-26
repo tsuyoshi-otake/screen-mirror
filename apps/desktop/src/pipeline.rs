@@ -17,6 +17,22 @@ pub struct SendArgs {
     #[arg(long, default_value_t = 5004)]
     pub port: u16,
 
+    /// Enable low-latency Opus/RTP system-audio loopback transfer.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub audio_enabled: bool,
+
+    /// Receiver UDP audio port.
+    #[arg(long, default_value_t = 5005)]
+    pub audio_port: u16,
+
+    /// Opus audio bitrate in bit/sec.
+    #[arg(long, default_value_t = 96_000)]
+    pub audio_bitrate: u32,
+
+    /// Opus frame size in ms: 2.5, 5, 10, 20, 40, or 60.
+    #[arg(long, default_value = "5")]
+    pub audio_frame_ms: String,
+
     /// Maximum receivers to auto-connect to when host is "auto".
     #[arg(long, default_value_t = 3)]
     pub max_receivers: u32,
@@ -95,6 +111,18 @@ pub struct RecvArgs {
     /// Local UDP port to listen on.
     #[arg(long, default_value_t = 5004)]
     pub port: u16,
+
+    /// Enable low-latency Opus/RTP audio playback.
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    pub audio_enabled: bool,
+
+    /// Local UDP audio port to listen on.
+    #[arg(long, default_value_t = 5005)]
+    pub audio_port: u16,
+
+    /// RTP audio jitter buffer latency in milliseconds.
+    #[arg(long, default_value_t = 15)]
+    pub audio_jitter_ms: u32,
 
     /// Four-digit PIN advertised for LAN discovery pairing.
     #[arg(long, default_value = DEFAULT_PIN)]
@@ -228,7 +256,9 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
     ensure_positive("mtu", args.mtu)?;
     ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
     ensure_positive("max-receivers", args.max_receivers)?;
+    ensure_positive("audio-bitrate", args.audio_bitrate)?;
     validate_qos_dscp(args.qos_dscp)?;
+    validate_audio_frame_ms(&args.audio_frame_ms)?;
 
     if args.width.is_some() != args.height.is_some() {
         return Err(anyhow!("--width and --height must be specified together"));
@@ -259,7 +289,7 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
     );
     let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
 
-    Ok(format!(
+    let video = format!(
         "{source} ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {caps} \
          ! {encoder_chain} \
@@ -270,7 +300,13 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
         gst_string_literal(&clients),
         args.udp_buffer_size,
         args.qos_dscp
-    ))
+    );
+
+    if !args.audio_enabled {
+        return Ok(video);
+    }
+
+    Ok(format!("{video} {}", build_sender_audio_chain(args)?))
 }
 
 pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
@@ -280,11 +316,12 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     ensure_positive("jitter-faststart-packets", args.jitter_faststart_packets)?;
     ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
     ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
+    ensure_positive("audio-jitter-ms", args.audio_jitter_ms)?;
 
     let decoder = select_decoder(args.decoder)?;
     let sink = select_sink(args.sink, args.fullscreen)?;
 
-    Ok(format!(
+    let video = format!(
         "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
          ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
@@ -301,6 +338,57 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
         args.jitter_faststart_packets,
         args.jitter_max_dropout_ms,
         args.jitter_max_misorder_ms
+    );
+
+    if !args.audio_enabled {
+        return Ok(video);
+    }
+
+    Ok(format!("{video} {}", build_receiver_audio_chain(args)?))
+}
+
+fn build_sender_audio_chain(args: &SendArgs) -> Result<String> {
+    require_element("wasapi2src", ())?;
+    require_element("audioconvert", ())?;
+    require_element("audioresample", ())?;
+    require_element("opusenc", ())?;
+    require_element("rtpopuspay", ())?;
+    require_element("multiudpsink", ())?;
+    let clients = multi_udp_clients_force_port(&args.host, args.audio_port)?;
+    Ok(format!(
+        "wasapi2src loopback=true low-latency=true buffer-time=10000 latency-time=2500 provide-clock=false \
+         ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 \
+         ! opusenc bitrate={} bitrate-type=cbr audio-type=restricted-lowdelay frame-size={} inband-fec=false dtx=false \
+         ! rtpopuspay pt=97 mtu={} perfect-rtptime=true \
+         ! multiudpsink clients={} sync=false async=false buffer-size={} qos-dscp={} send-duplicates=false ttl=1",
+        args.audio_bitrate,
+        args.audio_frame_ms,
+        args.mtu,
+        gst_string_literal(&clients),
+        args.udp_buffer_size,
+        args.qos_dscp
+    ))
+}
+
+fn build_receiver_audio_chain(args: &RecvArgs) -> Result<String> {
+    require_element("rtpopusdepay", ())?;
+    require_element("opusdec", ())?;
+    require_element("audioconvert", ())?;
+    require_element("audioresample", ())?;
+    let sink = if has_element("wasapi2sink") {
+        "wasapi2sink low-latency=true buffer-time=10000 latency-time=2500 sync=false async=false"
+    } else {
+        "autoaudiosink sync=false"
+    };
+    Ok(format!(
+        "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false caps=\"application/x-rtp,media=(string)audio,clock-rate=(int)48000,encoding-name=(string)OPUS,payload=(int)97\" \
+         ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets=2 \
+         ! rtpopusdepay ! opusdec plc=true \
+         ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! audioconvert ! audioresample ! {sink}",
+        args.audio_port, args.udp_buffer_size, args.mtu, args.audio_jitter_ms
     ))
 }
 
@@ -527,6 +615,10 @@ pub fn probe_elements() {
         ("qsv encode", "qsvh264enc"),
         ("cpu encode", "x264enc"),
         ("rtp pay", "rtph264pay"),
+        ("opus encode", "opusenc"),
+        ("opus decode", "opusdec"),
+        ("audio capture", "wasapi2src"),
+        ("audio sink", "wasapi2sink"),
         ("multi udp", "multiudpsink"),
         ("rtp jitter", "rtpjitterbuffer"),
         ("rtp depay", "rtph264depay"),
@@ -559,6 +651,15 @@ fn validate_qos_dscp(value: i32) -> Result<()> {
     }
 }
 
+fn validate_audio_frame_ms(value: &str) -> Result<()> {
+    match value {
+        "2.5" | "5" | "10" | "20" | "40" | "60" => Ok(()),
+        _ => Err(anyhow!(
+            "--audio-frame-ms must be one of: 2.5, 5, 10, 20, 40, 60"
+        )),
+    }
+}
+
 fn multi_udp_clients(hosts: &str, port: u16) -> Result<String> {
     let clients: Vec<String> = hosts
         .split(',')
@@ -570,6 +671,32 @@ fn multi_udp_clients(hosts: &str, port: u16) -> Result<String> {
             } else {
                 format!("{host}:{port}")
             }
+        })
+        .collect();
+
+    if clients.is_empty() {
+        return Err(anyhow!("at least one receiver host is required"));
+    }
+
+    Ok(clients.join(","))
+}
+
+fn multi_udp_clients_force_port(hosts: &str, port: u16) -> Result<String> {
+    let clients: Vec<String> = hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            if let Some((address, explicit_port)) = host.rsplit_once(':') {
+                if !explicit_port.is_empty()
+                    && explicit_port
+                        .chars()
+                        .all(|character| character.is_ascii_digit())
+                {
+                    return format!("{address}:{port}");
+                }
+            }
+            format!("{host}:{port}")
         })
         .collect();
 

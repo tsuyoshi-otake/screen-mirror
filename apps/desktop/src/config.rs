@@ -34,6 +34,14 @@ pub enum StartupMode {
 pub struct SendConfig {
     pub host: String,
     pub port: u16,
+    #[serde(default)]
+    pub audio_enabled: bool,
+    #[serde(default = "default_audio_port")]
+    pub audio_port: u16,
+    #[serde(default = "default_audio_bitrate")]
+    pub audio_bitrate: u32,
+    #[serde(default = "default_audio_frame_ms")]
+    pub audio_frame_ms: String,
     #[serde(default = "default_max_receivers")]
     pub max_receivers: u32,
     #[serde(default = "default_prefer_virtual_display")]
@@ -93,6 +101,22 @@ fn default_pin() -> String {
     DEFAULT_PIN.to_string()
 }
 
+fn default_audio_port() -> u16 {
+    5005
+}
+
+fn default_audio_bitrate() -> u32 {
+    96_000
+}
+
+fn default_audio_frame_ms() -> String {
+    "5".to_string()
+}
+
+fn default_audio_jitter_ms() -> u32 {
+    15
+}
+
 fn default_jitter_faststart_packets() -> u32 {
     2
 }
@@ -112,6 +136,12 @@ fn default_receiver_fullscreen() -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecvConfig {
     pub port: u16,
+    #[serde(default)]
+    pub audio_enabled: bool,
+    #[serde(default = "default_audio_port")]
+    pub audio_port: u16,
+    #[serde(default = "default_audio_jitter_ms")]
+    pub audio_jitter_ms: u32,
     pub jitter_ms: u32,
     #[serde(default = "default_udp_buffer_size")]
     pub udp_buffer_size: u32,
@@ -195,6 +225,10 @@ impl Default for SendConfig {
         Self {
             host: "auto".to_string(),
             port: 5004,
+            audio_enabled: false,
+            audio_port: default_audio_port(),
+            audio_bitrate: default_audio_bitrate(),
+            audio_frame_ms: default_audio_frame_ms(),
             max_receivers: 3,
             prefer_virtual_display: true,
             enable_virtual_display: true,
@@ -220,6 +254,9 @@ impl Default for RecvConfig {
     fn default() -> Self {
         Self {
             port: 5004,
+            audio_enabled: false,
+            audio_port: default_audio_port(),
+            audio_jitter_ms: default_audio_jitter_ms(),
             jitter_ms: 15,
             udp_buffer_size: default_udp_buffer_size(),
             mtu: default_mtu(),
@@ -279,6 +316,10 @@ impl From<SendConfig> for SendArgs {
         Self {
             host: config.host,
             port: config.port,
+            audio_enabled: config.audio_enabled,
+            audio_port: config.audio_port,
+            audio_bitrate: config.audio_bitrate,
+            audio_frame_ms: config.audio_frame_ms,
             max_receivers: config.max_receivers,
             pin: DEFAULT_PIN.to_string(),
             prefer_virtual_display: config.prefer_virtual_display,
@@ -305,6 +346,9 @@ impl From<RecvConfig> for RecvArgs {
     fn from(config: RecvConfig) -> Self {
         Self {
             port: config.port,
+            audio_enabled: config.audio_enabled,
+            audio_port: config.audio_port,
+            audio_jitter_ms: config.audio_jitter_ms,
             pin: DEFAULT_PIN.to_string(),
             jitter_ms: config.jitter_ms,
             udp_buffer_size: config.udp_buffer_size,

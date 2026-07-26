@@ -15,6 +15,7 @@ Low-latency LAN screen mirroring for Windows and Android. This is not Miracast-c
 - Discovery: UDP broadcast on port `47777`
 - Touch/control: UDP JSON on port `47778`
 - Video: RTP/H.264 over UDP on port `5004`
+- Audio: optional Opus/RTP over UDP on port `5005`
 - Pairing: sender and receiver must use the same four-digit PIN; discovery/control packets carry only a SHA-256 PIN hash
 - Sender fan-out: one sender can stream to multiple receivers with `multiudpsink`
 - Default auto-connect limit: `3` receivers, so `1:3` is the standard target
@@ -74,6 +75,10 @@ pin = "0000"
 [send]
 host = "auto"
 port = 5004
+audio_enabled = false
+audio_port = 5005
+audio_bitrate = 96000
+audio_frame_ms = "5"
 max_receivers = 3
 prefer_virtual_display = true
 enable_virtual_display = true
@@ -88,6 +93,9 @@ allow_software_encoder = false
 nvidia_tuning = "auto"
 
 [recv]
+audio_enabled = false
+audio_port = 5005
+audio_jitter_ms = 15
 jitter_ms = 15
 udp_buffer_size = 4194304
 mtu = 1200
@@ -236,6 +244,36 @@ The Windows receiver uses GStreamer `d3d11videosink` for GPU rendering, but scre
 - Window icon: the same simple display icon used by the app and tray
 - Fullscreen: enabled by default with `[recv].fullscreen = true`
 
+## Audio
+
+Desktop audio transfer is optional and uses a separate low-latency Opus/RTP stream:
+
+```toml
+[send]
+audio_enabled = true
+audio_port = 5005
+audio_bitrate = 96000
+audio_frame_ms = "5"
+
+[recv]
+audio_enabled = true
+audio_port = 5005
+audio_jitter_ms = 15
+```
+
+- Sender capture: Windows WASAPI loopback via `wasapi2src`.
+- Encoding: `opusenc audio-type=restricted-lowdelay` with configurable frame size.
+- Receiver playback: `opusdec` into `wasapi2sink low-latency=true`.
+- Audio stays CPU-side; libopus uses its own CPU/SIMD optimizations where available.
+- Keep video on `5004` and audio on `5005` through the firewall.
+
+## Icons
+
+- The app uses a monochrome mirror-split display icon.
+- Windows tray icon chooses black or white at startup based on the Windows system theme.
+- The MSI includes both `screen-mirror.ico` and `screen-mirror-dark.ico`, both with alpha transparency.
+- Android uses an adaptive launcher icon with a monochrome layer for themed icons.
+
 ## Android APK
 
 Build the APK:
@@ -284,6 +322,7 @@ Android build requirements:
 - Set `qos_dscp = 46` only if your router/switch honors DSCP; otherwise leave `-1`
 - Use GPU encode/decode where available: `nvd3d11h264enc`, `mfh264enc`, `qsvh264enc`, `d3d11h264dec`
 - Increase bitrate for desktop readability: `--bitrate 16000`
+- For lowest audio latency, keep `audio_frame_ms = "5"` or `"2.5"` and `audio_jitter_ms = 10` to `20`
 
 ### Transfer pipeline
 
@@ -294,6 +333,14 @@ The desktop sender uses a low-latency RTP/UDP pipeline:
 - RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.
 - UDP send/receive buffers default to `4 MiB`.
 - Receiver `udpsrc` disables sender-address metadata collection to avoid unnecessary per-packet work.
+
+## Third-Party Licensing
+
+The MSI bundles selected GStreamer runtime files, libopus, and VDD files. Third-party notices are installed under `licenses/`.
+
+- GStreamer is LGPL-based and dynamically bundled.
+- Opus/libopus is BSD-style licensed with royalty-free patent grants.
+- GPL-only GStreamer plugins such as `gstx264.dll` and `gstlibav.dll` are intentionally not bundled.
 - Receiver jitterbuffer starts after two packets and drops late packets instead of increasing latency.
 
 The Android packet path is optimized for the hot loop:

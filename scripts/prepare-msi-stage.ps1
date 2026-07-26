@@ -30,6 +30,7 @@ if (-not $GStreamerRoot -or -not (Test-Path -LiteralPath $GStreamerRoot)) {
     throw "GStreamer MSVC x86_64 runtime root was not found."
 }
 
+Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 $runtimeFiles = @()
@@ -48,6 +49,7 @@ function Copy-IfChanged([string] $source, [string] $destination) {
 Copy-IfChanged (Join-Path $repo "target\release\screen-mirror.exe") (Join-Path $stage "screen-mirror.exe")
 Copy-IfChanged (Join-Path $repo "README.md") (Join-Path $stage "README.md")
 Copy-IfChanged (Join-Path $repo "assets\screen-mirror.ico") (Join-Path $stage "screen-mirror.ico")
+Copy-IfChanged (Join-Path $repo "assets\screen-mirror-dark.ico") (Join-Path $stage "screen-mirror-dark.ico")
 
 function Copy-RuntimeFile([string] $source, [string] $relativeDestination) {
     $destination = Join-Path $stage $relativeDestination
@@ -57,27 +59,45 @@ function Copy-RuntimeFile([string] $source, [string] $relativeDestination) {
 }
 
 Copy-RuntimeFile (Join-Path $repo "scripts\install-bundled-vdd.ps1") "install-bundled-vdd.ps1"
+Copy-RuntimeFile (Join-Path $repo "assets\screen-mirror-dark.ico") "screen-mirror-dark.ico"
+
+$excludedRuntimeDllPatterns = @(
+    'x264*.dll',
+    'avcodec*.dll',
+    'avdevice*.dll',
+    'avfilter*.dll',
+    'avformat*.dll',
+    'avutil*.dll',
+    'postproc*.dll',
+    'swresample*.dll',
+    'swscale*.dll'
+)
 
 Get-ChildItem -LiteralPath (Join-Path $GStreamerRoot "bin") -File |
-    Where-Object { $_.Extension -ieq ".dll" } |
+    Where-Object {
+        $fileName = $_.Name
+        $_.Extension -ieq ".dll" -and -not ($excludedRuntimeDllPatterns | Where-Object { $fileName -like $_ })
+    } |
     ForEach-Object { Copy-RuntimeFile $_.FullName $_.Name }
 
 $pluginAllowList = @(
     'gstautodetect.dll',
     'gstcoreelements.dll',
+    'gstaudioconvert.dll',
+    'gstaudioresample.dll',
     'gstd3d11.dll',
-    'gstlibav.dll',
     'gstmediafoundation.dll',
     'gstnvcodec.dll',
+    'gstopus.dll',
     'gstplayback.dll',
     'gstqsv.dll',
     'gstrtp.dll',
     'gstrtpmanager.dll',
     'gstudp.dll',
+    'gstwasapi2.dll',
     'gstvideoconvertscale.dll',
     'gstvideoparsersbad.dll',
-    'gstvideorate.dll',
-    'gstx264.dll'
+    'gstvideorate.dll'
 )
 
 Get-ChildItem -LiteralPath (Join-Path $GStreamerRoot "lib\gstreamer-1.0") -File |
@@ -89,6 +109,54 @@ if (Test-Path -LiteralPath $scannerDir) {
     Get-ChildItem -LiteralPath $scannerDir -File |
         Where-Object { $_.Extension -ieq ".exe" -or $_.Extension -ieq ".dll" } |
         ForEach-Object { Copy-RuntimeFile $_.FullName (Join-Path "libexec\gstreamer-1.0" $_.Name) }
+}
+
+$licenseStage = Join-Path $stage "licenses"
+New-Item -ItemType Directory -Force -Path $licenseStage | Out-Null
+$notice = Join-Path $licenseStage "THIRD-PARTY-NOTICES.txt"
+@"
+Screen Mirror bundles selected GStreamer runtime DLLs and plugins, libopus, and the Virtual Display Driver package.
+
+GStreamer is distributed under LGPL terms. See the bundled GStreamer license files in this directory and https://gstreamer.freedesktop.org/.
+Opus/libopus is distributed under a BSD-style license with royalty-free patent grants. See the bundled Opus license files and https://opus-codec.org/license/.
+Virtual Display Driver license text is bundled as Virtual-Display-Driver-LICENSE.txt.
+
+GPL-only plugins such as gstx264.dll and gstlibav.dll are intentionally not bundled.
+"@ | Set-Content -Path $notice -Encoding UTF8
+$script:runtimeFiles += "licenses\THIRD-PARTY-NOTICES.txt"
+
+function Copy-LicenseFile([string] $source, [string] $prefix) {
+    $licenseBase = (Resolve-Path (Join-Path $GStreamerRoot "share\licenses")).Path.TrimEnd('\') + '\'
+    $relative = $source
+    if ($source.StartsWith($licenseBase, [StringComparison]::OrdinalIgnoreCase)) {
+        $relative = $source.Substring($licenseBase.Length)
+    }
+    $safeName = ($prefix + "-" + ($relative -replace '[\\/:*?"<>| ]', '-'))
+    Copy-RuntimeFile $source (Join-Path "licenses" $safeName)
+}
+
+$licenseRoot = Join-Path $GStreamerRoot "share\licenses"
+if (Test-Path -LiteralPath $licenseRoot) {
+    $licensePackages = @(
+        'gstreamer',
+        'gstreamer-1.0',
+        'gst-plugins-base',
+        'gst-plugins-base-1.0',
+        'gst-plugins-good',
+        'gst-plugins-good-1.0',
+        'gst-plugins-bad',
+        'gst-plugins-bad-1.0',
+        'glib',
+        'libopus',
+        'opus'
+    )
+    foreach ($package in $licensePackages) {
+        $packageDir = Join-Path $licenseRoot $package
+        if (Test-Path -LiteralPath $packageDir) {
+            Get-ChildItem -LiteralPath $packageDir -Recurse -File |
+                ForEach-Object { Copy-LicenseFile $_.FullName $package }
+        }
+    }
 }
 
 if ($IncludeVdd) {
@@ -125,7 +193,6 @@ if ($IncludeVdd) {
         ForEach-Object { Copy-RuntimeFile $_.FullName (Join-Path "vdd" $_.Name) }
     Copy-RuntimeFile $devconSource "vdd\devcon.exe"
 
-    $licenseStage = Join-Path $stage "licenses"
     New-Item -ItemType Directory -Force -Path $licenseStage | Out-Null
     $licenseFile = Join-Path $licenseStage "Virtual-Display-Driver-LICENSE.txt"
     Invoke-WebRequest -Uri $vddLicenseUrl -OutFile $licenseFile

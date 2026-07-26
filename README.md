@@ -142,14 +142,15 @@ Runtime behavior:
 2. Receiver discovery advertises its display resolution.
 3. Start the desktop sender.
 4. With `host = "auto"`, the sender waits until at least one receiver with a matching PIN is discovered.
-5. After a matching receiver is found, the sender ensures the bundled MTT VDD device exists, then requests Windows extended-display mode with `DisplaySwitch.exe /extend`.
+5. After a matching receiver is found, the sender ensures the bundled MTT VDD device exists. It requests Windows extended-display mode only when that display is not already capture-ready.
 6. Sender mode prefers the bundled MTT VDD display for capture. Other virtual displays are fallback candidates, but SuperDisplay is not auto-selected for Screen Mirror capture.
 7. If the bundled MTT VDD virtual monitor is visible, the sender tries to match its resolution to the first receiver.
-8. When auto sender mode cannot find a matching receiver, it requests removal of bundled MTT VDD devices so the virtual display is not left in Windows while disconnected.
-7. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
+8. When auto sender mode loses every matching receiver beyond the disconnect grace period, it requests bundled VDD removal once so the virtual display is not left in Windows while disconnected.
+9. Repeated receiver discovery does not rerun PowerShell, VDD removal, or `DisplaySwitch.exe`; those operations run only when the receiver set changes.
+10. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
 
 Use the tray menu to show, enable, disable, or remove all bundled MTT VDD devices and monitors. If repeated installs created two or more virtual displays, the remove action deletes every bundled MTT VDD display/monitor after confirmation.
-The root-enumerated VDD device itself is persistent after install. The app does not silently install or remove driver devices on every connection because that requires elevation; use the tray management actions when you want to disable or remove them.
+Automatic VDD lifecycle commands are limited to connection state changes. Use the tray management actions for explicit repair, disable, or removal operations.
 
 List capture indexes:
 
@@ -254,6 +255,7 @@ The tray app checks GitHub Releases automatically:
 - Regular interval: once per hour
 - Manual check: tray menu `Check for Updates`
 - Asset name: `ScreenMirror.msi`
+- Version lookup and download run inside the Screen Mirror process over HTTPS; periodic checks do not launch `curl.exe`, PowerShell, or `cmd.exe`
 - Install mode: hidden direct `msiexec.exe /i <msi> /qn /norestart`; no `cmd.exe` wrapper window
 
 ## Receiver Power Behavior

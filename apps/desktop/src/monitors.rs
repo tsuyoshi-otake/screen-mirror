@@ -171,7 +171,34 @@ pub fn ensure_bundled_virtual_display_installed() {
     run_bundled_vdd_action("Install", false);
 }
 
+pub fn ensure_bundled_virtual_display_ready() -> bool {
+    if preferred_bundled_virtual_monitor().is_some() {
+        crate::logging::append("bundled VDD already capture-ready; extend request skipped");
+        return true;
+    }
+
+    ensure_bundled_virtual_display_installed();
+    if !wait_for_bundled_virtual_display(std::time::Duration::from_secs(15)) {
+        crate::logging::append("bundled VDD did not appear before sender start");
+        return false;
+    }
+
+    if preferred_bundled_virtual_monitor().is_some() {
+        return true;
+    }
+
+    request_extended_desktop();
+    wait_for_bundled_virtual_capture(std::time::Duration::from_secs(10))
+}
+
 pub fn remove_bundled_virtual_display() {
+    if !enumerate_monitors()
+        .into_iter()
+        .any(|monitor| monitor.bundled_virtual_display)
+    {
+        crate::logging::append("bundled VDD removal skipped: no display endpoint found");
+        return;
+    }
     run_bundled_vdd_action("Remove", true);
 }
 

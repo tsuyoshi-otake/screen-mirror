@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use sm_core::{
     diagnostics::DIAGNOSTICS_PORT,
-    discovery::{self, DiscoveredPeer, PeerAnnouncement, PeerRole},
+    discovery::{self, DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole},
 };
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -22,6 +22,30 @@ pub struct SenderSupervisor {
     thread: Option<JoinHandle<()>>,
 }
 
+struct ResolvedSender {
+    args: SendArgs,
+    target_display: Option<DisplayInfo>,
+}
+
+#[derive(Default)]
+struct SenderPreparationState {
+    hosts: String,
+}
+
+impl SenderPreparationState {
+    fn should_prepare(&mut self, hosts: &str) -> bool {
+        if self.hosts == hosts {
+            return false;
+        }
+        self.hosts = hosts.to_string();
+        true
+    }
+
+    fn reset(&mut self) {
+        self.hosts.clear();
+    }
+}
+
 impl SenderSupervisor {
     pub fn start(args: SendArgs) -> Self {
         let (stop, stop_rx) = mpsc::channel();
@@ -29,7 +53,8 @@ impl SenderSupervisor {
             let mut active_hosts = String::new();
             let mut active_pipeline: Option<PipelineHandle> = None;
             let mut detached_for_no_receivers = false;
-            let mut last_receiver_seen = Instant::now();
+            let mut last_receiver_seen: Option<Instant> = None;
+            let mut preparation = SenderPreparationState::default();
 
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -47,33 +72,40 @@ impl SenderSupervisor {
                         }
                     }
                     active_hosts.clear();
+                    preparation.reset();
                 }
 
-                match resolve_sender_args(args.clone()) {
-                    Ok(resolved) if resolved.host != active_hosts => {
-                        detached_for_no_receivers = false;
-                        last_receiver_seen = Instant::now();
+                match discover_sender_args(args.clone()) {
+                    Ok(resolved) if resolved.args.host != active_hosts => {
+                        last_receiver_seen = Some(Instant::now());
                         if let Some(handle) = active_pipeline.take() {
                             if let Err(error) = handle.stop() {
                                 eprintln!("sender restart stop failed: {error:#}");
                             }
                         }
-                        match pipeline::build_sender_pipeline(&resolved) {
+                        if preparation.should_prepare(&resolved.args.host)
+                            && prepare_sender_environment(&resolved)
+                        {
+                            detached_for_no_receivers = false;
+                        }
+                        match pipeline::build_sender_pipeline(&resolved.args) {
                             Ok(description) => {
-                                eprintln!("sender targets updated: {}", resolved.host);
-                                active_hosts = resolved.host;
+                                eprintln!("sender targets updated: {}", resolved.args.host);
+                                active_hosts = resolved.args.host;
                                 active_pipeline = Some(pipeline::spawn_pipeline(description));
+                                detached_for_no_receivers = false;
                             }
                             Err(error) => eprintln!("sender pipeline build failed: {error:#}"),
                         }
                     }
                     Ok(_) => {
                         detached_for_no_receivers = false;
-                        last_receiver_seen = Instant::now();
+                        last_receiver_seen = Some(Instant::now());
                     }
                     Err(error) => {
-                        if active_pipeline.is_some()
-                            && last_receiver_seen.elapsed() < RECEIVER_LOSS_GRACE
+                        if !detached_for_no_receivers
+                            && last_receiver_seen
+                                .is_some_and(|last_seen| last_seen.elapsed() < RECEIVER_LOSS_GRACE)
                         {
                             eprintln!(
                                 "receiver rediscovery missed; keeping sender pipeline for {}s: {error:#}",
@@ -91,6 +123,8 @@ impl SenderSupervisor {
                         if args.enable_virtual_display && !detached_for_no_receivers {
                             crate::monitors::remove_bundled_virtual_display();
                             detached_for_no_receivers = true;
+                            last_receiver_seen = None;
+                            preparation.reset();
                         }
                         eprintln!("waiting for receivers: {error:#}");
                     }
@@ -182,53 +216,30 @@ impl Drop for Announcer {
     }
 }
 
-pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
+pub fn resolve_sender_args(args: SendArgs) -> Result<SendArgs> {
+    let resolved = discover_sender_args(args)?;
+    let _ = prepare_sender_environment(&resolved);
+    Ok(resolved.args)
+}
+
+fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
     if !is_auto_host(&args.host) {
-        if args.enable_virtual_display {
-            crate::monitors::ensure_bundled_virtual_display_installed();
-            if !crate::monitors::wait_for_bundled_virtual_display(Duration::from_secs(15)) {
-                crate::logging::append("bundled VDD did not appear before sender start");
-            }
-            crate::monitors::request_extended_desktop();
-            if !crate::monitors::wait_for_bundled_virtual_capture(Duration::from_secs(10)) {
-                crate::logging::append("bundled VDD was not capture-ready before sender start");
-            }
-        }
-        return Ok(args);
+        return Ok(ResolvedSender {
+            args,
+            target_display: None,
+        });
     }
 
     let receivers = discover_receivers_with_pin(Duration::from_secs(5), &args.pin)?;
     if receivers.is_empty() {
-        if args.enable_virtual_display {
-            crate::monitors::remove_bundled_virtual_display();
-        }
         return Err(anyhow!(
             "no receivers discovered with matching PIN; start receiver mode on another device or set the same four-digit PIN"
         ));
     }
 
-    if args.enable_virtual_display {
-        crate::monitors::ensure_bundled_virtual_display_installed();
-        if !crate::monitors::wait_for_bundled_virtual_display(Duration::from_secs(15)) {
-            crate::logging::append("bundled VDD did not appear before sender start");
-        }
-        crate::monitors::request_extended_desktop();
-        if !crate::monitors::wait_for_bundled_virtual_capture(Duration::from_secs(10)) {
-            crate::logging::append("bundled VDD was not capture-ready before sender start");
-        }
-    }
-
     let target_display = receivers
         .iter()
         .find_map(|peer| peer.announcement.display.clone());
-
-    if args.sync_virtual_display_resolution {
-        if let Err(error) =
-            crate::monitors::sync_preferred_virtual_display_mode(target_display.as_ref())
-        {
-            crate::logging::append(format!("virtual display resolution sync failed: {error:#}"));
-        }
-    }
 
     if args.width.is_none() && args.height.is_none() {
         if let Some(display) = &target_display {
@@ -244,7 +255,28 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
         .collect();
 
     args.host = selected.join(",");
-    Ok(args)
+    Ok(ResolvedSender {
+        args,
+        target_display,
+    })
+}
+
+fn prepare_sender_environment(resolved: &ResolvedSender) -> bool {
+    let display_ready = !resolved.args.enable_virtual_display
+        || crate::monitors::ensure_bundled_virtual_display_ready();
+    if !display_ready {
+        crate::logging::append("bundled VDD was not capture-ready before sender start");
+    }
+
+    if resolved.args.sync_virtual_display_resolution {
+        if let Err(error) =
+            crate::monitors::sync_preferred_virtual_display_mode(resolved.target_display.as_ref())
+        {
+            crate::logging::append(format!("virtual display resolution sync failed: {error:#}"));
+        }
+    }
+
+    display_ready
 }
 
 pub fn discover_receivers_with_pin(timeout: Duration, pin: &str) -> Result<Vec<DiscoveredPeer>> {
@@ -274,4 +306,22 @@ fn device_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "screen-mirror-desktop".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SenderPreparationState;
+
+    #[test]
+    fn sender_environment_is_prepared_once_per_receiver_set() {
+        let mut state = SenderPreparationState::default();
+
+        assert!(state.should_prepare("10.0.0.2:5004"));
+        assert!(!state.should_prepare("10.0.0.2:5004"));
+        assert!(state.should_prepare("10.0.0.3:5004"));
+        assert!(!state.should_prepare("10.0.0.3:5004"));
+
+        state.reset();
+        assert!(state.should_prepare("10.0.0.3:5004"));
+    }
 }

@@ -41,6 +41,17 @@ pub fn start_background_update_checks() {
     });
 }
 
+pub fn start_manual_update_check() {
+    thread::spawn(|| {
+        if let Err(error) = check_and_start_update() {
+            eprintln!("manual update check failed: {error:#}");
+            crate::logging::append(format!("manual update check failed: {error:#}"));
+        } else {
+            crate::logging::append("manual update check finished: no update");
+        }
+    });
+}
+
 fn check_and_start_update() -> Result<()> {
     let release = latest_release()?;
     let latest = parse_version(&release.tag_name).with_context(|| {

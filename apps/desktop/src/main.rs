@@ -8,6 +8,8 @@ mod lan;
 mod logging;
 mod monitors;
 mod pipeline;
+mod power;
+mod receiver_window;
 mod single_instance;
 mod tray_app;
 mod updater;
@@ -94,6 +96,8 @@ fn main() -> Result<()> {
             run_pipeline(&pipeline)
         }
         Command::Recv(args) => {
+            let _sleep_guard = power::SleepGuard::receiver();
+            let _render_window = receiver_window::RenderWindowGuard::start();
             let pipeline = pipeline::build_receiver_pipeline(&args)?;
             eprintln!("pipeline: {pipeline}");
             run_pipeline(&pipeline)

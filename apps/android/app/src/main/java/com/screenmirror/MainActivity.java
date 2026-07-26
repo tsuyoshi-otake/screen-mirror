@@ -12,6 +12,7 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -136,6 +137,7 @@ public final class MainActivity extends Activity {
     private void startReceiver() {
         stopAll();
         enterReceiverFullscreen();
+        keepReceiverAwake(true);
         SurfaceHolder holder = surfaceView.getHolder();
         holder.addCallback(new SurfaceHolder.Callback() {
             @Override
@@ -219,6 +221,7 @@ public final class MainActivity extends Activity {
         receiver.stop();
         sender.stop();
         leaveReceiverFullscreen();
+        keepReceiverAwake(false);
         if (multicastLock != null && multicastLock.isHeld()) {
             multicastLock.release();
         }
@@ -264,6 +267,15 @@ public final class MainActivity extends Activity {
             toolbar.setVisibility(View.VISIBLE);
         }
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+    }
+
+    private void keepReceiverAwake(boolean enabled) {
+        surfaceView.setKeepScreenOn(enabled);
+        if (enabled) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
     }
 
     private void setStatus(String text) {

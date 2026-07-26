@@ -33,6 +33,7 @@ Tray actions:
 - `Start as Sender`: continuously discovers receivers and streams to up to three
 - `Stop`: stops the active pipeline
 - `Enable Autostart`: registers the tray app under HKCU Run
+- `Check for Updates`: checks GitHub Releases immediately
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`
 
 ## Quick Start
@@ -201,8 +202,25 @@ The tray app checks GitHub Releases automatically:
 
 - First check: 30 seconds after tray startup
 - Regular interval: once per hour
+- Manual check: tray menu `Check for Updates`
 - Asset name: `ScreenMirror.msi`
 - Install mode: quiet MSI update with `/qn /norestart`
+
+## Receiver Power Behavior
+
+Receiver mode prevents the display and system from sleeping while video reception is active:
+
+- Windows receiver calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`.
+- Android receiver sets `FLAG_KEEP_SCREEN_ON` and `SurfaceView.setKeepScreenOn(true)`.
+- The sleep/display guard is released when receiver mode stops.
+
+## Receiver Window
+
+The Windows receiver uses GStreamer `d3d11videosink` for GPU rendering, but screen-mirror renames the generated render window while receiver mode is active:
+
+- Taskbar/window title: `screen-mirror Receiver`
+- Window icon: the same simple display icon used by the app and tray
+- Fullscreen: enabled by default with `[recv].fullscreen = true`
 
 ## Android APK
 

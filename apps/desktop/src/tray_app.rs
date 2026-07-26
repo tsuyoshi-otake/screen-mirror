@@ -12,6 +12,7 @@ const ID_START_SENDER: &str = "start-sender";
 const ID_START_RECEIVER: &str = "start-receiver";
 const ID_STOP: &str = "stop";
 const ID_AUTOSTART: &str = "autostart";
+const ID_CHECK_UPDATE: &str = "check-update";
 const ID_INSTALL_VDD: &str = "install-vdd";
 const ID_OPEN_VDD: &str = "open-vdd";
 const ID_OPEN_CONFIG: &str = "open-config";
@@ -69,6 +70,8 @@ struct TrayApp {
     sender_supervisor: Option<crate::lan::SenderSupervisor>,
     control_server: Option<crate::control::ControlServer>,
     announcer: Option<crate::lan::Announcer>,
+    sleep_guard: Option<crate::power::SleepGuard>,
+    render_window: Option<crate::receiver_window::RenderWindowGuard>,
     tray: Option<TrayIcon>,
     items: Option<TrayItems>,
 }
@@ -96,6 +99,8 @@ impl TrayApp {
             sender_supervisor: None,
             control_server: None,
             announcer: None,
+            sleep_guard: None,
+            render_window: None,
             tray: None,
             items: None,
         })
@@ -112,6 +117,7 @@ impl TrayApp {
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
         let sep3 = PredefinedMenuItem::separator();
+        let check_update = MenuItem::with_id(ID_CHECK_UPDATE, "Check for Updates", true, None);
         let install_vdd = MenuItem::with_id(
             ID_INSTALL_VDD,
             "Install Bundled Virtual Display Driver",
@@ -131,6 +137,7 @@ impl TrayApp {
         menu.append(&items.stop)?;
         menu.append(&sep2)?;
         menu.append(&items.autostart)?;
+        menu.append(&check_update)?;
         menu.append(&install_vdd)?;
         menu.append(&open_vdd)?;
         menu.append(&open_config)?;
@@ -183,6 +190,7 @@ impl TrayApp {
                 self.save_config();
             }
             ID_AUTOSTART => self.toggle_autostart(),
+            ID_CHECK_UPDATE => self.check_for_updates(),
             ID_INSTALL_VDD => self.install_bundled_vdd(),
             ID_OPEN_VDD => self.open_vdd_page(),
             ID_OPEN_CONFIG => self.open_config(),
@@ -249,6 +257,8 @@ impl TrayApp {
                 crate::logging::append(format!("receiver pipeline: {description}"));
                 eprintln!("receiver pipeline: {description}");
                 self.pipeline = Some(pipeline::spawn_pipeline(description));
+                self.sleep_guard = Some(crate::power::SleepGuard::receiver());
+                self.render_window = Some(crate::receiver_window::RenderWindowGuard::start());
                 match crate::lan::Announcer::receiver(self.config.recv.port) {
                     Ok(announcer) => self.announcer = Some(announcer),
                     Err(error) => eprintln!("receiver discovery announce failed: {error:#}"),
@@ -275,6 +285,8 @@ impl TrayApp {
         if let Some(announcer) = self.announcer.take() {
             announcer.stop();
         }
+        self.render_window = None;
+        self.sleep_guard = None;
         self.active_mode = ActiveMode::Idle;
         self.sync_menu();
         Ok(())
@@ -289,6 +301,13 @@ impl TrayApp {
                 self.sync_menu();
             }
             Err(error) => self.set_error(format!("Autostart update failed: {error:#}")),
+        }
+    }
+
+    fn check_for_updates(&self) {
+        crate::updater::start_manual_update_check();
+        if let Some(items) = self.items.as_ref() {
+            items.status.set_text("Status: update check started");
         }
     }
 
@@ -439,23 +458,31 @@ impl TrayItems {
 }
 
 fn app_icon() -> Result<Icon> {
-    let size = 32;
-    let mut rgba = Vec::with_capacity(size * size * 4);
-
-    for y in 0..size {
-        for x in 0..size {
-            let border = x < 3 || y < 3 || x >= size - 3 || y >= size - 3;
-            let beam = x > 8 && x < 24 && y > 10 && y < 22;
-            let (r, g, b, a) = if border {
-                (40, 180, 255, 255)
-            } else if beam {
-                (120, 220, 255, 255)
-            } else {
-                (10, 24, 40, 255)
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
-        }
+    if let Ok(icon) = Icon::from_resource(1, Some((32, 32))) {
+        return Ok(icon);
     }
 
+    let size = 32;
+    let mut rgba = Vec::with_capacity(size * size * 4);
+    for y in 0..size {
+        for x in 0..size {
+            let screen_border = (4..=27).contains(&x)
+                && (6..=22).contains(&y)
+                && (x <= 6 || x >= 25 || y <= 8 || y >= 20);
+            let arrow = (10..=23).contains(&x) && (13..=17).contains(&y)
+                || (18..=23).contains(&x)
+                    && (10..=20).contains(&y)
+                    && (x + y >= 30)
+                    && (x >= y - 2);
+            let stand = (14..=17).contains(&x) && (23..=25).contains(&y)
+                || (10..=21).contains(&x) && (26..=27).contains(&y);
+            let (red, green, blue, alpha) = if screen_border || arrow || stand {
+                (34, 199, 255, 255)
+            } else {
+                (10, 16, 32, 255)
+            };
+            rgba.extend_from_slice(&[red, green, blue, alpha]);
+        }
+    }
     Icon::from_rgba(rgba, size as u32, size as u32).context("failed to create tray icon image")
 }

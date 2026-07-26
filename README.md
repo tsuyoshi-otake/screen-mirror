@@ -59,13 +59,13 @@ fullscreen = true
 
 For a SuperDisplay-like extended desktop workflow, screen-mirror uses Virtual Display Driver (VDD) as the Windows virtual monitor and streams that display.
 
-The MSI bundles the signed VDD Driver Only package under the install directory. Use the tray menu item `Install Bundled Virtual Display Driver` to run:
+The MSI bundles the signed VDD Driver Only package and `devcon.exe` from the official VDD Control release under the install directory. Use the tray menu item `Install Bundled Virtual Display Driver` to run:
 
 ```powershell
-pnputil.exe /add-driver "vdd\MttVDD.inf" /install
+devcon.exe install "vdd\MttVDD.inf" Root\MttVDD
 ```
 
-This launches the driver install through UAC. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
+This launches the driver install through UAC and creates the root-enumerated `Root\MttVDD` device. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
 
 ```powershell
 winget install --id=VirtualDrivers.Virtual-Display-Driver -e

@@ -79,6 +79,7 @@ function Get-VirtualDisplayCandidates {
     }
 
     @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+        $_.Class -in @("Display", "Monitor") -and
         $_.InstanceId -notlike "ROOT\MTTVDD\*" -and
         $_.InstanceId -notlike "ROOT\DISPLAY\*" -and
         $_.InstanceId -notlike "DISPLAY\MTT1337\*" -and (
@@ -270,7 +271,6 @@ switch ($Action) {
             Invoke-Devcon @("install", "`"$driver`"", $hardwareId)
         }
         Invoke-DeviceScan
-        Invoke-ExtendDisplay
     }
 
     "List" {
@@ -279,20 +279,27 @@ switch ($Action) {
 
     "Enable" {
         $devices = Get-BundledVddDevices
-        if ($devices.Count -eq 0) {
+        $monitors = Get-BundledVddMonitors
+        if ($devices.Count -eq 0 -and $monitors.Count -eq 0) {
             throw "No bundled Virtual Display Driver device was found."
         }
         foreach ($device in $devices) {
             Invoke-DeviceAction "enable" $device.InstanceId
         }
+        foreach ($monitor in $monitors) {
+            Invoke-DeviceAction "enable" $monitor.InstanceId
+        }
         Invoke-DeviceScan
-        Invoke-ExtendDisplay
     }
 
     "Disable" {
         $devices = Get-BundledVddDevices
-        if ($devices.Count -eq 0) {
+        $monitors = Get-BundledVddMonitors
+        if ($devices.Count -eq 0 -and $monitors.Count -eq 0) {
             throw "No bundled Virtual Display Driver device was found."
+        }
+        foreach ($monitor in $monitors) {
+            Invoke-DeviceAction "disable" $monitor.InstanceId
         }
         foreach ($device in $devices) {
             Invoke-DeviceAction "disable" $device.InstanceId

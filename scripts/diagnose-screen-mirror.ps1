@@ -131,6 +131,7 @@ function Get-VirtualDisplayCandidates {
         return @()
     }
     @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+        $_.Class -in @("Display", "Monitor") -and
         $_.InstanceId -notlike "ROOT\MTTVDD\*" -and
         $_.InstanceId -notlike "ROOT\DISPLAY\*" -and
         $_.InstanceId -notlike "DISPLAY\MTT1337\*" -and (

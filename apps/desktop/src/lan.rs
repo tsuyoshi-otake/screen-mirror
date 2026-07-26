@@ -27,6 +27,7 @@ impl SenderSupervisor {
         let thread = thread::spawn(move || {
             let mut active_hosts = String::new();
             let mut active_pipeline: Option<PipelineHandle> = None;
+            let mut detached_for_no_receivers = false;
 
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -35,6 +36,7 @@ impl SenderSupervisor {
 
                 match resolve_sender_args(args.clone()) {
                     Ok(resolved) if resolved.host != active_hosts => {
+                        detached_for_no_receivers = false;
                         if let Some(handle) = active_pipeline.take() {
                             if let Err(error) = handle.stop() {
                                 eprintln!("sender restart stop failed: {error:#}");
@@ -51,9 +53,17 @@ impl SenderSupervisor {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        if active_pipeline.is_none() {
-                            eprintln!("waiting for receivers: {error:#}");
+                        if let Some(handle) = active_pipeline.take() {
+                            if let Err(error) = handle.stop() {
+                                eprintln!("sender stop after receiver loss failed: {error:#}");
+                            }
+                            active_hosts.clear();
                         }
+                        if args.enable_virtual_display && !detached_for_no_receivers {
+                            crate::monitors::remove_bundled_virtual_display();
+                            detached_for_no_receivers = true;
+                        }
+                        eprintln!("waiting for receivers: {error:#}");
                     }
                 }
 
@@ -146,6 +156,10 @@ impl Drop for Announcer {
 pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
     if !is_auto_host(&args.host) {
         if args.enable_virtual_display {
+            crate::monitors::ensure_bundled_virtual_display_installed();
+            if !crate::monitors::wait_for_bundled_virtual_display(Duration::from_secs(15)) {
+                crate::logging::append("bundled VDD did not appear before sender start");
+            }
             crate::monitors::request_extended_desktop();
         }
         return Ok(args);
@@ -153,12 +167,19 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
 
     let receivers = discover_receivers_with_pin(Duration::from_secs(5), &args.pin)?;
     if receivers.is_empty() {
+        if args.enable_virtual_display {
+            crate::monitors::remove_bundled_virtual_display();
+        }
         return Err(anyhow!(
             "no receivers discovered with matching PIN; start receiver mode on another device or set the same four-digit PIN"
         ));
     }
 
     if args.enable_virtual_display {
+        crate::monitors::ensure_bundled_virtual_display_installed();
+        if !crate::monitors::wait_for_bundled_virtual_display(Duration::from_secs(15)) {
+            crate::logging::append("bundled VDD did not appear before sender start");
+        }
         crate::monitors::request_extended_desktop();
     }
 

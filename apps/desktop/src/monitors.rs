@@ -10,6 +10,7 @@ pub struct DisplayMonitor {
     pub primary: bool,
     pub mirroring: bool,
     pub virtual_candidate: bool,
+    pub bundled_virtual_display: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,11 @@ pub fn print_monitors() {
         } else {
             ""
         };
+        let bundled = if monitor.bundled_virtual_display {
+            " bundled-vdd"
+        } else {
+            ""
+        };
         let primary = if monitor.primary { " primary" } else { "" };
         let attached = if monitor.attached {
             " attached"
@@ -45,8 +51,14 @@ pub fn print_monitors() {
         let mirroring = if monitor.mirroring { " mirroring" } else { "" };
 
         crate::console::line(format!(
-            "[{index}] {} - {}{}{}{}{}",
-            monitor.adapter_name, monitor.adapter_description, attached, primary, mirroring, marker
+            "[{index}] {} - {}{}{}{}{}{}",
+            monitor.adapter_name,
+            monitor.adapter_description,
+            attached,
+            primary,
+            mirroring,
+            marker,
+            bundled
         ));
 
         if let Some(name) = &monitor.monitor_name {
@@ -103,9 +115,7 @@ pub fn sync_preferred_virtual_display_mode(
         return Ok(());
     }
 
-    let Some(monitor) = enumerate_monitors().into_iter().find(|monitor| {
-        monitor.capture_index.is_some() && monitor.virtual_candidate && !monitor.primary
-    }) else {
+    let Some(monitor) = preferred_virtual_monitor() else {
         crate::logging::append("no virtual display found for receiver resolution sync");
         return Ok(());
     };
@@ -119,12 +129,7 @@ pub fn sync_preferred_virtual_display_mode(
 }
 
 pub fn preferred_virtual_monitor_index() -> Option<i32> {
-    enumerate_monitors()
-        .into_iter()
-        .find(|monitor| {
-            monitor.capture_index.is_some() && monitor.virtual_candidate && !monitor.primary
-        })
-        .and_then(|monitor| monitor.capture_index)
+    preferred_virtual_monitor().and_then(|monitor| monitor.capture_index)
 }
 
 pub fn resolve_capture_monitor_index(requested: i32, prefer_virtual_display: bool) -> i32 {
@@ -146,6 +151,86 @@ pub fn detected_nvidia_gpu_name() -> Option<String> {
             .contains("nvidia")
             .then_some(combined)
     })
+}
+
+pub fn ensure_bundled_virtual_display_installed() {
+    if enumerate_monitors()
+        .into_iter()
+        .any(|monitor| monitor.bundled_virtual_display)
+    {
+        return;
+    }
+    run_bundled_vdd_action("Install", false);
+}
+
+pub fn remove_bundled_virtual_display() {
+    run_bundled_vdd_action("Remove", true);
+}
+
+pub fn wait_for_bundled_virtual_display(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if enumerate_monitors()
+            .into_iter()
+            .any(|monitor| monitor.bundled_virtual_display)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
+}
+
+fn preferred_virtual_monitor() -> Option<DisplayMonitor> {
+    let monitors = enumerate_monitors();
+    monitors
+        .iter()
+        .find(|monitor| {
+            monitor.capture_index.is_some() && monitor.bundled_virtual_display && !monitor.primary
+        })
+        .cloned()
+        .or_else(|| {
+            monitors.into_iter().find(|monitor| {
+                monitor.capture_index.is_some()
+                    && monitor.virtual_candidate
+                    && !monitor.primary
+                    && !looks_like_superdisplay(monitor)
+            })
+        })
+}
+
+fn run_bundled_vdd_action(action: &str, force: bool) {
+    #[cfg(windows)]
+    {
+        let Some(script) = std::env::current_exe().ok().and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("install-bundled-vdd.ps1"))
+        }) else {
+            crate::logging::append("failed to resolve bundled VDD script path");
+            return;
+        };
+        if !script.exists() {
+            crate::logging::append(format!(
+                "bundled VDD script not found: {}",
+                script.display()
+            ));
+            return;
+        }
+        let mut command = std::process::Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(script)
+            .args(["-Action", action]);
+        if force {
+            command.arg("-Force");
+        }
+        match command.spawn() {
+            Ok(_) => crate::logging::append(format!("requested bundled VDD {action}")),
+            Err(error) => {
+                crate::logging::append(format!("failed to request VDD {action}: {error}"))
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -294,6 +379,7 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
             monitor_description.as_deref().unwrap_or("")
         );
 
+        let bundled_virtual_display = looks_like_bundled_virtual_display(&combined);
         monitors.push(DisplayMonitor {
             capture_index: current_capture_index,
             adapter_name,
@@ -305,6 +391,7 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
             primary,
             mirroring,
             virtual_candidate: looks_like_virtual_display(&combined),
+            bundled_virtual_display,
         });
 
         adapter_ordinal += 1;
@@ -345,6 +432,25 @@ fn looks_like_virtual_display(value: &str) -> bool {
     ]
     .iter()
     .any(|needle| value.contains(needle))
+}
+
+fn looks_like_bundled_virtual_display(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    ["mtt1337", "mttvdd", "vdd by mtt", "virtual display driver"]
+        .iter()
+        .any(|needle| value.contains(needle))
+}
+
+fn looks_like_superdisplay(monitor: &DisplayMonitor) -> bool {
+    format!(
+        "{} {} {} {}",
+        monitor.adapter_description,
+        monitor.device_id,
+        monitor.monitor_description.as_deref().unwrap_or(""),
+        monitor.monitor_name.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase()
+    .contains("superdisplay")
 }
 
 #[cfg(windows)]

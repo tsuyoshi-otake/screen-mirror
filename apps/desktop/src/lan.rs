@@ -34,6 +34,19 @@ impl SenderSupervisor {
                     break;
                 }
 
+                if active_pipeline
+                    .as_ref()
+                    .map(|handle| handle.is_finished())
+                    .unwrap_or(false)
+                {
+                    if let Some(handle) = active_pipeline.take() {
+                        if let Err(error) = handle.finish() {
+                            eprintln!("sender pipeline stopped: {error:#}");
+                        }
+                    }
+                    active_hosts.clear();
+                }
+
                 match resolve_sender_args(args.clone()) {
                     Ok(resolved) if resolved.host != active_hosts => {
                         detached_for_no_receivers = false;
@@ -161,6 +174,9 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
                 crate::logging::append("bundled VDD did not appear before sender start");
             }
             crate::monitors::request_extended_desktop();
+            if !crate::monitors::wait_for_bundled_virtual_capture(Duration::from_secs(10)) {
+                crate::logging::append("bundled VDD was not capture-ready before sender start");
+            }
         }
         return Ok(args);
     }
@@ -181,6 +197,9 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
             crate::logging::append("bundled VDD did not appear before sender start");
         }
         crate::monitors::request_extended_desktop();
+        if !crate::monitors::wait_for_bundled_virtual_capture(Duration::from_secs(10)) {
+            crate::logging::append("bundled VDD was not capture-ready before sender start");
+        }
     }
 
     let target_display = receivers

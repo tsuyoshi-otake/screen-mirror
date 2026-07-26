@@ -115,8 +115,8 @@ pub fn sync_preferred_virtual_display_mode(
         return Ok(());
     }
 
-    let Some(monitor) = preferred_virtual_monitor() else {
-        crate::logging::append("no virtual display found for receiver resolution sync");
+    let Some(monitor) = preferred_bundled_virtual_monitor() else {
+        crate::logging::append("no bundled virtual display found for receiver resolution sync");
         return Ok(());
     };
 
@@ -179,6 +179,23 @@ pub fn wait_for_bundled_virtual_display(timeout: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     false
+}
+
+pub fn wait_for_bundled_virtual_capture(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if preferred_bundled_virtual_monitor().is_some() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
+}
+
+fn preferred_bundled_virtual_monitor() -> Option<DisplayMonitor> {
+    enumerate_monitors().into_iter().find(|monitor| {
+        monitor.capture_index.is_some() && monitor.bundled_virtual_display && !monitor.primary
+    })
 }
 
 fn preferred_virtual_monitor() -> Option<DisplayMonitor> {
@@ -272,8 +289,8 @@ fn set_display_mode(
     use anyhow::anyhow;
     use windows_sys::Win32::Graphics::Gdi::{
         ChangeDisplaySettingsExW, EnumDisplaySettingsW, CDS_UPDATEREGISTRY, DEVMODEW,
-        DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
-        ENUM_CURRENT_SETTINGS,
+        DISP_CHANGE_BADMODE, DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT,
+        DM_PELSWIDTH, ENUM_CURRENT_SETTINGS,
     };
 
     let wide_name = to_wide(device_name);
@@ -311,6 +328,12 @@ fn set_display_mode(
         )
     };
     if result != DISP_CHANGE_SUCCESSFUL {
+        if result == DISP_CHANGE_BADMODE {
+            crate::logging::append(format!(
+                "virtual display {device_name} does not support {width}x{height}; keeping current mode"
+            ));
+            return Ok(());
+        }
         return Err(anyhow!(
             "failed to set {device_name} to {width}x{height}: DISP_CHANGE={result}"
         ));

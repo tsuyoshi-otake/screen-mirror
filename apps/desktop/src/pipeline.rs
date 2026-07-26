@@ -286,6 +286,11 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
         args.monitor_index,
         args.prefer_virtual_display,
     );
+    if args.prefer_virtual_display && args.monitor_index < 0 {
+        crate::logging::append(format!(
+            "sender capture monitor-index selected: {monitor_index}"
+        ));
+    }
     let source = format!(
         "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
         args.capture_api,

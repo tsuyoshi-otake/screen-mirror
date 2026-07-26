@@ -138,11 +138,13 @@ Runtime behavior:
 1. Start the receiver on the tablet/second PC.
 2. Receiver discovery advertises its display resolution.
 3. Start the desktop sender.
-4. The sender requests Windows extended-display mode with `DisplaySwitch.exe /extend`.
-5. If a VDD/SuperDisplay-style virtual monitor is visible, the sender tries to match its resolution to the first receiver.
-6. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
+4. With `host = "auto"`, the sender waits until at least one receiver with a matching PIN is discovered.
+5. After a matching receiver is found, the sender requests Windows extended-display mode with `DisplaySwitch.exe /extend`.
+6. If a VDD/SuperDisplay-style virtual monitor is visible, the sender tries to match its resolution to the first receiver.
+7. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
 
 Use the tray menu to show, enable, disable, or remove all bundled `Root\MttVDD` devices. If repeated installs created two or more virtual displays, the remove action deletes every bundled `Root\MttVDD` device after confirmation.
+The root-enumerated VDD device itself is persistent after install. The app does not silently install or remove driver devices on every connection because that requires elevation; use the tray management actions when you want to disable or remove them.
 
 List capture indexes:
 

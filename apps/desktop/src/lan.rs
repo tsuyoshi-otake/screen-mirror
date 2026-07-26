@@ -22,11 +22,6 @@ impl SenderSupervisor {
     pub fn start(args: SendArgs) -> Self {
         let (stop, stop_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
-            let mut args = args;
-            if args.enable_virtual_display {
-                crate::monitors::request_extended_desktop();
-                args.enable_virtual_display = false;
-            }
             let mut active_hosts = String::new();
             let mut active_pipeline: Option<PipelineHandle> = None;
 
@@ -141,11 +136,10 @@ impl Drop for Announcer {
 }
 
 pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
-    if args.enable_virtual_display {
-        crate::monitors::request_extended_desktop();
-    }
-
     if !is_auto_host(&args.host) {
+        if args.enable_virtual_display {
+            crate::monitors::request_extended_desktop();
+        }
         return Ok(args);
     }
 
@@ -154,6 +148,10 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
         return Err(anyhow!(
             "no receivers discovered with matching PIN; start receiver mode on another device or set the same four-digit PIN"
         ));
+    }
+
+    if args.enable_virtual_display {
+        crate::monitors::request_extended_desktop();
     }
 
     let target_display = receivers

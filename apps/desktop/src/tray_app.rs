@@ -176,7 +176,7 @@ impl TrayApp {
             .with_menu(Box::new(menu))
             .with_tooltip("screen-mirror")
             .with_icon(app_icon()?)
-            .with_menu_on_left_click(true)
+            .with_menu_on_left_click(false)
             .with_menu_on_right_click(true)
             .build()
             .context("failed to create tray icon")?;

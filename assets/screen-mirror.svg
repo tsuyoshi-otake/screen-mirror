@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="mirror split">
-  <g fill="none" stroke="#111111" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+  <g fill="none" stroke="#F8B500" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
     <rect x="28" y="48" width="200" height="132" rx="20"/>
     <path d="M128 48v132"/>
     <path d="M78 112h50"/>

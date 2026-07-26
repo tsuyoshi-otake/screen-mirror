@@ -21,6 +21,8 @@ pub struct PeerAnnouncement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayInfo>,
@@ -64,6 +66,7 @@ impl PeerAnnouncement {
             role,
             stream_port,
             audio_port: None,
+            diagnostics_port: None,
             pin_hash: None,
             display: None,
             timestamp_ms: now_ms(),
@@ -77,6 +80,11 @@ impl PeerAnnouncement {
 
     pub fn with_audio_port(mut self, audio_port: Option<u16>) -> Self {
         self.audio_port = audio_port;
+        self
+    }
+
+    pub fn with_diagnostics_port(mut self, diagnostics_port: u16) -> Self {
+        self.diagnostics_port = Some(diagnostics_port);
         self
     }
 

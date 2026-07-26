@@ -1,5 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use sm_core::discovery::{self, DiscoveredPeer, PeerAnnouncement, PeerRole};
+use sm_core::{
+    diagnostics::DIAGNOSTICS_PORT,
+    discovery::{self, DiscoveredPeer, PeerAnnouncement, PeerRole},
+};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -91,16 +94,21 @@ impl Drop for SenderSupervisor {
 }
 
 impl Announcer {
+    pub fn sender(stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
+        Self::start(PeerRole::Sender, stream_port, audio_port, pin)
+    }
+
     pub fn receiver(stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
+        Self::start(PeerRole::Receiver, stream_port, audio_port, pin)
+    }
+
+    fn start(role: PeerRole, stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
         let socket = discovery::bind_ephemeral_broadcast_socket()?;
-        let mut announcement = PeerAnnouncement::new(
-            instance_id(),
-            device_name(),
-            PeerRole::Receiver,
-            stream_port,
-        )
-        .with_pin(pin)?
-        .with_audio_port(audio_port);
+        let mut announcement =
+            PeerAnnouncement::new(instance_id(), device_name(), role, stream_port)
+                .with_pin(pin)?
+                .with_audio_port(audio_port)
+                .with_diagnostics_port(DIAGNOSTICS_PORT);
         if let Some(display) = crate::monitors::primary_display_info() {
             announcement = announcement.with_display(display);
         }
@@ -185,6 +193,11 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
 
 pub fn discover_receivers_with_pin(timeout: Duration, pin: &str) -> Result<Vec<DiscoveredPeer>> {
     discovery::discover_receivers_with_pin(timeout, pin).context("receiver discovery failed")
+}
+
+pub fn discover_senders_with_pin(timeout: Duration, pin: &str) -> Result<Vec<DiscoveredPeer>> {
+    discovery::discover_with_pin(timeout, Some(PeerRole::Sender), Some(pin))
+        .context("sender discovery failed")
 }
 
 fn is_auto_host(host: &str) -> bool {

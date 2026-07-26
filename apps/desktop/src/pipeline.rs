@@ -218,14 +218,25 @@ pub struct PipelineHandle {
 }
 
 impl PipelineHandle {
-    pub fn stop(mut self) -> Result<()> {
-        let _ = self.stop.send(());
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .map(|thread| thread.is_finished())
+            .unwrap_or(true)
+    }
+
+    pub fn finish(mut self) -> Result<()> {
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
                 .map_err(|_| anyhow!("pipeline thread panicked"))??;
         }
         Ok(())
+    }
+
+    pub fn stop(self) -> Result<()> {
+        let _ = self.stop.send(());
+        self.finish()
     }
 }
 
@@ -322,7 +333,7 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     let sink = select_sink(args.sink, args.fullscreen)?;
 
     let video = format!(
-        "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
+        "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=3000000000 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
          ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
          ! rtph264depay \
@@ -417,6 +428,16 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
             use gst::MessageView;
             match message.view() {
                 MessageView::Eos(..) => break Ok(()),
+                MessageView::Element(element) => {
+                    if element
+                        .structure()
+                        .map(|structure| structure.name() == "GstUDPSrcTimeout")
+                        .unwrap_or(false)
+                    {
+                        crate::logging::append("receiver timed out waiting for video packets");
+                        break Ok(());
+                    }
+                }
                 MessageView::Error(error) => {
                     let src = error
                         .src()

@@ -59,6 +59,7 @@ function Copy-RuntimeFile([string] $source, [string] $relativeDestination) {
 }
 
 Copy-RuntimeFile (Join-Path $repo "scripts\install-bundled-vdd.ps1") "install-bundled-vdd.ps1"
+Copy-RuntimeFile (Join-Path $repo "scripts\diagnose-screen-mirror.ps1") "diagnose-screen-mirror.ps1"
 Copy-RuntimeFile (Join-Path $repo "assets\screen-mirror-dark.ico") "screen-mirror-dark.ico"
 
 $excludedRuntimeDllPatterns = @(

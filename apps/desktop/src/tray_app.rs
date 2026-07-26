@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -13,6 +14,8 @@ const ID_START_RECEIVER: &str = "start-receiver";
 const ID_STOP: &str = "stop";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
+const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
+const ID_RUN_PEER_DIAGNOSTICS: &str = "run-peer-diagnostics";
 const ID_INSTALL_VDD: &str = "install-vdd";
 const ID_LIST_VDD: &str = "list-vdd";
 const ID_ENABLE_VDD: &str = "enable-vdd";
@@ -53,7 +56,7 @@ pub fn run() -> Result<()> {
     crate::logging::append("tray initialized");
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
 
         match event {
             Event::UserEvent(UserEvent::Menu(event)) => {
@@ -64,6 +67,8 @@ pub fn run() -> Result<()> {
             }
             _ => {}
         }
+
+        app.reap_finished_pipeline();
     });
 }
 
@@ -74,6 +79,7 @@ struct TrayApp {
     pipeline: Option<PipelineHandle>,
     sender_supervisor: Option<crate::lan::SenderSupervisor>,
     control_server: Option<crate::control::ControlServer>,
+    diagnostics_server: Option<crate::diagnostics::DiagnosticsServer>,
     announcer: Option<crate::lan::Announcer>,
     sleep_guard: Option<crate::power::SleepGuard>,
     render_window: Option<crate::receiver_window::RenderWindowGuard>,
@@ -103,6 +109,7 @@ impl TrayApp {
             pipeline: None,
             sender_supervisor: None,
             control_server: None,
+            diagnostics_server: None,
             announcer: None,
             sleep_guard: None,
             render_window: None,
@@ -122,7 +129,11 @@ impl TrayApp {
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
         let sep3 = PredefinedMenuItem::separator();
+        let sep4 = PredefinedMenuItem::separator();
         let check_update = MenuItem::with_id(ID_CHECK_UPDATE, "Check for Updates", true, None);
+        let run_diagnostics = MenuItem::with_id(ID_RUN_DIAGNOSTICS, "Run Diagnostics", true, None);
+        let run_peer_diagnostics =
+            MenuItem::with_id(ID_RUN_PEER_DIAGNOSTICS, "Run Peer Diagnostics", true, None);
         let install_vdd = MenuItem::with_id(
             ID_INSTALL_VDD,
             "Install/Repair Virtual Display Driver",
@@ -160,6 +171,9 @@ impl TrayApp {
         menu.append(&sep2)?;
         menu.append(&items.autostart)?;
         menu.append(&check_update)?;
+        menu.append(&run_diagnostics)?;
+        menu.append(&run_peer_diagnostics)?;
+        menu.append(&sep3)?;
         menu.append(&install_vdd)?;
         menu.append(&list_vdd)?;
         menu.append(&enable_vdd)?;
@@ -169,7 +183,7 @@ impl TrayApp {
         menu.append(&open_vdd)?;
         menu.append(&open_config)?;
         menu.append(&reload_config)?;
-        menu.append(&sep3)?;
+        menu.append(&sep4)?;
         menu.append(&quit)?;
 
         let tray = TrayIconBuilder::new()
@@ -185,6 +199,7 @@ impl TrayApp {
         self.tray = Some(tray);
         self.sync_menu();
         crate::updater::start_background_update_checks();
+        self.restart_diagnostics_server();
 
         if let Err(error) = autostart::set_enabled(self.config.autostart) {
             self.set_error(format!("Autostart update failed: {error:#}"));
@@ -218,6 +233,8 @@ impl TrayApp {
             }
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
+            ID_RUN_DIAGNOSTICS => self.run_diagnostics(),
+            ID_RUN_PEER_DIAGNOSTICS => self.run_peer_diagnostics(),
             ID_INSTALL_VDD => self.run_vdd_action("Install"),
             ID_LIST_VDD => self.run_vdd_action("List"),
             ID_ENABLE_VDD => self.run_vdd_action("Enable"),
@@ -229,6 +246,9 @@ impl TrayApp {
             ID_RELOAD_CONFIG => self.reload_config(),
             ID_QUIT => {
                 let _ = self.stop_current();
+                if let Some(server) = self.diagnostics_server.take() {
+                    server.stop();
+                }
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}
@@ -250,6 +270,19 @@ impl TrayApp {
         match crate::control::ControlServer::start(&self.config.security.pin) {
             Ok(server) => self.control_server = Some(server),
             Err(error) => eprintln!("touch control server failed: {error:#}"),
+        }
+        let audio_port = self
+            .config
+            .send
+            .audio_enabled
+            .then_some(self.config.send.audio_port);
+        match crate::lan::Announcer::sender(
+            self.config.send.port,
+            audio_port,
+            &self.config.security.pin,
+        ) {
+            Ok(announcer) => self.announcer = Some(announcer),
+            Err(error) => eprintln!("sender discovery announce failed: {error:#}"),
         }
 
         if crate::lan::wants_auto_host(&args.host) {
@@ -343,6 +376,42 @@ impl TrayApp {
         Ok(())
     }
 
+    fn reap_finished_pipeline(&mut self) {
+        let Some(handle) = self.pipeline.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+
+        let result = self
+            .pipeline
+            .take()
+            .map(PipelineHandle::finish)
+            .unwrap_or(Ok(()));
+        if let Err(error) = result {
+            self.set_error(format!("Pipeline stopped: {error:#}"));
+        } else {
+            crate::logging::append("pipeline stopped; returning to idle");
+        }
+
+        if let Some(supervisor) = self.sender_supervisor.take() {
+            supervisor.stop();
+        }
+        if let Some(server) = self.control_server.take() {
+            server.stop();
+        }
+        if let Some(announcer) = self.announcer.take() {
+            announcer.stop();
+        }
+        self.render_window = None;
+        self.sleep_guard = None;
+        self.active_mode = ActiveMode::Idle;
+        self.config.startup_mode = StartupMode::Idle;
+        self.save_config();
+        self.sync_menu();
+    }
+
     fn toggle_autostart(&mut self) {
         let next = !self.config.autostart;
         match autostart::set_enabled(next) {
@@ -359,6 +428,77 @@ impl TrayApp {
         crate::updater::start_manual_update_check();
         if let Some(items) = self.items.as_ref() {
             items.status.set_text("Status: update check started");
+        }
+    }
+
+    fn run_diagnostics(&self) {
+        let Some(script) = std::env::current_exe().ok().and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("diagnose-screen-mirror.ps1"))
+        }) else {
+            self.set_error("Failed to resolve diagnostics script path".to_string());
+            return;
+        };
+
+        if !script.exists() {
+            self.set_error(format!(
+                "Diagnostics script not found: {}",
+                script.display()
+            ));
+            return;
+        }
+
+        if let Err(error) = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+            ])
+            .arg(script)
+            .spawn()
+        {
+            self.set_error(format!("Failed to start diagnostics: {error}"));
+        } else if let Some(items) = self.items.as_ref() {
+            items
+                .status
+                .set_text("Status: diagnostics copied to clipboard");
+        }
+    }
+
+    fn run_peer_diagnostics(&self) {
+        let pin = self.config.security.pin.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let peers = crate::lan::discover_senders_with_pin(Duration::from_secs(3), &pin)?;
+                let peer = peers
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no sender found with matching PIN"))?;
+                let port = peer
+                    .announcement
+                    .diagnostics_port
+                    .unwrap_or(sm_core::diagnostics::DIAGNOSTICS_PORT);
+                let report = crate::diagnostics::request_remote_report(peer.address, port, &pin)?;
+                let path = crate::diagnostics::save_report_to_clipboard_and_notepad(
+                    &report,
+                    &peer.announcement.device_name,
+                )?;
+                crate::logging::append(format!(
+                    "peer diagnostics copied to clipboard: {}",
+                    path.display()
+                ));
+                Ok(())
+            })();
+
+            if let Err(error) = result {
+                crate::logging::append(format!("peer diagnostics failed: {error:#}"));
+            }
+        });
+
+        if let Some(items) = self.items.as_ref() {
+            items.status.set_text("Status: peer diagnostics requested");
         }
     }
 
@@ -431,6 +571,7 @@ impl TrayApp {
                 }
                 self.config = config;
                 self.config_path = path;
+                self.restart_diagnostics_server();
                 match mode {
                     ActiveMode::Sender => self.start_sender(),
                     ActiveMode::Receiver => self.start_receiver(),
@@ -445,6 +586,7 @@ impl TrayApp {
         let (config, path) = AppConfig::load_or_create()?;
         self.config = config;
         self.config_path = path;
+        self.restart_diagnostics_server();
         self.sync_menu();
         Ok(())
     }
@@ -497,6 +639,16 @@ impl TrayApp {
             items.status.set_text(format!("Error: {message}"));
         }
     }
+
+    fn restart_diagnostics_server(&mut self) {
+        if let Some(server) = self.diagnostics_server.take() {
+            server.stop();
+        }
+        match crate::diagnostics::DiagnosticsServer::start(&self.config.security.pin) {
+            Ok(server) => self.diagnostics_server = Some(server),
+            Err(error) => self.set_error(format!("Diagnostics server failed: {error:#}")),
+        }
+    }
 }
 
 impl TrayItems {
@@ -527,16 +679,10 @@ impl TrayItems {
 }
 
 fn app_icon() -> Result<Icon> {
-    let dark_mode = is_dark_system_theme();
-    if let Some(icon_path) = std::env::current_exe().ok().and_then(|path| {
-        path.parent().map(|parent| {
-            parent.join(if dark_mode {
-                "screen-mirror-dark.ico"
-            } else {
-                "screen-mirror.ico"
-            })
-        })
-    }) {
+    if let Some(icon_path) = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("screen-mirror.ico")))
+    {
         if icon_path.exists() {
             if let Ok(icon) = Icon::from_path(icon_path, Some((32, 32))) {
                 return Ok(icon);
@@ -546,7 +692,7 @@ fn app_icon() -> Result<Icon> {
 
     let size = 32;
     let mut rgba = Vec::with_capacity(size * size * 4);
-    let color = if dark_mode { 245 } else { 17 };
+    let (color_r, color_g, color_b) = (248, 181, 0);
     for y in 0..size {
         for x in 0..size {
             let border = (3..=28).contains(&x)
@@ -560,7 +706,7 @@ fn app_icon() -> Result<Icon> {
             let stand = (10..=21).contains(&x) && (26..=27).contains(&y);
             let (red, green, blue, alpha) =
                 if border || divider || left_arrow || right_arrow || stand {
-                    (color, color, color, 255)
+                    (color_r, color_g, color_b, 255)
                 } else {
                     (0, 0, 0, 0)
                 };
@@ -568,24 +714,4 @@ fn app_icon() -> Result<Icon> {
         }
     }
     Icon::from_rgba(rgba, size as u32, size as u32).context("failed to create tray icon image")
-}
-
-#[cfg(windows)]
-fn is_dark_system_theme() -> bool {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let Ok(key) =
-        hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-    else {
-        return false;
-    };
-    let system_uses_light_theme = key.get_value::<u32, _>("SystemUsesLightTheme").unwrap_or(1);
-    system_uses_light_theme == 0
-}
-
-#[cfg(not(windows))]
-fn is_dark_system_theme() -> bool {
-    false
 }

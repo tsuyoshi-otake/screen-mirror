@@ -14,6 +14,7 @@ Low-latency LAN screen mirroring for Windows and Android. This is not Miracast-c
 
 - Discovery: UDP broadcast on port `47777`
 - Touch/control: UDP JSON on port `47778`
+- Diagnostics: TCP JSON request/report response on port `47779`
 - Video: RTP/H.264 over UDP on port `5004`
 - Audio: optional Opus/RTP over UDP on port `5005`
 - Pairing: sender and receiver must use the same four-digit PIN; discovery/control packets carry only a SHA-256 PIN hash
@@ -36,8 +37,10 @@ Tray actions:
 - `Stop`: stops the active pipeline
 - `Enable Autostart`: registers the tray app under HKCU Run
 - `Check for Updates`: checks GitHub Releases immediately
+- `Run Diagnostics`: writes a copyable debug report, copies it to the clipboard, and opens it in Notepad
+- `Run Peer Diagnostics`: discovers a sender with the same PIN, requests its debug report, copies it to the clipboard, and opens it in Notepad
 - `Install/Repair Virtual Display Driver`: installs the bundled VDD driver without creating duplicates when it already exists
-- `Show/Enable/Disable/Remove All Bundled Virtual Displays`: manages bundled `Root\MttVDD` devices
+- `Show/Enable/Disable/Remove All Bundled Virtual Displays`: manages bundled MTT VDD display devices and monitors
 - `Open Display Settings`: opens Windows display settings
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`
 
@@ -127,7 +130,7 @@ The MSI bundles the signed VDD Driver Only package and `devcon.exe` from the off
 devcon.exe install "vdd\MttVDD.inf" Root\MttVDD
 ```
 
-This launches the driver install through UAC and creates the root-enumerated `Root\MttVDD` device only if one does not already exist. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
+This launches the driver install through UAC and creates the root-enumerated MTT VDD display device only if one does not already exist. Depending on Windows/driver state, the instance can appear as `ROOT\DISPLAY\...` with an attached `DISPLAY\MTT1337\...` monitor. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
 
 ```powershell
 winget install --id=VirtualDrivers.Virtual-Display-Driver -e
@@ -227,6 +230,20 @@ Build the MSI:
 The MSI installs `screen-mirror.exe`, the tray/start-menu icon, autostart registration, and the required GStreamer runtime DLL/plugin files.
 The tray app is launched after install/update and is registered under HKCU Run for the installing Windows user.
 
+## Diagnostics
+
+Use tray menu `Run Diagnostics` to collect a local debug report. The report is saved under `%TEMP%`, opened in Notepad, and copied to the clipboard so it can be pasted into an issue or chat.
+
+Use tray menu `Run Peer Diagnostics` on a receiver to collect diagnostics from a sender with the same PIN. The sender advertises a diagnostics endpoint while sender mode is active, and the receiver requests the report over TCP `47779`. The received report is saved under `%TEMP%`, opened in Notepad, and copied to the receiver clipboard.
+
+The report includes:
+
+- Raw `%APPDATA%\screen-mirror\config.toml`, including the four-digit PIN
+- Recent Screen Mirror log lines
+- Installed version, autostart entry, and running process list
+- Bundled VDD device status and other virtual display candidates
+- Windows display list, GStreamer probe, receiver discovery, UDP endpoints, network adapters, and related firewall rule summaries
+
 ## Auto Update
 
 The tray app checks GitHub Releases automatically:
@@ -244,6 +261,7 @@ Receiver mode prevents the display and system from sleeping while video receptio
 - Windows receiver calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`.
 - Android receiver sets `FLAG_KEEP_SCREEN_ON` and `SurfaceView.setKeepScreenOn(true)`.
 - The sleep/display guard is released when receiver mode stops.
+- Windows receiver mode exits back to idle after video packets stop arriving, so a fullscreen receiver window is not left behind after sender disconnect.
 
 ## Receiver Window
 

@@ -4,6 +4,7 @@ mod autostart;
 mod config;
 mod console;
 mod control;
+mod diagnostics;
 mod lan;
 mod logging;
 mod monitors;

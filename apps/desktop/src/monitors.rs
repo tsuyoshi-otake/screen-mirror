@@ -80,12 +80,7 @@ pub fn primary_display_info() -> Option<sm_core::discovery::DisplayInfo> {
         })
 }
 
-pub fn enable_extended_desktop_once() {
-    static REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if REQUESTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-
+pub fn request_extended_desktop() {
     #[cfg(windows)]
     {
         let result = std::process::Command::new("DisplaySwitch.exe")

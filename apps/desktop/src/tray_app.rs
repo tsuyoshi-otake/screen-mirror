@@ -14,6 +14,11 @@ const ID_STOP: &str = "stop";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_INSTALL_VDD: &str = "install-vdd";
+const ID_LIST_VDD: &str = "list-vdd";
+const ID_ENABLE_VDD: &str = "enable-vdd";
+const ID_DISABLE_VDD: &str = "disable-vdd";
+const ID_REMOVE_VDD: &str = "remove-vdd";
+const ID_OPEN_DISPLAY_SETTINGS: &str = "open-display-settings";
 const ID_OPEN_VDD: &str = "open-vdd";
 const ID_OPEN_CONFIG: &str = "open-config";
 const ID_RELOAD_CONFIG: &str = "reload-config";
@@ -120,7 +125,24 @@ impl TrayApp {
         let check_update = MenuItem::with_id(ID_CHECK_UPDATE, "Check for Updates", true, None);
         let install_vdd = MenuItem::with_id(
             ID_INSTALL_VDD,
-            "Install Bundled Virtual Display Driver",
+            "Install/Repair Virtual Display Driver",
+            true,
+            None,
+        );
+        let list_vdd = MenuItem::with_id(ID_LIST_VDD, "Show Virtual Display Status", true, None);
+        let enable_vdd =
+            MenuItem::with_id(ID_ENABLE_VDD, "Enable Virtual Display Driver", true, None);
+        let disable_vdd =
+            MenuItem::with_id(ID_DISABLE_VDD, "Disable Virtual Display Driver", true, None);
+        let remove_vdd = MenuItem::with_id(
+            ID_REMOVE_VDD,
+            "Remove All Bundled Virtual Displays",
+            true,
+            None,
+        );
+        let open_display_settings = MenuItem::with_id(
+            ID_OPEN_DISPLAY_SETTINGS,
+            "Open Display Settings",
             true,
             None,
         );
@@ -139,6 +161,11 @@ impl TrayApp {
         menu.append(&items.autostart)?;
         menu.append(&check_update)?;
         menu.append(&install_vdd)?;
+        menu.append(&list_vdd)?;
+        menu.append(&enable_vdd)?;
+        menu.append(&disable_vdd)?;
+        menu.append(&remove_vdd)?;
+        menu.append(&open_display_settings)?;
         menu.append(&open_vdd)?;
         menu.append(&open_config)?;
         menu.append(&reload_config)?;
@@ -191,7 +218,12 @@ impl TrayApp {
             }
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
-            ID_INSTALL_VDD => self.install_bundled_vdd(),
+            ID_INSTALL_VDD => self.run_vdd_action("Install"),
+            ID_LIST_VDD => self.run_vdd_action("List"),
+            ID_ENABLE_VDD => self.run_vdd_action("Enable"),
+            ID_DISABLE_VDD => self.run_vdd_action("Disable"),
+            ID_REMOVE_VDD => self.run_vdd_action("Remove"),
+            ID_OPEN_DISPLAY_SETTINGS => self.open_display_settings(),
             ID_OPEN_VDD => self.open_vdd_page(),
             ID_OPEN_CONFIG => self.open_config(),
             ID_RELOAD_CONFIG => self.reload_config(),
@@ -204,6 +236,11 @@ impl TrayApp {
     }
 
     fn start_sender(&mut self) {
+        if let Err(error) = self.reload_config_from_disk() {
+            self.set_error(format!("Config reload failed: {error:#}"));
+            return;
+        }
+
         if let Err(error) = self.stop_current() {
             self.set_error(format!("Stop failed: {error:#}"));
             return;
@@ -246,6 +283,11 @@ impl TrayApp {
 
     fn start_receiver(&mut self) {
         crate::logging::append("start_receiver requested");
+        if let Err(error) = self.reload_config_from_disk() {
+            self.set_error(format!("Config reload failed: {error:#}"));
+            return;
+        }
+
         if let Err(error) = self.stop_current() {
             self.set_error(format!("Stop failed: {error:#}"));
             return;
@@ -329,7 +371,7 @@ impl TrayApp {
         }
     }
 
-    fn install_bundled_vdd(&self) {
+    fn run_vdd_action(&self, action: &str) {
         let Some(script) = std::env::current_exe().ok().and_then(|path| {
             path.parent()
                 .map(|parent| parent.join("install-bundled-vdd.ps1"))
@@ -349,9 +391,19 @@ impl TrayApp {
         if let Err(error) = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(script)
+            .args(["-Action", action])
             .spawn()
         {
-            self.set_error(format!("Failed to start bundled VDD installer: {error}"));
+            self.set_error(format!("Failed to start VDD action {action}: {error}"));
+        }
+    }
+
+    fn open_display_settings(&self) {
+        if let Err(error) = std::process::Command::new("cmd.exe")
+            .args(["/C", "start", "", "ms-settings:display"])
+            .spawn()
+        {
+            eprintln!("failed to open display settings: {error}");
         }
     }
 
@@ -387,6 +439,14 @@ impl TrayApp {
             }
             Err(error) => self.set_error(format!("Config reload failed: {error:#}")),
         }
+    }
+
+    fn reload_config_from_disk(&mut self) -> Result<()> {
+        let (config, path) = AppConfig::load_or_create()?;
+        self.config = config;
+        self.config_path = path;
+        self.sync_menu();
+        Ok(())
     }
 
     fn save_config(&self) {

@@ -36,6 +36,9 @@ Tray actions:
 - `Stop`: stops the active pipeline
 - `Enable Autostart`: registers the tray app under HKCU Run
 - `Check for Updates`: checks GitHub Releases immediately
+- `Install/Repair Virtual Display Driver`: installs the bundled VDD driver without creating duplicates when it already exists
+- `Show/Enable/Disable/Remove All Bundled Virtual Displays`: manages bundled `Root\MttVDD` devices
+- `Open Display Settings`: opens Windows display settings
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`
 
 ## Quick Start
@@ -44,7 +47,7 @@ Tray actions:
 
 1. Install `ScreenMirror.msi` from the latest GitHub Release.
 2. Start `Screen Mirror` from the Start Menu or the system tray.
-3. Open the tray menu and run `Install Bundled Virtual Display Driver`.
+3. Open the tray menu and run `Install/Repair Virtual Display Driver`.
 4. Allow the UAC prompt, then confirm Windows Display Settings shows an extra display.
 5. Set the same four-digit PIN on Windows and Android. The default is `0000`.
 6. Start the Android app and tap `Start Receiver`.
@@ -109,6 +112,7 @@ fullscreen = true
 
 - PIN values must be exactly four numeric digits.
 - Windows stores the PIN in `%APPDATA%\screen-mirror\config.toml` under `[security].pin`.
+- The tray app reloads `%APPDATA%\screen-mirror\config.toml` before starting sender or receiver mode, so a changed PIN is applied on the next start.
 - Android stores the PIN from the app input field and reuses it on the next launch.
 - Auto discovery ignores receivers with a different PIN hash, so mismatched devices do not auto-connect.
 - This is pairing protection for trusted LAN use, not strong encryption. RTP/H.264 video is still sent over plain UDP.
@@ -117,13 +121,13 @@ fullscreen = true
 
 For a SuperDisplay-like extended desktop workflow, screen-mirror uses Virtual Display Driver (VDD) as the Windows virtual monitor and streams that display.
 
-The MSI bundles the signed VDD Driver Only package and `devcon.exe` from the official VDD Control release under the install directory. Use the tray menu item `Install Bundled Virtual Display Driver` to run:
+The MSI bundles the signed VDD Driver Only package and `devcon.exe` from the official VDD Control release under the install directory. Use the tray menu item `Install/Repair Virtual Display Driver` to run an idempotent install:
 
 ```powershell
 devcon.exe install "vdd\MttVDD.inf" Root\MttVDD
 ```
 
-This launches the driver install through UAC and creates the root-enumerated `Root\MttVDD` device. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
+This launches the driver install through UAC and creates the root-enumerated `Root\MttVDD` device only if one does not already exist. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
 
 ```powershell
 winget install --id=VirtualDrivers.Virtual-Display-Driver -e
@@ -137,6 +141,8 @@ Runtime behavior:
 4. The sender requests Windows extended-display mode with `DisplaySwitch.exe /extend`.
 5. If a VDD/SuperDisplay-style virtual monitor is visible, the sender tries to match its resolution to the first receiver.
 6. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
+
+Use the tray menu to show, enable, disable, or remove all bundled `Root\MttVDD` devices. If repeated installs created two or more virtual displays, the remove action deletes every bundled `Root\MttVDD` device after confirmation.
 
 List capture indexes:
 
@@ -217,6 +223,7 @@ Build the MSI:
 ```
 
 The MSI installs `screen-mirror.exe`, the tray/start-menu icon, autostart registration, and the required GStreamer runtime DLL/plugin files.
+The tray app is launched after install/update and is registered under HKCU Run for the installing Windows user.
 
 ## Auto Update
 

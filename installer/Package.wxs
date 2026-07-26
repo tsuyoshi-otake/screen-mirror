@@ -27,7 +27,7 @@
     <CustomAction Id="LaunchScreenMirror" FileRef="ScreenMirrorExe" ExeCommand="tray" Execute="immediate" Return="asyncNoWait" Impersonate="yes" />
     <InstallExecuteSequence>
       <Custom Action="StopExistingScreenMirror" Before="InstallValidate" Condition="NOT REMOVE" />
-      <Custom Action="LaunchScreenMirror" After="InstallFinalize" Condition="NOT Installed" />
+      <Custom Action="LaunchScreenMirror" After="InstallFinalize" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
   </Package>
 

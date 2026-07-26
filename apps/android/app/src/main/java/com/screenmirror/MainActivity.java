@@ -17,6 +17,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -26,10 +27,13 @@ import java.util.List;
 
 public final class MainActivity extends Activity {
     private static final int STREAM_PORT = 5004;
+    private static final String PREF_PIN = "pin";
+    private static final String PREF_RECEIVE_AUDIO = "receive_audio";
     private static final int REQUEST_CAPTURE = 1001;
 
     private final DiscoveryAgent discovery = new DiscoveryAgent();
     private final RtpH264Receiver receiver = new RtpH264Receiver();
+    private final RtpOpusReceiver audioReceiver = new RtpOpusReceiver();
     private final ScreenSender sender = new ScreenSender();
     private final ControlClient control = new ControlClient();
     private final ArrayList<DiscoveryAgent.Peer> selectedReceivers = new ArrayList<>();
@@ -37,6 +41,7 @@ public final class MainActivity extends Activity {
     private SurfaceView surfaceView;
     private TextView status;
     private EditText pinInput;
+    private CheckBox receiveAudio;
     private LinearLayout toolbar;
     private MediaProjectionManager projectionManager;
     private WifiManager.MulticastLock multicastLock;
@@ -86,9 +91,13 @@ public final class MainActivity extends Activity {
 
         pinInput = new EditText(this);
         pinInput.setHint("PIN (4 digits)");
-        pinInput.setText(preferences.getString("pin", Pin.DEFAULT));
+        pinInput.setText(preferences.getString(PREF_PIN, Pin.DEFAULT));
         pinInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
         pinInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4)});
+
+        receiveAudio = new CheckBox(this);
+        receiveAudio.setText("Receive Audio (Opus/RTP :5005)");
+        receiveAudio.setChecked(preferences.getBoolean(PREF_RECEIVE_AUDIO, false));
 
         Button startReceiver = new Button(this);
         startReceiver.setText("Start Receiver");
@@ -110,6 +119,7 @@ public final class MainActivity extends Activity {
         toolbar.setOrientation(LinearLayout.VERTICAL);
         toolbar.addView(status);
         toolbar.addView(pinInput);
+        toolbar.addView(receiveAudio);
         toolbar.addView(startReceiver);
         toolbar.addView(discover);
         toolbar.addView(startSender);
@@ -156,6 +166,15 @@ public final class MainActivity extends Activity {
         stopAll();
         enterReceiverFullscreen();
         keepReceiverAwake(true);
+        boolean audioEnabled = receiveAudio.isChecked();
+        preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, audioEnabled).apply();
+        if (audioEnabled) {
+            try {
+                audioReceiver.start(RtpOpusReceiver.DEFAULT_AUDIO_PORT);
+            } catch (Exception error) {
+                setStatus("Audio receiver failed: " + error.getMessage());
+            }
+        }
         SurfaceHolder holder = surfaceView.getHolder();
         holder.addCallback(new SurfaceHolder.Callback() {
             @Override
@@ -164,7 +183,7 @@ public final class MainActivity extends Activity {
                     lockMulticast();
                     discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
                     receiver.start(STREAM_PORT, holder.getSurface());
-                    setStatus("Status: receiving on :" + STREAM_PORT);
+                    setStatus(receiverStatus(audioEnabled));
                 } catch (Exception error) {
                     setStatus("Receiver failed: " + error.getMessage());
                 }
@@ -184,7 +203,7 @@ public final class MainActivity extends Activity {
                 lockMulticast();
                 discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
                 receiver.start(STREAM_PORT, holder.getSurface());
-                setStatus("Status: receiving on :" + STREAM_PORT);
+                setStatus(receiverStatus(audioEnabled));
             } catch (Exception error) {
                 setStatus("Receiver failed: " + error.getMessage());
             }
@@ -245,6 +264,7 @@ public final class MainActivity extends Activity {
     private void stopAll() {
         discovery.stop();
         receiver.stop();
+        audioReceiver.stop();
         sender.stop();
         leaveReceiverFullscreen();
         keepReceiverAwake(false);
@@ -263,7 +283,7 @@ public final class MainActivity extends Activity {
     private String currentPinOrStatus() {
         try {
             String pin = Pin.normalize(pinInput.getText().toString());
-            preferences.edit().putString("pin", pin).apply();
+            preferences.edit().putString(PREF_PIN, pin).apply();
             return pin;
         } catch (IllegalArgumentException error) {
             setStatus("Invalid PIN: use exactly four digits");
@@ -325,5 +345,12 @@ public final class MainActivity extends Activity {
 
     private void setStatus(String text) {
         status.setText(text);
+    }
+
+    private static String receiverStatus(boolean audioEnabled) {
+        if (audioEnabled) {
+            return "Status: receiving video :" + STREAM_PORT + " and audio :" + RtpOpusReceiver.DEFAULT_AUDIO_PORT;
+        }
+        return "Status: receiving on :" + STREAM_PORT;
     }
 }

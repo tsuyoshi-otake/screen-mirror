@@ -246,7 +246,7 @@ The Windows receiver uses GStreamer `d3d11videosink` for GPU rendering, but scre
 
 ## Audio
 
-Desktop audio transfer is optional and uses a separate low-latency Opus/RTP stream:
+Audio transfer is optional and uses a separate low-latency Opus/RTP stream:
 
 ```toml
 [send]
@@ -263,7 +263,8 @@ audio_jitter_ms = 15
 
 - Sender capture: Windows WASAPI loopback via `wasapi2src`.
 - Encoding: `opusenc audio-type=restricted-lowdelay` with configurable frame size.
-- Receiver playback: `opusdec` into `wasapi2sink low-latency=true`.
+- Windows receiver playback: `opusdec` into `wasapi2sink low-latency=true`.
+- Android receiver playback: RTP/Opus packets on `:5005` are decoded with `MediaCodec` and played through `AudioTrack`.
 - Audio stays CPU-side; libopus uses its own CPU/SIMD optimizations where available.
 - Keep video on `5004` and audio on `5005` through the firewall.
 
@@ -357,4 +358,4 @@ The Android packet path is optimized for the hot loop:
 - UDP favors latency over guaranteed delivery; unstable Wi-Fi can produce visible corruption.
 - Android sender currently uses a fixed `1280x720@30` encode path.
 - Android touch injection into Android sender devices is not implemented because it requires an AccessibilityService/root-level privileges.
-- Desktop audio transfer is implemented for Windows sender/receiver. Android audio capture/playback is not implemented yet.
+- Desktop audio transfer is implemented for Windows sender/receiver, and Android receiver audio playback is implemented. Android sender audio capture is not implemented yet.

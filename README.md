@@ -357,4 +357,4 @@ The Android packet path is optimized for the hot loop:
 - UDP favors latency over guaranteed delivery; unstable Wi-Fi can produce visible corruption.
 - Android sender currently uses a fixed `1280x720@30` encode path.
 - Android touch injection into Android sender devices is not implemented because it requires an AccessibilityService/root-level privileges.
-- Audio is not implemented yet; the next step is WASAPI loopback on Windows and AudioPlaybackCapture on Android.
+- Desktop audio transfer is implemented for Windows sender/receiver. Android audio capture/playback is not implemented yet.

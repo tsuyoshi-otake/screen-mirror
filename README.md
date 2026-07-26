@@ -226,7 +226,7 @@ The tray app checks GitHub Releases automatically:
 - Regular interval: once per hour
 - Manual check: tray menu `Check for Updates`
 - Asset name: `ScreenMirror.msi`
-- Install mode: quiet MSI update with `/qn /norestart`
+- Install mode: hidden direct `msiexec.exe /i <msi> /qn /norestart`; no `cmd.exe` wrapper window
 
 ## Receiver Power Behavior
 
@@ -357,6 +357,6 @@ The Android packet path is optimized for the hot loop:
 
 - DRM/protected content is out of scope.
 - UDP favors latency over guaranteed delivery; unstable Wi-Fi can produce visible corruption.
-- Android sender currently uses a fixed `1280x720@30` encode path.
+- Android sender chooses an encoder-aligned resolution from discovered receiver display metadata, capped at `1920x1080` for latency.
 - Android touch injection into Android sender devices is not implemented because it requires an AccessibilityService/root-level privileges.
 - Desktop audio transfer is implemented for Windows sender/receiver. Android receiver audio playback and Android sender app-audio capture are implemented; Android sender audio is limited by Android's AudioPlaybackCapture rules and app opt-out behavior.

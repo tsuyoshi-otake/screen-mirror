@@ -163,7 +163,7 @@ public final class MainActivity extends Activity {
             MediaProjection projection = projectionManager.getMediaProjection(resultCode, data);
             boolean audioEnabled = sendAudio.isChecked() && canSendAudio();
             sender.start(projection, new ArrayList<>(selectedReceivers), audioEnabled);
-            setStatus("Status: sending to " + selectedReceivers.size() + " receiver(s)" + (audioEnabled ? " with audio" : ""));
+            setStatus("Status: sending " + sender.profileDescription() + " to " + selectedReceivers.size() + " receiver(s)" + (audioEnabled ? " with audio" : ""));
         } catch (Exception error) {
             setStatus("Sender failed: " + error.getMessage());
         }
@@ -172,10 +172,6 @@ public final class MainActivity extends Activity {
     private void startReceiver() {
         String pin = currentPinOrStatus();
         if (pin == null) {
-            return;
-        }
-        preferences.edit().putBoolean(PREF_SEND_AUDIO, sendAudio.isChecked()).apply();
-        if (sendAudio.isChecked() && !ensureAudioPermission()) {
             return;
         }
         stopAll();
@@ -249,6 +245,10 @@ public final class MainActivity extends Activity {
     private void startSender() {
         String pin = currentPinOrStatus();
         if (pin == null) {
+            return;
+        }
+        preferences.edit().putBoolean(PREF_SEND_AUDIO, sendAudio.isChecked()).apply();
+        if (sendAudio.isChecked() && !ensureAudioPermission()) {
             return;
         }
         stopAll();

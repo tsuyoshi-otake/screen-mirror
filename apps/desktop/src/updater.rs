@@ -7,11 +7,16 @@ use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const OWNER: &str = "tsuyoshi-otake";
 const REPO: &str = "screen-mirror";
 const INSTALLER_ASSET: &str = "ScreenMirror.msi";
 const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 static START: Once = Once::new();
 
@@ -84,7 +89,7 @@ fn check_and_start_update() -> Result<()> {
 
 fn latest_release() -> Result<GithubRelease> {
     let url = format!("https://api.github.com/repos/{OWNER}/{REPO}/releases/latest");
-    let output = Command::new("curl.exe")
+    let output = hidden_command("curl.exe")
         .args(["-fsSL", "-H", "User-Agent: screen-mirror-updater", &url])
         .output()
         .context("failed to start curl.exe for release check")?;
@@ -104,7 +109,7 @@ fn download_installer(url: &str, tag_name: &str) -> Result<PathBuf> {
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let installer = dir.join(format!("ScreenMirror-{tag_name}.msi"));
 
-    let status = Command::new("curl.exe")
+    let status = hidden_command("curl.exe")
         .args([
             "-fL",
             "-H",
@@ -126,25 +131,29 @@ fn download_installer(url: &str, tag_name: &str) -> Result<PathBuf> {
 }
 
 fn start_installer_and_exit(installer: &PathBuf) -> Result<()> {
-    let command = format!(
-        "timeout /t 2 /nobreak > nul && msiexec /i \"{}\" /qn /norestart",
-        installer.display()
-    );
-    Command::new("cmd.exe")
-        .args([
-            "/C",
-            "start",
-            "\"ScreenMirrorUpdate\"",
-            "/MIN",
-            "cmd.exe",
-            "/C",
-            &command,
-        ])
+    hidden_command("msiexec.exe")
+        .arg("/i")
+        .arg(installer)
+        .args(["/qn", "/norestart"])
         .spawn()
         .context("failed to start MSI update process")?;
 
     std::process::exit(0);
 }
+
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    hide_window(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn hide_window(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_window(_command: &mut Command) {}
 
 fn update_dir() -> Result<PathBuf> {
     let base = dirs::data_local_dir().context("failed to resolve local app data directory")?;

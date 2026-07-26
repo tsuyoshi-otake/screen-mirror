@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
+use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Sender, Once};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const OWNER: &str = "tsuyoshi-otake";
 const REPO: &str = "screen-mirror";
@@ -32,24 +33,49 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
-pub fn start_background_update_checks() {
-    START.call_once(|| {
-        thread::spawn(|| {
+#[derive(Clone, Debug, Serialize)]
+struct UpdateAttempt {
+    current_version: String,
+    target_version: String,
+    started_unix_secs: u64,
+}
+
+#[derive(Copy, Clone)]
+enum UpdateCheckKind {
+    Background,
+    Manual,
+}
+
+pub fn start_background_update_checks(status: Sender<String>) {
+    START.call_once(move || {
+        thread::spawn(move || {
             thread::sleep(FIRST_CHECK_DELAY);
             loop {
                 crate::logging::append("background update check started (in-process HTTP)");
-                match check_and_start_update() {
-                    Ok(UpdateOutcome::UpdateStarted { latest }) => {
+                match check_and_start_update(UpdateCheckKind::Background) {
+                    Ok(UpdateOutcome::Available { latest }) => {
                         crate::logging::append(format!(
-                            "background update started: v{latest}; exiting for installer"
+                            "background update available: v{latest}; waiting for manual update"
                         ));
-                        thread::sleep(Duration::from_secs(2));
-                        std::process::exit(0);
+                        if let Err(error) = status.send(format!(
+                            "Status: update v{latest} available; use Check for Updates"
+                        )) {
+                            crate::logging::append(format!(
+                                "failed to publish background update status: {error}"
+                            ));
+                        }
                     }
                     Ok(UpdateOutcome::UpToDate { current, latest }) => {
                         crate::logging::append(format!(
                             "background update check finished: up to date current={current} latest={latest}"
                         ));
+                    }
+                    Ok(UpdateOutcome::UpdateStarted { latest }) => {
+                        crate::logging::append(format!(
+                            "unexpected background update start: v{latest}; exiting for installer"
+                        ));
+                        thread::sleep(Duration::from_secs(2));
+                        std::process::exit(0);
                     }
                     Err(error) => {
                         eprintln!("update check failed: {error:#}");
@@ -66,7 +92,7 @@ pub fn start_background_update_checks() {
 
 pub fn start_manual_update_check(status: Sender<String>) {
     thread::spawn(move || {
-        let message = match check_and_start_update() {
+        let message = match check_and_start_update(UpdateCheckKind::Manual) {
             Ok(UpdateOutcome::UpToDate { current, latest }) => {
                 crate::logging::append(format!(
                     "manual update check finished: up to date current={current} latest={latest}"
@@ -76,6 +102,9 @@ pub fn start_manual_update_check(status: Sender<String>) {
             Ok(UpdateOutcome::UpdateStarted { latest }) => {
                 crate::logging::append(format!("manual update started: v{latest}"));
                 format!("Status: updating to v{latest}; app will restart")
+            }
+            Ok(UpdateOutcome::Available { latest }) => {
+                format!("Status: update v{latest} available")
             }
             Err(error) => {
                 eprintln!("manual update check failed: {error:#}");
@@ -96,9 +125,10 @@ pub fn start_manual_update_check(status: Sender<String>) {
 enum UpdateOutcome {
     UpToDate { current: String, latest: String },
     UpdateStarted { latest: String },
+    Available { latest: String },
 }
 
-fn check_and_start_update() -> Result<UpdateOutcome> {
+fn check_and_start_update(kind: UpdateCheckKind) -> Result<UpdateOutcome> {
     let release = latest_release()?;
     let latest = parse_version(&release.tag_name).with_context(|| {
         format!(
@@ -109,9 +139,17 @@ fn check_and_start_update() -> Result<UpdateOutcome> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))?;
 
     if latest <= current {
+        clear_completed_update_attempt();
         return Ok(UpdateOutcome::UpToDate {
             current: env!("CARGO_PKG_VERSION").to_string(),
             latest: release.tag_name.trim_start_matches('v').to_string(),
+        });
+    }
+
+    let latest_text = release.tag_name.trim_start_matches('v').to_string();
+    if matches!(kind, UpdateCheckKind::Background) {
+        return Ok(UpdateOutcome::Available {
+            latest: latest_text,
         });
     }
 
@@ -127,8 +165,11 @@ fn check_and_start_update() -> Result<UpdateOutcome> {
         })
         .ok_or_else(|| anyhow!("release {} has no MSI asset", release.tag_name))?;
     let installer = download_installer(&asset.browser_download_url, &release.tag_name)?;
-    let latest_text = release.tag_name.trim_start_matches('v').to_string();
-    start_update_runner(&installer, &latest_text)?;
+    let attempt_path = record_update_attempt(&latest_text)?;
+    if let Err(error) = start_update_runner(&installer, &latest_text, &attempt_path) {
+        let _ = fs::remove_file(&attempt_path);
+        return Err(error);
+    }
     UPDATE_STARTED.store(true, Ordering::SeqCst);
     Ok(UpdateOutcome::UpdateStarted {
         latest: latest_text,
@@ -246,17 +287,27 @@ fn http_agent(timeout: Duration) -> ureq::Agent {
         .new_agent()
 }
 
-fn start_update_runner(installer: &PathBuf, latest: &str) -> Result<()> {
+fn start_update_runner(installer: &PathBuf, latest: &str, attempt_path: &PathBuf) -> Result<()> {
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     let dir = update_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let script = dir.join("run-update.ps1");
     let log = dir.join(format!("ScreenMirror-update-v{latest}.log"));
+    let failure = dir.join("ScreenMirror-update-last-failure.txt");
     fs::write(&script, update_runner_script())
         .with_context(|| format!("failed to write {}", script.display()))?;
 
     crate::process::hidden_command("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+        ])
         .arg(&script)
         .arg("-Installer")
         .arg(installer)
@@ -264,6 +315,14 @@ fn start_update_runner(installer: &PathBuf, latest: &str) -> Result<()> {
         .arg(exe)
         .arg("-LogPath")
         .arg(log)
+        .arg("-CurrentPid")
+        .arg(std::process::id().to_string())
+        .arg("-AttemptPath")
+        .arg(attempt_path)
+        .arg("-FailurePath")
+        .arg(failure)
+        .arg("-TargetVersion")
+        .arg(latest)
         .spawn()
         .context("failed to start update runner")?;
 
@@ -280,11 +339,51 @@ param(
     [string] $CurrentExe,
 
     [Parameter(Mandatory = $true)]
-    [string] $LogPath
+    [string] $LogPath,
+
+    [Parameter(Mandatory = $true)]
+    [int] $CurrentPid,
+
+    [Parameter(Mandatory = $true)]
+    [string] $AttemptPath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $FailurePath,
+
+    [Parameter(Mandatory = $true)]
+    [string] $TargetVersion
 )
 
 $ErrorActionPreference = "Continue"
-Start-Sleep -Seconds 2
+
+function Write-UpdateFailure {
+    param(
+        [string] $Message,
+        [int] $ExitCode
+    )
+
+    @(
+        "Screen Mirror Update Failure",
+        "Generated: $(Get-Date -Format s)",
+        "TargetVersion: $TargetVersion",
+        "ExitCode: $ExitCode",
+        "Message: $Message",
+        "Installer: $Installer",
+        "MSI log: $LogPath",
+        "Attempt state: $AttemptPath"
+    ) | Set-Content -LiteralPath $FailurePath -Encoding UTF8
+}
+
+$exitDeadline = (Get-Date).AddSeconds(30)
+while ((Get-Process -Id $CurrentPid -ErrorAction SilentlyContinue) -and
+       (Get-Date) -lt $exitDeadline) {
+    Start-Sleep -Milliseconds 250
+}
+
+if (Get-Process -Id $CurrentPid -ErrorAction SilentlyContinue) {
+    Write-UpdateFailure "Timed out waiting for Screen Mirror process $CurrentPid to exit." 1460
+    exit 1460
+}
 
 $arguments = @(
     "/i",
@@ -294,14 +393,25 @@ $arguments = @(
     "/L*v",
     "`"$LogPath`""
 )
-$process = Start-Process -FilePath "msiexec.exe" -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+try {
+    $process = Start-Process -FilePath "msiexec.exe" -Verb RunAs -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+} catch {
+    Write-UpdateFailure $_.Exception.Message 1
+    if (Test-Path -LiteralPath $CurrentExe) {
+        Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
+    }
+    exit 1
+}
 
 if ($process.ExitCode -ne 0) {
+    Write-UpdateFailure "msiexec failed." $process.ExitCode
     if (Test-Path -LiteralPath $CurrentExe) {
         Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
     }
     exit $process.ExitCode
 }
+
+Remove-Item -LiteralPath $AttemptPath, $FailurePath -Force -ErrorAction SilentlyContinue
 
 Start-Sleep -Seconds 5
 $running = @(Get-Process screen-mirror -ErrorAction SilentlyContinue)
@@ -314,6 +424,39 @@ if ($running.Count -eq 0) {
     }
 }
 "#
+}
+
+fn record_update_attempt(target_version: &str) -> Result<PathBuf> {
+    let path = update_attempt_path()?;
+    let attempt = UpdateAttempt {
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        target_version: target_version.to_string(),
+        started_unix_secs: unix_now_secs(),
+    };
+    let bytes = serde_json::to_vec_pretty(&attempt).context("failed to encode update attempt")?;
+    fs::write(&path, bytes)
+        .with_context(|| format!("failed to write update attempt state {}", path.display()))?;
+    Ok(path)
+}
+
+fn clear_completed_update_attempt() {
+    let Ok(path) = update_attempt_path() else {
+        return;
+    };
+    let _ = fs::remove_file(path);
+}
+
+fn update_attempt_path() -> Result<PathBuf> {
+    let dir = update_dir()?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    Ok(dir.join("update-attempt.json"))
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn update_dir() -> Result<PathBuf> {

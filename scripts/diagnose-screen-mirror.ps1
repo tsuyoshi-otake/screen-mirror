@@ -26,6 +26,7 @@ if (-not (Test-Path -LiteralPath $screenMirror)) {
 
 $configPath = Join-Path $env:APPDATA "screen-mirror\config.toml"
 $logPath = Join-Path $env:LOCALAPPDATA "ScreenMirror\screen-mirror.log"
+$updatesPath = Join-Path $env:LOCALAPPDATA "ScreenMirror\Updates"
 $reportPath = Join-Path $env:TEMP ("ScreenMirror-diagnostics-{0}.txt" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 $interestingPorts = @(47777, 47778, 47779, 5004, 5005)
 $lines = New-Object System.Collections.Generic.List[string]
@@ -278,6 +279,43 @@ if (Test-Path -LiteralPath $logPath) {
     Add-Line ((Get-Content -LiteralPath $logPath -Tail 200) -join [Environment]::NewLine)
 } else {
     Add-Line "Log file not found."
+}
+
+Add-CommandOutput "Update State" {
+    if (-not (Test-Path -LiteralPath $updatesPath)) {
+        "Update directory not found."
+        return
+    }
+
+    Get-ChildItem -LiteralPath $updatesPath -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object Name, Length, LastWriteTime |
+        Format-Table -AutoSize
+
+    foreach ($name in @("update-attempt.json", "ScreenMirror-update-last-failure.txt")) {
+        $path = Join-Path $updatesPath $name
+        if (Test-Path -LiteralPath $path) {
+            "---- $name ----"
+            Get-Content -LiteralPath $path -Raw
+        }
+    }
+
+    $msiLog = Get-ChildItem -LiteralPath $updatesPath -Filter "ScreenMirror-update-v*.log" -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($msiLog) {
+        "---- $($msiLog.Name) relevant failures ----"
+        $matches = Get-Content -LiteralPath $msiLog.FullName |
+            Select-String -Pattern "Return value 3|error 1[0-9]{3}|MainEngineThread|Installation success or error status" |
+            Select-Object -Last 80
+        if ($matches) {
+            $matches | ForEach-Object { $_.Line }
+        } else {
+            "No MSI failure markers found."
+        }
+        "---- $($msiLog.Name) tail ----"
+        Get-Content -LiteralPath $msiLog.FullName -Tail 80
+    }
 }
 
 Add-CommandOutput "Bundled VDD Devices" {

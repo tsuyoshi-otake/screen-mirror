@@ -243,6 +243,7 @@ The report includes:
 
 - Raw `%APPDATA%\screen-mirror\config.toml`, including the four-digit PIN
 - Recent Screen Mirror log lines
+- Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
 - Bundled VDD device status and other virtual display candidates
 - Windows display list, GStreamer probe, receiver discovery, UDP endpoints, network adapters, and related firewall rule summaries
@@ -255,8 +256,11 @@ The tray app checks GitHub Releases automatically:
 - Regular interval: once per hour
 - Manual check: tray menu `Check for Updates`
 - Asset name: `ScreenMirror.msi`
-- Version lookup and download run inside the Screen Mirror process over HTTPS; periodic checks do not launch `curl.exe`, PowerShell, or `cmd.exe`
-- Install mode: hidden direct `msiexec.exe /i <msi> /qn /norestart`; no `cmd.exe` wrapper window
+- Version lookup runs inside the Screen Mirror process over HTTPS; periodic checks only notify through the tray status and never download or start an installer
+- Selecting `Check for Updates` downloads the MSI in-process, then requests one Windows UAC approval for the per-machine update
+- Install mode: elevated hidden `msiexec.exe /i <msi> /qn /norestart`; no `cmd.exe` wrapper window
+- The update runner waits for the exact old process ID to exit before invoking MSI
+- Failed update details and the MSI log are retained for diagnostics; no automatic install retry is scheduled
 
 ## Receiver Power Behavior
 

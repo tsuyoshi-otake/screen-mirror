@@ -231,7 +231,7 @@ impl TrayApp {
         }
         self.tray = Some(tray);
         self.sync_menu();
-        crate::updater::start_background_update_checks();
+        crate::updater::start_background_update_checks(self.update_status_tx.clone());
         self.restart_diagnostics_server();
 
         if let Err(error) = autostart::set_enabled(self.config.autostart) {

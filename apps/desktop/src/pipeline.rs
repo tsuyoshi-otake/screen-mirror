@@ -282,21 +282,39 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
 
     let encoder = select_encoder(args.encoder, args.allow_software_encoder)?;
     let clients = multi_udp_clients(&args.host, args.port)?;
-    let monitor_index = crate::monitors::resolve_capture_monitor_index(
-        args.monitor_index,
-        args.prefer_virtual_display,
-    );
-    if args.prefer_virtual_display && args.monitor_index < 0 {
-        crate::logging::append(format!(
-            "sender capture monitor-index selected: {monitor_index}"
-        ));
-    }
-    let source = format!(
-        "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
-        args.capture_api,
-        monitor_index,
-        if args.no_cursor { "false" } else { "true" }
-    );
+    let show_cursor = if args.no_cursor { "false" } else { "true" };
+    let source = if args.prefer_virtual_display && args.monitor_index < 0 {
+        if let Some(monitor_handle) = crate::monitors::preferred_virtual_monitor_handle() {
+            crate::logging::append(format!(
+                "sender capture monitor-handle selected: {monitor_handle}"
+            ));
+            format!(
+                "d3d11screencapturesrc capture-api={} monitor-handle={} show-cursor={}",
+                args.capture_api, monitor_handle, show_cursor
+            )
+        } else {
+            let monitor_index = crate::monitors::resolve_capture_monitor_index(
+                args.monitor_index,
+                args.prefer_virtual_display,
+            );
+            crate::logging::append(format!(
+                "sender capture monitor-index selected: {monitor_index}"
+            ));
+            format!(
+                "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
+                args.capture_api, monitor_index, show_cursor
+            )
+        }
+    } else {
+        let monitor_index = crate::monitors::resolve_capture_monitor_index(
+            args.monitor_index,
+            args.prefer_virtual_display,
+        );
+        format!(
+            "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
+            args.capture_api, monitor_index, show_cursor
+        )
+    };
     let caps = video_caps(
         args.fps,
         args.width,

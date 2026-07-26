@@ -5,11 +5,12 @@ use sm_core::{
 };
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::pipeline::{self, PipelineHandle, SendArgs};
 
 const AUTO_HOST: &str = "auto";
+const RECEIVER_LOSS_GRACE: Duration = Duration::from_secs(75);
 
 pub struct Announcer {
     stop: Sender<()>,
@@ -28,6 +29,7 @@ impl SenderSupervisor {
             let mut active_hosts = String::new();
             let mut active_pipeline: Option<PipelineHandle> = None;
             let mut detached_for_no_receivers = false;
+            let mut last_receiver_seen = Instant::now();
 
             loop {
                 if stop_rx.try_recv().is_ok() {
@@ -50,6 +52,7 @@ impl SenderSupervisor {
                 match resolve_sender_args(args.clone()) {
                     Ok(resolved) if resolved.host != active_hosts => {
                         detached_for_no_receivers = false;
+                        last_receiver_seen = Instant::now();
                         if let Some(handle) = active_pipeline.take() {
                             if let Err(error) = handle.stop() {
                                 eprintln!("sender restart stop failed: {error:#}");
@@ -64,8 +67,21 @@ impl SenderSupervisor {
                             Err(error) => eprintln!("sender pipeline build failed: {error:#}"),
                         }
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        detached_for_no_receivers = false;
+                        last_receiver_seen = Instant::now();
+                    }
                     Err(error) => {
+                        if active_pipeline.is_some()
+                            && last_receiver_seen.elapsed() < RECEIVER_LOSS_GRACE
+                        {
+                            eprintln!(
+                                "receiver rediscovery missed; keeping sender pipeline for {}s: {error:#}",
+                                RECEIVER_LOSS_GRACE.as_secs()
+                            );
+                            thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
                         if let Some(handle) = active_pipeline.take() {
                             if let Err(error) = handle.stop() {
                                 eprintln!("sender stop after receiver loss failed: {error:#}");

@@ -1,6 +1,7 @@
 #[derive(Clone, Debug)]
 pub struct DisplayMonitor {
     pub capture_index: Option<i32>,
+    pub monitor_handle: Option<u64>,
     pub adapter_name: String,
     pub adapter_description: String,
     pub monitor_name: Option<String>,
@@ -130,6 +131,10 @@ pub fn sync_preferred_virtual_display_mode(
 
 pub fn preferred_virtual_monitor_index() -> Option<i32> {
     preferred_virtual_monitor().and_then(|monitor| monitor.capture_index)
+}
+
+pub fn preferred_virtual_monitor_handle() -> Option<u64> {
+    preferred_virtual_monitor().and_then(|monitor| monitor.monitor_handle)
 }
 
 pub fn resolve_capture_monitor_index(requested: i32, prefer_virtual_display: bool) -> i32 {
@@ -363,6 +368,7 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
     const DISPLAY_DEVICE_PRIMARY_DEVICE: u32 = 0x0000_0004;
     const DISPLAY_DEVICE_MIRRORING_DRIVER: u32 = 0x0000_0008;
 
+    let handles = monitor_handles_by_device_name();
     let mut monitors = Vec::new();
     let mut adapter_ordinal = 0;
     let mut capture_index = 0;
@@ -412,6 +418,10 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
         let bundled_virtual_display = looks_like_bundled_virtual_display(&combined);
         monitors.push(DisplayMonitor {
             capture_index: current_capture_index,
+            monitor_handle: handles
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_name))
+                .map(|(_, handle)| *handle),
             adapter_name,
             adapter_description,
             monitor_name,
@@ -433,6 +443,40 @@ pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
 #[cfg(not(windows))]
 pub fn enumerate_monitors() -> Vec<DisplayMonitor> {
     Vec::new()
+}
+
+#[cfg(windows)]
+fn monitor_handles_by_device_name() -> Vec<(String, u64)> {
+    use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    };
+
+    unsafe extern "system" fn callback(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let handles = &mut *(data as *mut Vec<(String, u64)>);
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut _) != 0 {
+            handles.push((wide_array_to_string(&info.szDevice), monitor as u64));
+        }
+        TRUE
+    }
+
+    let mut handles = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(callback),
+            &mut handles as *mut Vec<(String, u64)> as LPARAM,
+        );
+    }
+    handles
 }
 
 #[cfg(windows)]

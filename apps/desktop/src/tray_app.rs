@@ -259,8 +259,14 @@ impl TrayApp {
                 self.pipeline = Some(pipeline::spawn_pipeline(description));
                 self.sleep_guard = Some(crate::power::SleepGuard::receiver());
                 self.render_window = Some(crate::receiver_window::RenderWindowGuard::start());
+                let audio_port = self
+                    .config
+                    .recv
+                    .audio_enabled
+                    .then_some(self.config.recv.audio_port);
                 match crate::lan::Announcer::receiver(
                     self.config.recv.port,
+                    audio_port,
                     &self.config.security.pin,
                 ) {
                     Ok(announcer) => self.announcer = Some(announcer),

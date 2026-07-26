@@ -91,7 +91,7 @@ impl Drop for SenderSupervisor {
 }
 
 impl Announcer {
-    pub fn receiver(stream_port: u16, pin: &str) -> Result<Self> {
+    pub fn receiver(stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
         let socket = discovery::bind_ephemeral_broadcast_socket()?;
         let mut announcement = PeerAnnouncement::new(
             instance_id(),
@@ -99,7 +99,8 @@ impl Announcer {
             PeerRole::Receiver,
             stream_port,
         )
-        .with_pin(pin)?;
+        .with_pin(pin)?
+        .with_audio_port(audio_port);
         if let Some(display) = crate::monitors::primary_display_info() {
             announcement = announcement.with_display(display);
         }

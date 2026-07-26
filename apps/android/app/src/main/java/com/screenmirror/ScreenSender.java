@@ -21,12 +21,13 @@ final class ScreenSender {
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final RtpPacketizer packetizer = new RtpPacketizer();
+    private final AudioSender audioSender = new AudioSender();
     private Thread thread;
     private MediaCodec encoder;
     private VirtualDisplay virtualDisplay;
     private MediaProjection projection;
 
-    void start(MediaProjection projection, List<DiscoveryAgent.Peer> peers) throws Exception {
+    void start(MediaProjection projection, List<DiscoveryAgent.Peer> peers, boolean sendAudio) throws Exception {
         stop();
         this.projection = projection;
         encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
@@ -54,6 +55,9 @@ final class ScreenSender {
                 null,
                 null
         );
+        if (sendAudio) {
+            audioSender.start(projection, peers);
+        }
         running.set(true);
         thread = new Thread(() -> drainLoop(peers), "screen-sender");
         thread.start();
@@ -78,6 +82,7 @@ final class ScreenSender {
             encoder = null;
         }
         packetizer.close();
+        audioSender.stop();
         if (projection != null) {
             projection.stop();
             projection = null;

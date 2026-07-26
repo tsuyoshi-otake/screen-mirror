@@ -4,10 +4,12 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.Manifest;
 import android.util.DisplayMetrics;
 import android.text.InputFilter;
 import android.text.InputType;
@@ -29,7 +31,9 @@ public final class MainActivity extends Activity {
     private static final int STREAM_PORT = 5004;
     private static final String PREF_PIN = "pin";
     private static final String PREF_RECEIVE_AUDIO = "receive_audio";
+    private static final String PREF_SEND_AUDIO = "send_audio";
     private static final int REQUEST_CAPTURE = 1001;
+    private static final int REQUEST_RECORD_AUDIO = 1002;
 
     private final DiscoveryAgent discovery = new DiscoveryAgent();
     private final RtpH264Receiver receiver = new RtpH264Receiver();
@@ -42,6 +46,7 @@ public final class MainActivity extends Activity {
     private TextView status;
     private EditText pinInput;
     private CheckBox receiveAudio;
+    private CheckBox sendAudio;
     private LinearLayout toolbar;
     private MediaProjectionManager projectionManager;
     private WifiManager.MulticastLock multicastLock;
@@ -99,6 +104,10 @@ public final class MainActivity extends Activity {
         receiveAudio.setText("Receive Audio (Opus/RTP :5005)");
         receiveAudio.setChecked(preferences.getBoolean(PREF_RECEIVE_AUDIO, false));
 
+        sendAudio = new CheckBox(this);
+        sendAudio.setText("Send Audio (Android 10+, app audio only)");
+        sendAudio.setChecked(preferences.getBoolean(PREF_SEND_AUDIO, false));
+
         Button startReceiver = new Button(this);
         startReceiver.setText("Start Receiver");
         startReceiver.setOnClickListener(view -> startReceiver());
@@ -120,6 +129,7 @@ public final class MainActivity extends Activity {
         toolbar.addView(status);
         toolbar.addView(pinInput);
         toolbar.addView(receiveAudio);
+        toolbar.addView(sendAudio);
         toolbar.addView(startReceiver);
         toolbar.addView(discover);
         toolbar.addView(startSender);
@@ -151,8 +161,9 @@ public final class MainActivity extends Activity {
         }
         try {
             MediaProjection projection = projectionManager.getMediaProjection(resultCode, data);
-            sender.start(projection, new ArrayList<>(selectedReceivers));
-            setStatus("Status: sending to " + selectedReceivers.size() + " receiver(s)");
+            boolean audioEnabled = sendAudio.isChecked() && canSendAudio();
+            sender.start(projection, new ArrayList<>(selectedReceivers), audioEnabled);
+            setStatus("Status: sending to " + selectedReceivers.size() + " receiver(s)" + (audioEnabled ? " with audio" : ""));
         } catch (Exception error) {
             setStatus("Sender failed: " + error.getMessage());
         }
@@ -161,6 +172,10 @@ public final class MainActivity extends Activity {
     private void startReceiver() {
         String pin = currentPinOrStatus();
         if (pin == null) {
+            return;
+        }
+        preferences.edit().putBoolean(PREF_SEND_AUDIO, sendAudio.isChecked()).apply();
+        if (sendAudio.isChecked() && !ensureAudioPermission()) {
             return;
         }
         stopAll();
@@ -181,7 +196,7 @@ public final class MainActivity extends Activity {
             public void surfaceCreated(SurfaceHolder holder) {
                 try {
                     lockMulticast();
-                    discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
+                    discovery.startReceiverBeacon(STREAM_PORT, RtpOpusReceiver.DEFAULT_AUDIO_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
                     receiver.start(STREAM_PORT, holder.getSurface());
                     setStatus(receiverStatus(audioEnabled));
                 } catch (Exception error) {
@@ -201,7 +216,7 @@ public final class MainActivity extends Activity {
         if (holder.getSurface().isValid()) {
             try {
                 lockMulticast();
-                discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
+                discovery.startReceiverBeacon(STREAM_PORT, RtpOpusReceiver.DEFAULT_AUDIO_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
                 receiver.start(STREAM_PORT, holder.getSurface());
                 setStatus(receiverStatus(audioEnabled));
             } catch (Exception error) {
@@ -345,6 +360,24 @@ public final class MainActivity extends Activity {
 
     private void setStatus(String text) {
         status.setText(text);
+    }
+
+    private boolean canSendAudio() {
+        return android.os.Build.VERSION.SDK_INT >= 29
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean ensureAudioPermission() {
+        if (android.os.Build.VERSION.SDK_INT < 29) {
+            setStatus("Audio sending requires Android 10 or newer");
+            return false;
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+        setStatus("Audio permission requested; tap Start Sender again after allowing it");
+        return false;
     }
 
     private static String receiverStatus(boolean audioEnabled) {

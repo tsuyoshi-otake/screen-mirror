@@ -265,6 +265,7 @@ audio_jitter_ms = 15
 - Encoding: `opusenc audio-type=restricted-lowdelay` with configurable frame size.
 - Windows receiver playback: `opusdec` into `wasapi2sink low-latency=true`.
 - Android receiver playback: RTP/Opus packets on `:5005` are decoded with `MediaCodec` and played through `AudioTrack`.
+- Android sender capture: Android 10+ `AudioPlaybackCapture` records eligible app/game audio, encodes Opus with `MediaCodec`, and sends RTP/Opus to the receiver audio port.
 - Audio stays CPU-side; libopus uses its own CPU/SIMD optimizations where available.
 - Keep video on `5004` and audio on `5005` through the firewall.
 
@@ -358,4 +359,4 @@ The Android packet path is optimized for the hot loop:
 - UDP favors latency over guaranteed delivery; unstable Wi-Fi can produce visible corruption.
 - Android sender currently uses a fixed `1280x720@30` encode path.
 - Android touch injection into Android sender devices is not implemented because it requires an AccessibilityService/root-level privileges.
-- Desktop audio transfer is implemented for Windows sender/receiver, and Android receiver audio playback is implemented. Android sender audio capture is not implemented yet.
+- Desktop audio transfer is implemented for Windows sender/receiver. Android receiver audio playback and Android sender app-audio capture are implemented; Android sender audio is limited by Android's AudioPlaybackCapture rules and app opt-out behavior.

@@ -27,16 +27,18 @@ final class DiscoveryAgent {
         final String role;
         final String host;
         final int streamPort;
+        final int audioPort;
         final int displayWidth;
         final int displayHeight;
         final int refreshHz;
 
-        Peer(String instanceId, String deviceName, String role, String host, int streamPort, int displayWidth, int displayHeight, int refreshHz) {
+        Peer(String instanceId, String deviceName, String role, String host, int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz) {
             this.instanceId = instanceId;
             this.deviceName = deviceName;
             this.role = role;
             this.host = host;
             this.streamPort = streamPort;
+            this.audioPort = audioPort;
             this.displayWidth = displayWidth;
             this.displayHeight = displayHeight;
             this.refreshHz = refreshHz;
@@ -52,11 +54,11 @@ final class DiscoveryAgent {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread thread;
 
-    void startReceiverBeacon(int streamPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
+    void startReceiverBeacon(int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
         stop();
         running.set(true);
         String normalizedPin = Pin.normalize(pin);
-        thread = new Thread(() -> runBeacon("receiver", streamPort, displayWidth, displayHeight, refreshHz, normalizedPin), "discovery-beacon");
+        thread = new Thread(() -> runBeacon("receiver", streamPort, audioPort, displayWidth, displayHeight, refreshHz, normalizedPin), "discovery-beacon");
         thread.start();
     }
 
@@ -105,11 +107,11 @@ final class DiscoveryAgent {
         return peers;
     }
 
-    private void runBeacon(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
+    private void runBeacon(String role, int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
             while (running.get()) {
-                byte[] payload = announcement(role, streamPort, displayWidth, displayHeight, refreshHz, pin);
+                byte[] payload = announcement(role, streamPort, audioPort, displayWidth, displayHeight, refreshHz, pin);
                 DatagramPacket packet = new DatagramPacket(
                         payload,
                         payload.length,
@@ -123,7 +125,7 @@ final class DiscoveryAgent {
         }
     }
 
-    private byte[] announcement(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz, String pin) throws Exception {
+    private byte[] announcement(String role, int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) throws Exception {
         JSONObject json = new JSONObject();
         json.put("protocol", PROTOCOL);
         json.put("version", VERSION);
@@ -131,6 +133,7 @@ final class DiscoveryAgent {
         json.put("device_name", Build.MODEL);
         json.put("role", role);
         json.put("stream_port", streamPort);
+        json.put("audio_port", audioPort);
         json.put("pin_hash", Pin.hash(pin));
         JSONObject display = new JSONObject();
         display.put("width", displayWidth);
@@ -160,13 +163,15 @@ final class DiscoveryAgent {
         int displayWidth = display == null ? 0 : display.optInt("width", 0);
         int displayHeight = display == null ? 0 : display.optInt("height", 0);
         int refreshHz = display == null ? 0 : display.optInt("refresh_hz", 0);
+        int streamPort = json.getInt("stream_port");
 
         return new Peer(
                 json.getString("instance_id"),
                 json.optString("device_name", "Android"),
                 json.getString("role"),
                 address.getHostAddress(),
-                json.getInt("stream_port"),
+                streamPort,
+                json.optInt("audio_port", streamPort + 1),
                 displayWidth,
                 displayHeight,
                 refreshHz

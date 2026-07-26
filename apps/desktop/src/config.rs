@@ -37,6 +37,10 @@ pub struct SendConfig {
     pub fps: u32,
     pub bitrate: u32,
     pub mtu: u32,
+    #[serde(default = "default_udp_buffer_size")]
+    pub udp_buffer_size: u32,
+    #[serde(default = "default_qos_dscp")]
+    pub qos_dscp: i32,
     #[serde(default)]
     pub allow_software_encoder: bool,
     #[serde(default)]
@@ -64,6 +68,30 @@ fn default_sync_virtual_display_resolution() -> bool {
     true
 }
 
+fn default_mtu() -> u32 {
+    1200
+}
+
+fn default_udp_buffer_size() -> u32 {
+    4 * 1024 * 1024
+}
+
+fn default_qos_dscp() -> i32 {
+    -1
+}
+
+fn default_jitter_faststart_packets() -> u32 {
+    2
+}
+
+fn default_jitter_max_dropout_ms() -> u32 {
+    200
+}
+
+fn default_jitter_max_misorder_ms() -> u32 {
+    50
+}
+
 fn default_receiver_fullscreen() -> bool {
     true
 }
@@ -72,6 +100,16 @@ fn default_receiver_fullscreen() -> bool {
 pub struct RecvConfig {
     pub port: u16,
     pub jitter_ms: u32,
+    #[serde(default = "default_udp_buffer_size")]
+    pub udp_buffer_size: u32,
+    #[serde(default = "default_mtu")]
+    pub mtu: u32,
+    #[serde(default = "default_jitter_faststart_packets")]
+    pub jitter_faststart_packets: u32,
+    #[serde(default = "default_jitter_max_dropout_ms")]
+    pub jitter_max_dropout_ms: u32,
+    #[serde(default = "default_jitter_max_misorder_ms")]
+    pub jitter_max_misorder_ms: u32,
     #[serde(default = "default_receiver_fullscreen")]
     pub fullscreen: bool,
     pub decoder: ConfigDecoder,
@@ -144,7 +182,9 @@ impl Default for SendConfig {
             monitor_index: -1,
             fps: 60,
             bitrate: 12_000,
-            mtu: 1200,
+            mtu: default_mtu(),
+            udp_buffer_size: default_udp_buffer_size(),
+            qos_dscp: default_qos_dscp(),
             allow_software_encoder: false,
             nvidia_tuning: ConfigNvidiaTuning::Auto,
             encoder: ConfigEncoder::Auto,
@@ -160,7 +200,12 @@ impl Default for RecvConfig {
     fn default() -> Self {
         Self {
             port: 5004,
-            jitter_ms: 20,
+            jitter_ms: 15,
+            udp_buffer_size: default_udp_buffer_size(),
+            mtu: default_mtu(),
+            jitter_faststart_packets: default_jitter_faststart_packets(),
+            jitter_max_dropout_ms: default_jitter_max_dropout_ms(),
+            jitter_max_misorder_ms: default_jitter_max_misorder_ms(),
             fullscreen: true,
             decoder: ConfigDecoder::Auto,
             sink: ConfigSink::Auto,
@@ -208,6 +253,8 @@ impl From<SendConfig> for SendArgs {
             fps: config.fps,
             bitrate: config.bitrate,
             mtu: config.mtu,
+            udp_buffer_size: config.udp_buffer_size,
+            qos_dscp: config.qos_dscp,
             allow_software_encoder: config.allow_software_encoder,
             nvidia_tuning: config.nvidia_tuning.into(),
             encoder: config.encoder.into(),
@@ -224,6 +271,11 @@ impl From<RecvConfig> for RecvArgs {
         Self {
             port: config.port,
             jitter_ms: config.jitter_ms,
+            udp_buffer_size: config.udp_buffer_size,
+            mtu: config.mtu,
+            jitter_faststart_packets: config.jitter_faststart_packets,
+            jitter_max_dropout_ms: config.jitter_max_dropout_ms,
+            jitter_max_misorder_ms: config.jitter_max_misorder_ms,
             fullscreen: config.fullscreen,
             decoder: config.decoder.into(),
             sink: config.sink.into(),

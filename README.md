@@ -35,6 +35,32 @@ Tray actions:
 - `Enable Autostart`: registers the tray app under HKCU Run
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`
 
+## Quick Start
+
+### Windows to Android as an extended display
+
+1. Install `ScreenMirror.msi` from the latest GitHub Release.
+2. Start `Screen Mirror` from the Start Menu or the system tray.
+3. Open the tray menu and run `Install Bundled Virtual Display Driver`.
+4. Allow the UAC prompt, then confirm Windows Display Settings shows an extra display.
+5. Start the Android app and tap `Start Receiver`.
+6. On Windows, choose `Start as Sender` from the tray menu.
+7. If needed, run `screen-mirror.exe monitors` and set `[send].monitor_index` in `%APPDATA%\screen-mirror\config.toml`.
+
+### Windows to Windows
+
+1. Install the MSI on both machines.
+2. On the target machine, choose `Start as Receiver`.
+3. On the source machine, choose `Start as Sender`.
+4. Keep `host = "auto"` for LAN discovery, or set an explicit receiver IP in `[send].host`.
+
+### Manual CLI run
+
+```powershell
+screen-mirror.exe recv --port 5004
+screen-mirror.exe send --host 192.168.1.20 --port 5004
+```
+
 Default sender config uses:
 
 ```toml
@@ -48,10 +74,19 @@ sync_virtual_display_resolution = true
 monitor_index = -1
 fps = 60
 bitrate = 12000
+mtu = 1200
+udp_buffer_size = 4194304
+qos_dscp = -1
 allow_software_encoder = false
 nvidia_tuning = "auto"
 
 [recv]
+jitter_ms = 15
+udp_buffer_size = 4194304
+mtu = 1200
+jitter_faststart_packets = 2
+jitter_max_dropout_ms = 200
+jitter_max_misorder_ms = 50
 fullscreen = true
 ```
 
@@ -160,6 +195,15 @@ Build the MSI:
 
 The MSI installs `screen-mirror.exe`, the tray/start-menu icon, autostart registration, and the required GStreamer runtime DLL/plugin files.
 
+## Auto Update
+
+The tray app checks GitHub Releases automatically:
+
+- First check: 30 seconds after tray startup
+- Regular interval: once per hour
+- Asset name: `ScreenMirror.msi`
+- Install mode: quiet MSI update with `/qn /norestart`
+
 ## Android APK
 
 Build the APK:
@@ -200,9 +244,31 @@ Android build requirements:
 ## Low-Latency Tuning
 
 - Use wired LAN or 5GHz/6GHz Wi-Fi
-- Keep receiver jitter low: `--jitter-ms 10` to `20`
+- Keep receiver jitter low: `--jitter-ms 10` to `20`; default is `15`
+- Keep `mtu = 1200` on Wi-Fi; try `mtu = 1400` only on a clean wired LAN
+- Keep `udp_buffer_size = 4194304` for burst tolerance without building application-level latency
+- Set `qos_dscp = 46` only if your router/switch honors DSCP; otherwise leave `-1`
 - Use GPU encode/decode where available: `nvd3d11h264enc`, `mfh264enc`, `qsvh264enc`, `d3d11h264dec`
 - Increase bitrate for desktop readability: `--bitrate 16000`
+
+### Transfer pipeline
+
+The desktop sender uses a low-latency RTP/UDP pipeline:
+
+- D3D11 screen capture stays in GPU memory when the selected encoder accepts D3D11 input.
+- Sender queues are leaky and capped at one frame so old frames are dropped instead of delayed.
+- RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.
+- UDP send/receive buffers default to `4 MiB`.
+- Receiver `udpsrc` disables sender-address metadata collection to avoid unnecessary per-packet work.
+- Receiver jitterbuffer starts after two packets and drops late packets instead of increasing latency.
+
+The Android packet path is optimized for the hot loop:
+
+- RTP sequence numbers use a plain integer because packetization runs on one encoder thread.
+- Receiver target comparison avoids per-frame string allocation.
+- Packet sending reuses `DatagramPacket` instances.
+- Direct `ByteBuffer` copy uses one reusable view per encoded frame instead of one duplicate per RTP packet.
+- The decoder is drained only when a full NAL unit has been queued.
 
 ## Limits
 

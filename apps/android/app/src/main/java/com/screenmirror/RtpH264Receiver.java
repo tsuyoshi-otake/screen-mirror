@@ -6,12 +6,15 @@ import android.view.Surface;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RtpH264Receiver {
     private static final byte[] START_CODE = new byte[]{0, 0, 0, 1};
+    private static final int SOCKET_BUFFER_SIZE = 4 * 1024 * 1024;
+    private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final byte[] receiveBuffer = new byte[2048];
@@ -28,6 +31,9 @@ final class RtpH264Receiver {
         decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
         MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080);
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+        }
         decoder.configure(format, surface, null, 0);
         decoder.start();
         running.set(true);
@@ -57,38 +63,45 @@ final class RtpH264Receiver {
     }
 
     private void receiveLoop(int port) {
-        try (DatagramSocket socket = new DatagramSocket(port)) {
-            socket.setReceiveBufferSize(2 * 1024 * 1024);
+        try (DatagramSocket socket = new DatagramSocket(null)) {
+            socket.setReuseAddress(true);
+            socket.setReceiveBufferSize(SOCKET_BUFFER_SIZE);
+            try {
+                socket.setTrafficClass(DSCP_EF_TRAFFIC_CLASS);
+            } catch (Exception ignored) {
+            }
+            socket.bind(new InetSocketAddress(port));
             while (running.get()) {
                 receivePacket.setData(receiveBuffer, 0, receiveBuffer.length);
                 socket.receive(receivePacket);
                 lastSenderHost = receivePacket.getAddress().getHostAddress();
-                depacketizeAndQueue(receiveBuffer, receivePacket.getLength());
-                drainDecoder();
+                if (depacketizeAndQueue(receiveBuffer, receivePacket.getLength())) {
+                    drainDecoder();
+                }
             }
         } catch (Exception ignored) {
         }
     }
 
-    private void depacketizeAndQueue(byte[] packet, int length) throws Exception {
+    private boolean depacketizeAndQueue(byte[] packet, int length) throws Exception {
         if (length <= 12) {
-            return;
+            return false;
         }
 
         int csrcCount = packet[0] & 0x0f;
         int payloadOffset = 12 + csrcCount * 4;
         if (payloadOffset >= length) {
-            return;
+            return false;
         }
 
         int nalType = packet[payloadOffset] & 0x1f;
         if (nalType >= 1 && nalType <= 23) {
             queueNal(packet, payloadOffset, length - payloadOffset);
-            return;
+            return true;
         }
 
         if (nalType != 28 || payloadOffset + 2 >= length) {
-            return;
+            return false;
         }
 
         int fuIndicator = packet[payloadOffset] & 0xff;
@@ -104,13 +117,15 @@ final class RtpH264Receiver {
             fuState.append((byte) reconstructedHeader);
         }
         if (!fuState.active) {
-            return;
+            return false;
         }
         fuState.append(packet, fragmentOffset, fragmentLength);
         if (end) {
             queueNal(fuState.data, 0, fuState.size);
             fuState.reset();
+            return true;
         }
+        return false;
     }
 
     private void queueNal(byte[] source, int offset, int length) throws Exception {
@@ -119,7 +134,7 @@ final class RtpH264Receiver {
             return;
         }
 
-        int index = activeDecoder.dequeueInputBuffer(5_000);
+        int index = activeDecoder.dequeueInputBuffer(1_000);
         if (index < 0) {
             return;
         }

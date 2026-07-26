@@ -48,6 +48,14 @@ pub struct SendArgs {
     #[arg(long, default_value_t = 1200)]
     pub mtu: u32,
 
+    /// UDP kernel send buffer size in bytes.
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    pub udp_buffer_size: u32,
+
+    /// DSCP value for UDP video packets. -1 keeps OS default; 46 requests Expedited Forwarding.
+    #[arg(long, default_value_t = -1)]
+    pub qos_dscp: i32,
+
     /// Permit auto encoder selection to fall back to CPU x264.
     #[arg(long, default_value_t = false, action = ArgAction::Set)]
     pub allow_software_encoder: bool,
@@ -84,8 +92,28 @@ pub struct RecvArgs {
     pub port: u16,
 
     /// RTP jitter buffer latency in milliseconds.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 15)]
     pub jitter_ms: u32,
+
+    /// UDP kernel receive buffer size in bytes.
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    pub udp_buffer_size: u32,
+
+    /// Maximum expected RTP packet size.
+    #[arg(long, default_value_t = 1200)]
+    pub mtu: u32,
+
+    /// Packets needed before jitterbuffer starts output.
+    #[arg(long, default_value_t = 2)]
+    pub jitter_faststart_packets: u32,
+
+    /// Maximum missing-packet tolerance in milliseconds.
+    #[arg(long, default_value_t = 200)]
+    pub jitter_max_dropout_ms: u32,
+
+    /// Maximum misordered-packet tolerance in milliseconds.
+    #[arg(long, default_value_t = 50)]
+    pub jitter_max_misorder_ms: u32,
 
     /// Render receiver video fullscreen.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -189,7 +217,9 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
     ensure_positive("fps", args.fps)?;
     ensure_positive("bitrate", args.bitrate)?;
     ensure_positive("mtu", args.mtu)?;
+    ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
     ensure_positive("max-receivers", args.max_receivers)?;
+    validate_qos_dscp(args.qos_dscp)?;
 
     if args.width.is_some() != args.height.is_some() {
         return Err(anyhow!("--width and --height must be specified together"));
@@ -221,33 +251,47 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
     let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
 
     Ok(format!(
-        "{source} ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
+        "{source} ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {caps} \
          ! {encoder_chain} \
          ! h264parse config-interval=-1 \
          ! rtph264pay pt=96 mtu={} config-interval=-1 aggregate-mode=zero-latency \
-         ! multiudpsink clients={} sync=false async=false buffer-size=2097152",
+         ! multiudpsink clients={} sync=false async=false buffer-size={} qos-dscp={} send-duplicates=false ttl=1",
         args.mtu,
-        gst_string_literal(&clients)
+        gst_string_literal(&clients),
+        args.udp_buffer_size,
+        args.qos_dscp
     ))
 }
 
 pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     ensure_positive("jitter-ms", args.jitter_ms)?;
+    ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
+    ensure_positive("mtu", args.mtu)?;
+    ensure_positive("jitter-faststart-packets", args.jitter_faststart_packets)?;
+    ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
+    ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
 
     let decoder = select_decoder(args.decoder)?;
     let sink = select_sink(args.sink, args.fullscreen)?;
 
     Ok(format!(
-        "udpsrc port={} buffer-size=2097152 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
-         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=true \
+        "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
+         ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
          ! rtph264depay \
          ! h264parse disable-passthrough=true \
-         ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 leaky=downstream \
-         ! {decoder} \
          ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! {decoder} \
+         ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {sink}",
-        args.port, args.jitter_ms
+        args.port,
+        args.udp_buffer_size,
+        args.mtu,
+        args.jitter_ms,
+        args.jitter_faststart_packets,
+        args.jitter_max_dropout_ms,
+        args.jitter_max_misorder_ms
     ))
 }
 
@@ -495,6 +539,14 @@ fn ensure_positive(name: &str, value: u32) -> Result<()> {
         Err(anyhow!("--{name} must be greater than zero"))
     } else {
         Ok(())
+    }
+}
+
+fn validate_qos_dscp(value: i32) -> Result<()> {
+    if value == -1 || (0..=63).contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow!("--qos-dscp must be -1 or 0..63"))
     }
 }
 

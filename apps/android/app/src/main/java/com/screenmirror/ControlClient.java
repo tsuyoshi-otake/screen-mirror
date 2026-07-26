@@ -12,12 +12,13 @@ final class ControlClient {
     private static final String PROTOCOL = "screen-mirror.control";
     private static final int VERSION = 1;
 
-    void send(String host, String action, float x, float y, int pointerId) {
+    void send(String host, String action, float x, float y, int pointerId, String pin) {
         new Thread(() -> {
             try (DatagramSocket socket = new DatagramSocket()) {
                 JSONObject json = new JSONObject();
                 json.put("protocol", PROTOCOL);
                 json.put("version", VERSION);
+                json.put("pin_hash", Pin.hash(pin));
                 json.put("action", action);
                 json.put("x", clamp(x));
                 json.put("y", clamp(y));

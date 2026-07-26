@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use get_if_addrs::{get_if_addrs, IfAddr};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DISCOVERY_PORT: u16 = 47777;
 pub const PROTOCOL: &str = "screen-mirror.discovery";
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_PIN: &str = "0000";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PeerAnnouncement {
@@ -16,6 +18,8 @@ pub struct PeerAnnouncement {
     pub device_name: String,
     pub role: PeerRole,
     pub stream_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayInfo>,
     pub timestamp_ms: u64,
@@ -57,9 +61,15 @@ impl PeerAnnouncement {
             device_name: device_name.into(),
             role,
             stream_port,
+            pin_hash: None,
             display: None,
             timestamp_ms: now_ms(),
         }
+    }
+
+    pub fn with_pin(mut self, pin: &str) -> Result<Self> {
+        self.pin_hash = Some(pin_hash(pin)?);
+        Ok(self)
     }
 
     pub fn with_display(mut self, display: DisplayInfo) -> Self {
@@ -146,7 +156,20 @@ pub fn discover_receivers(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
     discover(timeout, Some(PeerRole::Receiver))
 }
 
+pub fn discover_receivers_with_pin(timeout: Duration, pin: &str) -> Result<Vec<DiscoveredPeer>> {
+    discover_with_pin(timeout, Some(PeerRole::Receiver), Some(pin))
+}
+
 pub fn discover(timeout: Duration, role: Option<PeerRole>) -> Result<Vec<DiscoveredPeer>> {
+    discover_with_pin(timeout, role, None)
+}
+
+pub fn discover_with_pin(
+    timeout: Duration,
+    role: Option<PeerRole>,
+    pin: Option<&str>,
+) -> Result<Vec<DiscoveredPeer>> {
+    let wanted_pin_hash = pin.map(pin_hash).transpose()?;
     let socket = bind_discovery_socket()?;
     let deadline = Instant::now() + timeout;
     let mut peers = Vec::new();
@@ -159,6 +182,12 @@ pub fn discover(timeout: Duration, role: Option<PeerRole>) -> Result<Vec<Discove
                     continue;
                 };
                 if role.is_some_and(|wanted| announcement.role != wanted) {
+                    continue;
+                }
+                if wanted_pin_hash
+                    .as_deref()
+                    .is_some_and(|wanted| announcement.pin_hash.as_deref() != Some(wanted))
+                {
                     continue;
                 }
                 let std::net::SocketAddr::V4(source) = source else {
@@ -182,6 +211,29 @@ pub fn discover(timeout: Duration, role: Option<PeerRole>) -> Result<Vec<Discove
     }
 
     Ok(peers)
+}
+
+pub fn normalize_pin(pin: &str) -> Result<String> {
+    let pin = pin.trim();
+    anyhow::ensure!(
+        pin.len() == 4 && pin.bytes().all(|byte| byte.is_ascii_digit()),
+        "PIN must be exactly four digits"
+    );
+    Ok(pin.to_string())
+}
+
+pub fn pin_hash(pin: &str) -> Result<String> {
+    let pin = normalize_pin(pin)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"screen-mirror.pin.v1:");
+    hasher.update(pin.as_bytes());
+    let digest = hasher.finalize();
+    let mut text = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(text, "{byte:02x}");
+    }
+    Ok(text)
 }
 
 fn now_ms() -> u64 {

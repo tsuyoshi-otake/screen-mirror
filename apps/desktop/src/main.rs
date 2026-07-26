@@ -71,6 +71,10 @@ struct DiscoverArgs {
     /// Discovery timeout in milliseconds.
     #[arg(long, default_value_t = 3000)]
     timeout_ms: u64,
+
+    /// Four-digit PIN used to filter receiver discovery.
+    #[arg(long, default_value = sm_core::discovery::DEFAULT_PIN)]
+    pin: String,
 }
 
 fn main() -> Result<()> {
@@ -90,7 +94,7 @@ fn main() -> Result<()> {
         Command::Tray => tray_app::run(),
         Command::Send(args) => {
             let args = lan::resolve_sender_args(args)?;
-            let _control = control::ControlServer::start()?;
+            let _control = control::ControlServer::start(&args.pin)?;
             let pipeline = pipeline::build_sender_pipeline(&args)?;
             eprintln!("pipeline: {pipeline}");
             run_pipeline(&pipeline)
@@ -107,7 +111,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Discover(args) => {
-            let peers = lan::discover_receivers(std::time::Duration::from_millis(args.timeout_ms))?;
+            let peers = lan::discover_receivers_with_pin(
+                std::time::Duration::from_millis(args.timeout_ms),
+                &args.pin,
+            )?;
             for peer in peers {
                 console::line(format!(
                     "{} {}:{} ({})",

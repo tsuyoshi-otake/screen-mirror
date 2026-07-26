@@ -15,6 +15,7 @@ Low-latency LAN screen mirroring for Windows and Android. This is not Miracast-c
 - Discovery: UDP broadcast on port `47777`
 - Touch/control: UDP JSON on port `47778`
 - Video: RTP/H.264 over UDP on port `5004`
+- Pairing: sender and receiver must use the same four-digit PIN; discovery/control packets carry only a SHA-256 PIN hash
 - Sender fan-out: one sender can stream to multiple receivers with `multiudpsink`
 - Default auto-connect limit: `3` receivers, so `1:3` is the standard target
 - Reconnect: receiver advertisements repeat once per second; desktop auto sender refreshes receiver targets while running
@@ -44,27 +45,32 @@ Tray actions:
 2. Start `Screen Mirror` from the Start Menu or the system tray.
 3. Open the tray menu and run `Install Bundled Virtual Display Driver`.
 4. Allow the UAC prompt, then confirm Windows Display Settings shows an extra display.
-5. Start the Android app and tap `Start Receiver`.
-6. On Windows, choose `Start as Sender` from the tray menu.
-7. If needed, run `screen-mirror.exe monitors` and set `[send].monitor_index` in `%APPDATA%\screen-mirror\config.toml`.
+5. Set the same four-digit PIN on Windows and Android. The default is `0000`.
+6. Start the Android app and tap `Start Receiver`.
+7. On Windows, choose `Start as Sender` from the tray menu.
+8. If needed, run `screen-mirror.exe monitors` and set `[send].monitor_index` in `%APPDATA%\screen-mirror\config.toml`.
 
 ### Windows to Windows
 
 1. Install the MSI on both machines.
-2. On the target machine, choose `Start as Receiver`.
-3. On the source machine, choose `Start as Sender`.
-4. Keep `host = "auto"` for LAN discovery, or set an explicit receiver IP in `[send].host`.
+2. Set the same four-digit PIN in `%APPDATA%\screen-mirror\config.toml` on both machines. The default is `0000`.
+3. On the target machine, choose `Start as Receiver`.
+4. On the source machine, choose `Start as Sender`.
+5. Keep `host = "auto"` for LAN discovery, or set an explicit receiver IP in `[send].host`.
 
 ### Manual CLI run
 
 ```powershell
-screen-mirror.exe recv --port 5004
-screen-mirror.exe send --host 192.168.1.20 --port 5004
+screen-mirror.exe recv --port 5004 --pin 1234
+screen-mirror.exe send --host auto --port 5004 --pin 1234
 ```
 
 Default sender config uses:
 
 ```toml
+[security]
+pin = "0000"
+
 [send]
 host = "auto"
 port = 5004
@@ -90,6 +96,14 @@ jitter_max_dropout_ms = 200
 jitter_max_misorder_ms = 50
 fullscreen = true
 ```
+
+## PIN Pairing
+
+- PIN values must be exactly four numeric digits.
+- Windows stores the PIN in `%APPDATA%\screen-mirror\config.toml` under `[security].pin`.
+- Android stores the PIN from the app input field and reuses it on the next launch.
+- Auto discovery ignores receivers with a different PIN hash, so mismatched devices do not auto-connect.
+- This is pairing protection for trusted LAN use, not strong encryption. RTP/H.264 video is still sent over plain UDP.
 
 ## Virtual Display Mode
 
@@ -236,6 +250,7 @@ The Android MVP includes:
 - Android receiver mode using `MediaCodec` AVC decode to a `SurfaceView`
 - Android sender mode using `MediaProjection` + `MediaCodec` AVC encode
 - Sender fan-out to up to three discovered receivers
+- Four-digit PIN pairing compatible with the desktop app
 - Touch on the Android receiver surface sends normalized control events back to the sender
 
 ## Touch Control
@@ -244,6 +259,7 @@ Touch is carried out-of-band from video:
 
 - Android receiver touch events are sent to the active sender on UDP `47778`
 - Windows desktop sender listens on UDP `47778`
+- Touch events include the same PIN hash and are ignored if it does not match
 - Windows injects touch-equivalent mouse input with normalized coordinates
 
 Current practical path:

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use sm_core::control::{ControlEvent, TouchAction, CONTROL_PORT};
+use sm_core::discovery::pin_hash;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -11,7 +12,8 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    pub fn start() -> Result<Self> {
+    pub fn start(pin: &str) -> Result<Self> {
+        let expected_pin_hash = pin_hash(pin)?;
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
             .context("failed to bind touch control UDP port")?;
         socket
@@ -28,6 +30,9 @@ impl ControlServer {
                 match socket.recv_from(&mut buffer) {
                     Ok((len, _source)) => {
                         if let Ok(event) = ControlEvent::decode(&buffer[..len]) {
+                            if event.pin_hash.as_deref() != Some(expected_pin_hash.as_str()) {
+                                continue;
+                            }
                             inject_touch(event);
                         }
                     }

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sm_core::discovery::DEFAULT_PIN;
 use std::fs;
 use std::path::PathBuf;
 
@@ -9,8 +10,16 @@ use crate::pipeline::{CaptureApi, Decoder, Encoder, NvidiaTuning, RecvArgs, Send
 pub struct AppConfig {
     pub startup_mode: StartupMode,
     pub autostart: bool,
+    #[serde(default)]
+    pub security: SecurityConfig,
     pub send: SendConfig,
     pub recv: RecvConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_pin")]
+    pub pin: String,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -78,6 +87,10 @@ fn default_udp_buffer_size() -> u32 {
 
 fn default_qos_dscp() -> i32 {
     -1
+}
+
+fn default_pin() -> String {
+    DEFAULT_PIN.to_string()
 }
 
 fn default_jitter_faststart_packets() -> u32 {
@@ -164,9 +177,16 @@ impl Default for AppConfig {
         Self {
             startup_mode: StartupMode::Idle,
             autostart: true,
+            security: SecurityConfig::default(),
             send: SendConfig::default(),
             recv: RecvConfig::default(),
         }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self { pin: default_pin() }
     }
 }
 
@@ -224,8 +244,10 @@ impl AppConfig {
 
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let config = toml::from_str(&text)
+        let config: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
+        sm_core::discovery::normalize_pin(&config.security.pin)
+            .with_context(|| format!("invalid PIN in config: {}", path.display()))?;
         Ok((config, path))
     }
 
@@ -238,6 +260,18 @@ impl AppConfig {
         let text = toml::to_string_pretty(self).context("failed to serialize config")?;
         fs::write(path, text).with_context(|| format!("failed to write config: {}", path.display()))
     }
+
+    pub fn send_args(&self) -> SendArgs {
+        let mut args: SendArgs = self.send.clone().into();
+        args.pin = self.security.pin.clone();
+        args
+    }
+
+    pub fn recv_args(&self) -> RecvArgs {
+        let mut args: RecvArgs = self.recv.clone().into();
+        args.pin = self.security.pin.clone();
+        args
+    }
 }
 
 impl From<SendConfig> for SendArgs {
@@ -246,6 +280,7 @@ impl From<SendConfig> for SendArgs {
             host: config.host,
             port: config.port,
             max_receivers: config.max_receivers,
+            pin: DEFAULT_PIN.to_string(),
             prefer_virtual_display: config.prefer_virtual_display,
             enable_virtual_display: config.enable_virtual_display,
             sync_virtual_display_resolution: config.sync_virtual_display_resolution,
@@ -270,6 +305,7 @@ impl From<RecvConfig> for RecvArgs {
     fn from(config: RecvConfig) -> Self {
         Self {
             port: config.port,
+            pin: DEFAULT_PIN.to_string(),
             jitter_ms: config.jitter_ms,
             udp_buffer_size: config.udp_buffer_size,
             mtu: config.mtu,

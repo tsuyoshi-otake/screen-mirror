@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, Args, ValueEnum};
 use gst::prelude::*;
 use gstreamer as gst;
+use sm_core::discovery::DEFAULT_PIN;
 use std::fmt;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -19,6 +20,10 @@ pub struct SendArgs {
     /// Maximum receivers to auto-connect to when host is "auto".
     #[arg(long, default_value_t = 3)]
     pub max_receivers: u32,
+
+    /// Four-digit PIN used for LAN discovery pairing.
+    #[arg(long, default_value = DEFAULT_PIN)]
+    pub pin: String,
 
     /// Prefer a detected VDD/SuperDisplay-style virtual monitor when monitor-index is -1.
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
@@ -90,6 +95,10 @@ pub struct RecvArgs {
     /// Local UDP port to listen on.
     #[arg(long, default_value_t = 5004)]
     pub port: u16,
+
+    /// Four-digit PIN advertised for LAN discovery pairing.
+    #[arg(long, default_value = DEFAULT_PIN)]
+    pub pin: String,
 
     /// RTP jitter buffer latency in milliseconds.
     #[arg(long, default_value_t = 15)]

@@ -52,10 +52,11 @@ final class DiscoveryAgent {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Thread thread;
 
-    void startReceiverBeacon(int streamPort, int displayWidth, int displayHeight, int refreshHz) {
+    void startReceiverBeacon(int streamPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
         stop();
         running.set(true);
-        thread = new Thread(() -> runBeacon("receiver", streamPort, displayWidth, displayHeight, refreshHz), "discovery-beacon");
+        String normalizedPin = Pin.normalize(pin);
+        thread = new Thread(() -> runBeacon("receiver", streamPort, displayWidth, displayHeight, refreshHz, normalizedPin), "discovery-beacon");
         thread.start();
     }
 
@@ -67,10 +68,11 @@ final class DiscoveryAgent {
         }
     }
 
-    List<Peer> discoverReceivers(long timeoutMs) throws Exception {
+    List<Peer> discoverReceivers(long timeoutMs, String pin) throws Exception {
         ArrayList<Peer> peers = new ArrayList<>();
         long deadline = System.currentTimeMillis() + timeoutMs;
         byte[] buffer = new byte[2048];
+        String expectedPinHash = Pin.hash(pin);
 
         try (DatagramSocket socket = new DatagramSocket(null)) {
             socket.setReuseAddress(true);
@@ -81,7 +83,7 @@ final class DiscoveryAgent {
                 try {
                     DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                     socket.receive(packet);
-                    Peer peer = decodePeer(packet);
+                    Peer peer = decodePeer(packet, expectedPinHash);
                     if (!"receiver".equals(peer.role)) {
                         continue;
                     }
@@ -103,11 +105,11 @@ final class DiscoveryAgent {
         return peers;
     }
 
-    private void runBeacon(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz) {
+    private void runBeacon(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
             while (running.get()) {
-                byte[] payload = announcement(role, streamPort, displayWidth, displayHeight, refreshHz);
+                byte[] payload = announcement(role, streamPort, displayWidth, displayHeight, refreshHz, pin);
                 DatagramPacket packet = new DatagramPacket(
                         payload,
                         payload.length,
@@ -121,7 +123,7 @@ final class DiscoveryAgent {
         }
     }
 
-    private byte[] announcement(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz) throws Exception {
+    private byte[] announcement(String role, int streamPort, int displayWidth, int displayHeight, int refreshHz, String pin) throws Exception {
         JSONObject json = new JSONObject();
         json.put("protocol", PROTOCOL);
         json.put("version", VERSION);
@@ -129,6 +131,7 @@ final class DiscoveryAgent {
         json.put("device_name", Build.MODEL);
         json.put("role", role);
         json.put("stream_port", streamPort);
+        json.put("pin_hash", Pin.hash(pin));
         JSONObject display = new JSONObject();
         display.put("width", displayWidth);
         display.put("height", displayHeight);
@@ -140,11 +143,14 @@ final class DiscoveryAgent {
         return json.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    private static Peer decodePeer(DatagramPacket packet) throws Exception {
+    private static Peer decodePeer(DatagramPacket packet, String expectedPinHash) throws Exception {
         String text = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
         JSONObject json = new JSONObject(text);
         if (!PROTOCOL.equals(json.optString("protocol")) || json.optInt("version") != VERSION) {
             throw new IllegalArgumentException("unsupported discovery packet");
+        }
+        if (!expectedPinHash.equals(json.optString("pin_hash", ""))) {
+            throw new IllegalArgumentException("PIN mismatch");
         }
         InetAddress address = packet.getAddress();
         if (!(address instanceof Inet4Address)) {

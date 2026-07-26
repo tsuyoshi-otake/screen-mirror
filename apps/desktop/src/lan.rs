@@ -91,14 +91,15 @@ impl Drop for SenderSupervisor {
 }
 
 impl Announcer {
-    pub fn receiver(stream_port: u16) -> Result<Self> {
+    pub fn receiver(stream_port: u16, pin: &str) -> Result<Self> {
         let socket = discovery::bind_ephemeral_broadcast_socket()?;
         let mut announcement = PeerAnnouncement::new(
             instance_id(),
             device_name(),
             PeerRole::Receiver,
             stream_port,
-        );
+        )
+        .with_pin(pin)?;
         if let Some(display) = crate::monitors::primary_display_info() {
             announcement = announcement.with_display(display);
         }
@@ -142,10 +143,10 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
         return Ok(args);
     }
 
-    let receivers = discover_receivers(Duration::from_secs(5))?;
+    let receivers = discover_receivers_with_pin(Duration::from_secs(5), &args.pin)?;
     if receivers.is_empty() {
         return Err(anyhow!(
-            "no receivers discovered; start receiver mode on another device or set host explicitly"
+            "no receivers discovered with matching PIN; start receiver mode on another device or set the same four-digit PIN"
         ));
     }
 
@@ -178,8 +179,8 @@ pub fn resolve_sender_args(mut args: SendArgs) -> Result<SendArgs> {
     Ok(args)
 }
 
-pub fn discover_receivers(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
-    discovery::discover_receivers(timeout).context("receiver discovery failed")
+pub fn discover_receivers_with_pin(timeout: Duration, pin: &str) -> Result<Vec<DiscoveredPeer>> {
+    discovery::discover_receivers_with_pin(timeout, pin).context("receiver discovery failed")
 }
 
 fn is_auto_host(host: &str) -> bool {

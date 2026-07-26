@@ -209,8 +209,8 @@ impl TrayApp {
             return;
         }
 
-        let args: crate::pipeline::SendArgs = self.config.send.clone().into();
-        match crate::control::ControlServer::start() {
+        let args = self.config.send_args();
+        match crate::control::ControlServer::start(&self.config.security.pin) {
             Ok(server) => self.control_server = Some(server),
             Err(error) => eprintln!("touch control server failed: {error:#}"),
         }
@@ -251,7 +251,7 @@ impl TrayApp {
             return;
         }
 
-        let args = self.config.recv.clone().into();
+        let args = self.config.recv_args();
         match pipeline::build_receiver_pipeline(&args) {
             Ok(description) => {
                 crate::logging::append(format!("receiver pipeline: {description}"));
@@ -259,7 +259,10 @@ impl TrayApp {
                 self.pipeline = Some(pipeline::spawn_pipeline(description));
                 self.sleep_guard = Some(crate::power::SleepGuard::receiver());
                 self.render_window = Some(crate::receiver_window::RenderWindowGuard::start());
-                match crate::lan::Announcer::receiver(self.config.recv.port) {
+                match crate::lan::Announcer::receiver(
+                    self.config.recv.port,
+                    &self.config.security.pin,
+                ) {
                     Ok(announcer) => self.announcer = Some(announcer),
                     Err(error) => eprintln!("receiver discovery announce failed: {error:#}"),
                 }

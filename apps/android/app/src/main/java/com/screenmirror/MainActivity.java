@@ -3,17 +3,21 @@ package com.screenmirror;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.util.DisplayMetrics;
+import android.text.InputFilter;
+import android.text.InputType;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -32,13 +36,16 @@ public final class MainActivity extends Activity {
 
     private SurfaceView surfaceView;
     private TextView status;
+    private EditText pinInput;
     private LinearLayout toolbar;
     private MediaProjectionManager projectionManager;
     private WifiManager.MulticastLock multicastLock;
+    private SharedPreferences preferences;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        preferences = getSharedPreferences("screen-mirror", MODE_PRIVATE);
         projectionManager = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         multicastLock = wifi.createMulticastLock("screen-mirror-discovery");
@@ -70,12 +77,18 @@ public final class MainActivity extends Activity {
             int index = event.getActionIndex();
             float x = event.getX(index) / Math.max(1, view.getWidth());
             float y = event.getY(index) / Math.max(1, view.getHeight());
-            control.send(host, action, x, y, event.getPointerId(index));
+            control.send(host, action, x, y, event.getPointerId(index), currentPinOrDefault());
             return true;
         });
         status = new TextView(this);
         status.setText("Status: idle");
         status.setPadding(24, 24, 24, 24);
+
+        pinInput = new EditText(this);
+        pinInput.setHint("PIN (4 digits)");
+        pinInput.setText(preferences.getString("pin", Pin.DEFAULT));
+        pinInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        pinInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4)});
 
         Button startReceiver = new Button(this);
         startReceiver.setText("Start Receiver");
@@ -96,6 +109,7 @@ public final class MainActivity extends Activity {
         toolbar = new LinearLayout(this);
         toolbar.setOrientation(LinearLayout.VERTICAL);
         toolbar.addView(status);
+        toolbar.addView(pinInput);
         toolbar.addView(startReceiver);
         toolbar.addView(discover);
         toolbar.addView(startSender);
@@ -135,6 +149,10 @@ public final class MainActivity extends Activity {
     }
 
     private void startReceiver() {
+        String pin = currentPinOrStatus();
+        if (pin == null) {
+            return;
+        }
         stopAll();
         enterReceiverFullscreen();
         keepReceiverAwake(true);
@@ -144,7 +162,7 @@ public final class MainActivity extends Activity {
             public void surfaceCreated(SurfaceHolder holder) {
                 try {
                     lockMulticast();
-                    discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz());
+                    discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
                     receiver.start(STREAM_PORT, holder.getSurface());
                     setStatus("Status: receiving on :" + STREAM_PORT);
                 } catch (Exception error) {
@@ -164,7 +182,7 @@ public final class MainActivity extends Activity {
         if (holder.getSurface().isValid()) {
             try {
                 lockMulticast();
-                discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz());
+                discovery.startReceiverBeacon(STREAM_PORT, displayWidth(), displayHeight(), displayRefreshHz(), pin);
                 receiver.start(STREAM_PORT, holder.getSurface());
                 setStatus("Status: receiving on :" + STREAM_PORT);
             } catch (Exception error) {
@@ -174,11 +192,15 @@ public final class MainActivity extends Activity {
     }
 
     private void discoverReceivers() {
+        String pin = currentPinOrStatus();
+        if (pin == null) {
+            return;
+        }
         lockMulticast();
         setStatus("Status: discovering receivers...");
         new Thread(() -> {
             try {
-                List<DiscoveryAgent.Peer> peers = discovery.discoverReceivers(3000);
+                List<DiscoveryAgent.Peer> peers = discovery.discoverReceivers(3000, pin);
                 selectedReceivers.clear();
                 for (int i = 0; i < peers.size() && i < 3; i++) {
                     selectedReceivers.add(peers.get(i));
@@ -191,12 +213,16 @@ public final class MainActivity extends Activity {
     }
 
     private void startSender() {
+        String pin = currentPinOrStatus();
+        if (pin == null) {
+            return;
+        }
         stopAll();
         lockMulticast();
         new Thread(() -> {
             try {
                 if (selectedReceivers.isEmpty()) {
-                    List<DiscoveryAgent.Peer> peers = discovery.discoverReceivers(3000);
+                    List<DiscoveryAgent.Peer> peers = discovery.discoverReceivers(3000, pin);
                     selectedReceivers.clear();
                     for (int i = 0; i < peers.size() && i < 3; i++) {
                         selectedReceivers.add(peers.get(i));
@@ -231,6 +257,25 @@ public final class MainActivity extends Activity {
     private void lockMulticast() {
         if (multicastLock != null && !multicastLock.isHeld()) {
             multicastLock.acquire();
+        }
+    }
+
+    private String currentPinOrStatus() {
+        try {
+            String pin = Pin.normalize(pinInput.getText().toString());
+            preferences.edit().putString("pin", pin).apply();
+            return pin;
+        } catch (IllegalArgumentException error) {
+            setStatus("Invalid PIN: use exactly four digits");
+            return null;
+        }
+    }
+
+    private String currentPinOrDefault() {
+        try {
+            return Pin.normalize(pinInput.getText().toString());
+        } catch (IllegalArgumentException error) {
+            return Pin.DEFAULT;
         }
     }
 

@@ -10,6 +10,7 @@ import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.Manifest;
+import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.text.InputFilter;
 import android.text.InputType;
@@ -40,6 +41,7 @@ public final class MainActivity extends Activity {
     private final RtpOpusReceiver audioReceiver = new RtpOpusReceiver();
     private final ScreenSender sender = new ScreenSender();
     private final ControlClient control = new ControlClient();
+    private final TouchControlServer touchServer = new TouchControlServer();
     private final ArrayList<DiscoveryAgent.Peer> selectedReceivers = new ArrayList<>();
 
     private SurfaceView surfaceView;
@@ -120,6 +122,10 @@ public final class MainActivity extends Activity {
         startSender.setText("Start Sender (up to 3 receivers)");
         startSender.setOnClickListener(view -> startSender());
 
+        Button accessibility = new Button(this);
+        accessibility.setText("Enable Android Touch Injection");
+        accessibility.setOnClickListener(view -> openAccessibilitySettings());
+
         Button stop = new Button(this);
         stop.setText("Stop");
         stop.setOnClickListener(view -> stopAll());
@@ -133,6 +139,7 @@ public final class MainActivity extends Activity {
         toolbar.addView(startReceiver);
         toolbar.addView(discover);
         toolbar.addView(startSender);
+        toolbar.addView(accessibility);
         toolbar.addView(stop);
 
         LinearLayout root = new LinearLayout(this);
@@ -163,7 +170,8 @@ public final class MainActivity extends Activity {
             MediaProjection projection = projectionManager.getMediaProjection(resultCode, data);
             boolean audioEnabled = sendAudio.isChecked() && canSendAudio();
             sender.start(projection, new ArrayList<>(selectedReceivers), audioEnabled);
-            setStatus("Status: sending " + sender.profileDescription() + " to " + selectedReceivers.size() + " receiver(s)" + (audioEnabled ? " with audio" : ""));
+            boolean touchEnabled = startTouchServer(currentPinOrDefault());
+            setStatus("Status: sending " + sender.profileDescription() + " to " + selectedReceivers.size() + " receiver(s)" + (audioEnabled ? " with audio" : "") + (touchEnabled ? " with touch" : " (enable Accessibility for touch)"));
         } catch (Exception error) {
             setStatus("Sender failed: " + error.getMessage());
         }
@@ -281,6 +289,7 @@ public final class MainActivity extends Activity {
         receiver.stop();
         audioReceiver.stop();
         sender.stop();
+        touchServer.stop();
         leaveReceiverFullscreen();
         keepReceiverAwake(false);
         if (multicastLock != null && multicastLock.isHeld()) {
@@ -293,6 +302,20 @@ public final class MainActivity extends Activity {
         if (multicastLock != null && !multicastLock.isHeld()) {
             multicastLock.acquire();
         }
+    }
+
+    private boolean startTouchServer(String pin) {
+        try {
+            touchServer.start(pin);
+            return touchServer.isInjectingEnabled();
+        } catch (Exception error) {
+            setStatus("Touch control failed: " + error.getMessage());
+            return false;
+        }
+    }
+
+    private void openAccessibilitySettings() {
+        startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
     }
 
     private String currentPinOrStatus() {

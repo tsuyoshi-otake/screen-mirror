@@ -292,6 +292,7 @@ The Android MVP includes:
 - Sender fan-out to up to three discovered receivers
 - Four-digit PIN pairing compatible with the desktop app
 - Touch on the Android receiver surface sends normalized control events back to the sender
+- Android sender touch injection through the bundled AccessibilityService after enabling `Screen Mirror` in Android Accessibility settings
 
 ## Touch Control
 
@@ -299,13 +300,14 @@ Touch is carried out-of-band from video:
 
 - Android receiver touch events are sent to the active sender on UDP `47778`
 - Windows desktop sender listens on UDP `47778`
+- Android sender listens on UDP `47778` while sender mode is active and injects received events through Accessibility gestures
 - Touch events include the same PIN hash and are ignored if it does not match
 - Windows injects touch-equivalent mouse input with normalized coordinates
 
 Current practical path:
 
 ```text
-Android receiver touch -> Windows sender input
+Android receiver touch -> Windows sender input, or Android sender input when the Screen Mirror AccessibilityService is enabled
 ```
 
 Windows receiver-side touch capture needs a custom render window instead of the current GStreamer-created sink window. The protocol and sender-side injection are already separated so that can be added cleanly.
@@ -358,5 +360,5 @@ The Android packet path is optimized for the hot loop:
 - DRM/protected content is out of scope.
 - UDP favors latency over guaranteed delivery; unstable Wi-Fi can produce visible corruption.
 - Android sender chooses an encoder-aligned resolution from discovered receiver display metadata, capped at `1920x1080` for latency.
-- Android touch injection into Android sender devices is not implemented because it requires an AccessibilityService/root-level privileges.
+- Android sender touch injection requires manually enabling the bundled `Screen Mirror` AccessibilityService in Android system settings.
 - Desktop audio transfer is implemented for Windows sender/receiver. Android receiver audio playback and Android sender app-audio capture are implemented; Android sender audio is limited by Android's AudioPlaybackCapture rules and app opt-out behavior.

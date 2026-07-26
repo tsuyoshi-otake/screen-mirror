@@ -96,20 +96,44 @@ fn acquire_named_mutex() -> Result<windows_sys::Win32::Foundation::HANDLE> {
 
 #[cfg(windows)]
 fn process_is_running(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return false;
     }
+    let mut exit_code = 0;
+    let running = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0
+        && exit_code == STILL_ACTIVE as u32;
     unsafe {
         CloseHandle(handle);
     }
-    true
+    running
 }
 
 #[cfg(not(windows))]
 fn process_is_running(_pid: u32) -> bool {
     false
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::process_is_running;
+
+    #[test]
+    fn distinguishes_running_and_exited_processes() {
+        assert!(process_is_running(std::process::id()));
+
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("failed to start test child process");
+        let pid = child.id();
+        assert!(process_is_running(pid));
+        child.wait().expect("failed to wait for test child process");
+        assert!(!process_is_running(pid));
+    }
 }

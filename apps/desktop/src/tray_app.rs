@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::autostart;
 use crate::config::{AppConfig, StartupMode};
@@ -31,6 +31,7 @@ const ID_QUIT: &str = "quit";
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
+    Tray(TrayIconEvent),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -44,8 +45,12 @@ pub fn run() -> Result<()> {
     crate::logging::append("tray run start");
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Menu(event));
+        let _ = menu_proxy.send_event(UserEvent::Menu(event));
+    }));
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        let _ = proxy.send_event(UserEvent::Tray(event));
     }));
 
     let mut app = TrayApp::new()?;
@@ -63,6 +68,7 @@ pub fn run() -> Result<()> {
             Event::UserEvent(UserEvent::Menu(event)) => {
                 app.handle_menu(event.id().as_ref(), control_flow);
             }
+            Event::UserEvent(UserEvent::Tray(event)) => app.handle_tray_event(event),
             Event::LoopDestroyed => {
                 let _ = app.stop_current();
             }
@@ -88,6 +94,9 @@ struct TrayApp {
     update_status_tx: Sender<String>,
     update_status_rx: Receiver<String>,
     tray: Option<TrayIcon>,
+    menu: Option<Menu>,
+    #[cfg(windows)]
+    menu_owner: Option<crate::tray_menu_owner::TrayMenuOwner>,
     items: Option<TrayItems>,
 }
 
@@ -121,6 +130,9 @@ impl TrayApp {
             update_status_tx,
             update_status_rx,
             tray: None,
+            menu: None,
+            #[cfg(windows)]
+            menu_owner: None,
             items: None,
         })
     }
@@ -193,16 +205,30 @@ impl TrayApp {
         menu.append(&sep4)?;
         menu.append(&quit)?;
 
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
+        let tray_builder = TrayIconBuilder::new()
             .with_tooltip(app_tooltip())
             .with_icon(app_icon()?)
-            .with_menu_on_left_click(false)
+            .with_menu_on_left_click(false);
+
+        #[cfg(windows)]
+        let tray = tray_builder
+            .with_menu_on_right_click(false)
+            .build()
+            .context("failed to create tray icon")?;
+
+        #[cfg(not(windows))]
+        let tray = tray_builder
+            .with_menu(Box::new(menu.clone()))
             .with_menu_on_right_click(true)
             .build()
             .context("failed to create tray icon")?;
 
         self.items = Some(items);
+        self.menu = Some(menu);
+        #[cfg(windows)]
+        {
+            self.menu_owner = Some(crate::tray_menu_owner::TrayMenuOwner::new()?);
+        }
         self.tray = Some(tray);
         self.sync_menu();
         crate::updater::start_background_update_checks();
@@ -259,6 +285,25 @@ impl TrayApp {
                 *control_flow = ControlFlow::Exit;
             }
             _ => {}
+        }
+    }
+
+    fn handle_tray_event(&self, event: TrayIconEvent) {
+        if !matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Right,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
+            return;
+        }
+
+        crate::logging::append("tray right click received");
+        #[cfg(windows)]
+        if let (Some(menu), Some(owner)) = (self.menu.as_ref(), self.menu_owner.as_ref()) {
+            owner.show(menu);
         }
     }
 

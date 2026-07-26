@@ -8,4 +8,7 @@
     <StageDir Condition="'$(StageDir)' == ''">$(MSBuildThisFileDirectory)stage</StageDir>
     <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);StageDir=$(StageDir)</DefineConstants>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Util.wixext" Version="6.0.2" />
+  </ItemGroup>
 </Project>

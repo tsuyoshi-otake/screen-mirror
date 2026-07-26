@@ -18,13 +18,20 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="ProgramMenuScreenMirror" Name="Screen Mirror" />
     </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
 
     <Feature Id="MainFeature" Title="Screen Mirror" Level="1">
       <ComponentGroupRef Id="AppComponents" />
       <ComponentGroupRef Id="RuntimeComponents" />
     </Feature>
     <CustomAction Id="StopExistingScreenMirror" Directory="INSTALLFOLDER" ExeCommand="[SystemFolder]taskkill.exe /IM screen-mirror.exe /F" Execute="immediate" Return="ignore" Impersonate="yes" />
-    <CustomAction Id="LaunchScreenMirror" FileRef="ScreenMirrorExe" ExeCommand="tray" Execute="immediate" Return="asyncNoWait" Impersonate="yes" />
+    <Property Id="WixUnelevatedShellExecTarget" Value="[#ScreenMirrorExe]" />
+    <CustomAction
+      Id="LaunchScreenMirror"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixUnelevatedShellExec"
+      Execute="immediate"
+      Return="check" />
     <InstallExecuteSequence>
       <Custom Action="StopExistingScreenMirror" Before="InstallValidate" Condition="NOT REMOVE" />
       <Custom Action="LaunchScreenMirror" After="InstallFinalize" Condition="NOT REMOVE" />
@@ -42,6 +49,14 @@
           <Shortcut
             Id="StartMenuShortcut"
             Directory="ProgramMenuScreenMirror"
+            Name="Screen Mirror"
+            Arguments="tray"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="AppIcon.ico"
+            Advertise="yes" />
+          <Shortcut
+            Id="DesktopShortcut"
+            Directory="DesktopFolder"
             Name="Screen Mirror"
             Arguments="tray"
             WorkingDirectory="INSTALLFOLDER"

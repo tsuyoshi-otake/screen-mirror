@@ -10,6 +10,20 @@ Low-latency LAN screen mirroring for Windows and Android. This is not Miracast-c
 - `installer`: WiX SDK project for the Windows MSI
 - `scripts`: local build/check scripts
 
+## Release Status
+
+The current published build is available from the [latest GitHub Release](https://github.com/tsuyoshi-otake/screen-mirror/releases/latest).
+
+- `ScreenMirror.msi` is the current Windows distributable installer and the asset used by the desktop auto-updater.
+- `ScreenMirror-Android-debug.apk` is a debug-signed APK for development and device testing only. It is not a production-signed Android release.
+- To install or update the debug APK from a PC with Android platform tools and USB debugging enabled:
+
+```powershell
+adb install -r .\ScreenMirror-Android-debug.apk
+```
+
+The desktop and Android package versions for this release are `0.1.37`.
+
 ## Transport Model
 
 - Discovery: UDP broadcast on port `47777`, plus PIN-filtered local-subnet unicast probes on UDP `47776` when broadcasts are suppressed
@@ -48,14 +62,15 @@ Tray actions:
 
 ### Windows to Android as an extended display
 
-1. Install `ScreenMirror.msi` from the latest GitHub Release.
-2. Start `Screen Mirror` from the Start Menu or the system tray.
-3. Open the tray menu and run `Install/Repair Virtual Display Driver`.
-4. Allow the UAC prompt, then confirm Windows Display Settings shows an extra display.
-5. Set the same four-digit PIN on Windows and Android. The default is `0000`.
-6. Start the Android app and tap `Start Receiver`.
-7. On Windows, choose `Start as Sender` from the tray menu.
-8. If needed, run `screen-mirror.exe monitors` and set `[send].monitor_index` in `%APPDATA%\screen-mirror\config.toml`.
+1. Install `ScreenMirror.msi` from the [latest GitHub Release](https://github.com/tsuyoshi-otake/screen-mirror/releases/latest).
+2. For Android testing, install `ScreenMirror-Android-debug.apk` from the same release. This APK is debug-signed and is not a production build.
+3. Start `Screen Mirror` from the Start Menu or the system tray.
+4. Open the tray menu and run `Install/Repair Virtual Display Driver`.
+5. Allow the UAC prompt, then confirm Windows Display Settings shows an extra display.
+6. Set the same four-digit PIN on Windows and Android. The default is `0000`.
+7. Start the Android app and tap `Start Receiver`.
+8. On Windows, choose `Start as Sender` from the tray menu.
+9. If needed, run `screen-mirror.exe monitors` and set `[send].monitor_index` in `%APPDATA%\screen-mirror\config.toml`.
 
 ### Windows to Windows
 
@@ -287,7 +302,7 @@ Receiver mode prevents the display and system from sleeping while video receptio
 - Windows receiver calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`.
 - Android receiver sets `FLAG_KEEP_SCREEN_ON` and `SurfaceView.setKeepScreenOn(true)`.
 - The sleep/display guard is released when receiver mode stops.
-- After video packets stop arriving, the Windows receiver destroys the fullscreen render pipeline and immediately returns to background listening mode so the sender can reconnect without manual intervention.
+- After video packets stop arriving, the Windows receiver destroys the fullscreen render pipeline, remains in receiver mode, and immediately starts a fresh video listener so the sender can reconnect without manual intervention.
 
 ## Receiver Window
 
@@ -333,7 +348,7 @@ audio_jitter_ms = 10
 - The MSI includes both `screen-mirror.ico` and `screen-mirror-dark.ico`, both with alpha transparency.
 - Android uses an adaptive launcher icon with a monochrome layer for themed icons.
 
-## Android APK
+## Android Debug APK
 
 Build the APK:
 
@@ -373,7 +388,7 @@ SCREEN_MIRROR_KEY_PASSWORD
 
 `assembleRelease` fails instead of silently producing an unsigned APK when those values are missing. Do not commit the keystore or credentials.
 
-Final distribution still requires a signed release build and bidirectional Windows/Android testing on physical Android hardware; local JVM tests cannot validate device-specific `MediaCodec`, `MediaProjection`, audio-capture, or Accessibility behavior.
+The GitHub Release asset is the debug APK produced by this workflow. Production Android distribution still requires a signed release build and bidirectional Windows/Android testing on physical Android hardware; local JVM tests cannot validate device-specific `MediaCodec`, `MediaProjection`, audio-capture, or Accessibility behavior.
 
 ## Touch Control
 

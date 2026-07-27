@@ -23,7 +23,7 @@ final class AudioSender {
     private static final int SAMPLE_RATE = 48_000;
     private static final int CHANNELS = 2;
     private static final int BITRATE = 96_000;
-    static final int FRAME_SAMPLES = SAMPLE_RATE / 400;
+    static final int FRAME_SAMPLES = SAMPLE_RATE / 200;
     static final int PCM_FRAME_BYTES = FRAME_SAMPLES * CHANNELS * 2;
 
     private final Context context;

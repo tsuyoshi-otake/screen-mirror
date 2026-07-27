@@ -2,6 +2,21 @@ plugins {
     id "com.android.application"
 }
 
+def signingValue = { String name ->
+    def propertyValue = project.findProperty(name)
+    propertyValue == null ? System.getenv(name) : propertyValue.toString()
+}
+def releaseStoreFile = signingValue("SCREEN_MIRROR_KEYSTORE_FILE")
+def releaseStorePassword = signingValue("SCREEN_MIRROR_KEYSTORE_PASSWORD")
+def releaseKeyAlias = signingValue("SCREEN_MIRROR_KEY_ALIAS")
+def releaseKeyPassword = signingValue("SCREEN_MIRROR_KEY_PASSWORD")
+def releaseSigningConfigured = [
+        releaseStoreFile,
+        releaseStorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword
+].every { value -> value != null && !value.trim().isEmpty() }
+
 android {
     namespace "com.screenmirror"
     compileSdk 35
@@ -10,7 +25,61 @@ android {
         applicationId "com.screenmirror"
         minSdk 26
         targetSdk 35
-        versionCode 32
-        versionName "0.1.32"
+        versionCode 33
+        versionName "0.1.33"
     }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            release {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (releaseSigningConfigured) {
+                signingConfig signingConfigs.release
+            }
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+}
+
+def validateReleaseSigning = tasks.register("validateReleaseSigning") {
+    doLast {
+        if (!releaseSigningConfigured) {
+            throw new GradleException(
+                    "Release signing is required. Set SCREEN_MIRROR_KEYSTORE_FILE, " +
+                            "SCREEN_MIRROR_KEYSTORE_PASSWORD, SCREEN_MIRROR_KEY_ALIAS, and " +
+                            "SCREEN_MIRROR_KEY_PASSWORD as Gradle properties or environment variables."
+            )
+        }
+        if (!file(releaseStoreFile).isFile()) {
+            throw new GradleException("Release keystore was not found: " + releaseStoreFile)
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == "preReleaseBuild") {
+        task.dependsOn(validateReleaseSigning)
+    }
+}
+
+dependencies {
+    testImplementation "junit:junit:4.13.2"
 }

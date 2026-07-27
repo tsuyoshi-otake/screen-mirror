@@ -11,7 +11,7 @@ final class RtpOpusPacketizer implements AutoCloseable {
     private static final int PAYLOAD_TYPE = 97;
     private static final int CLOCK_RATE = 48_000;
     private static final int MTU = 1200;
-    private static final int SOCKET_BUFFER_SIZE = 512 * 1024;
+    private static final int SOCKET_BUFFER_SIZE = 256 * 1024;
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
     private static final int RTP_HEADER_SIZE = 12;
 
@@ -67,7 +67,8 @@ final class RtpOpusPacketizer implements AutoCloseable {
             socket.setSendBufferSize(SOCKET_BUFFER_SIZE);
             try {
                 socket.setTrafficClass(DSCP_EF_TRAFFIC_CLASS);
-            } catch (Exception ignored) {
+            } catch (Exception error) {
+                AppLog.warn("audio sender could not set DSCP", error);
             }
         }
         return socket;

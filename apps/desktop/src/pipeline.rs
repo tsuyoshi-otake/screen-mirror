@@ -58,11 +58,11 @@ pub struct SendArgs {
     pub monitor_index: i32,
 
     /// Capture frame rate.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 30)]
     pub fps: u32,
 
     /// Target bitrate in kbit/sec.
-    #[arg(long, default_value_t = 12_000)]
+    #[arg(long, default_value_t = 8_000)]
     pub bitrate: u32,
 
     /// RTP MTU. 1200 is safe for Wi-Fi and VPN-ish paths.
@@ -70,7 +70,7 @@ pub struct SendArgs {
     pub mtu: u32,
 
     /// UDP kernel send buffer size in bytes.
-    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    #[arg(long, default_value_t = 1024 * 1024)]
     pub udp_buffer_size: u32,
 
     /// DSCP value for UDP video packets. -1 keeps OS default; 46 requests Expedited Forwarding.
@@ -92,6 +92,10 @@ pub struct SendArgs {
     /// Capture API. dxgi is lowest overhead; wgc can behave better with modern Windows/window capture.
     #[arg(long, value_enum, default_value_t = CaptureApi::Dxgi)]
     pub capture_api: CaptureApi,
+
+    /// Keep captured frames in D3D11 memory through hardware encoding when supported.
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    pub zero_copy: bool,
 
     /// Disable cursor capture.
     #[arg(long)]
@@ -121,7 +125,7 @@ pub struct RecvArgs {
     pub audio_port: u16,
 
     /// RTP audio jitter buffer latency in milliseconds.
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 5)]
     pub audio_jitter_ms: u32,
 
     /// Four-digit PIN advertised for LAN discovery pairing.
@@ -133,7 +137,7 @@ pub struct RecvArgs {
     pub jitter_ms: u32,
 
     /// UDP kernel receive buffer size in bytes.
-    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    #[arg(long, default_value_t = 1024 * 1024)]
     pub udp_buffer_size: u32,
 
     /// Maximum expected RTP packet size.
@@ -323,12 +327,23 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
         )
     };
     crate::logging::append(format!("sender pipeline source: {source}"));
-    let caps = video_caps(
+    let encoder_accepts_d3d11 = encoder.supports_d3d11_input();
+    let use_d3d11_memory = args.zero_copy && encoder_accepts_d3d11;
+    if args.zero_copy && !encoder_accepts_d3d11 {
+        crate::logging::append(format!(
+            "sender encoder={} does not advertise D3D11 input; falling back to system-memory frames",
+            encoder.name()
+        ));
+    }
+    crate::logging::append(format!(
+        "sender encoder={} frame-memory={} fps={} bitrate={}kbit/s udp-buffer={}bytes",
+        encoder.name(),
+        if use_d3d11_memory { "D3D11" } else { "system" },
         args.fps,
-        args.width,
-        args.height,
-        encoder.uses_d3d11_input(),
-    );
+        args.bitrate,
+        args.udp_buffer_size
+    ));
+    let caps = video_caps(args.fps, args.width, args.height, use_d3d11_memory);
     let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
 
     let video = format!(
@@ -423,7 +438,7 @@ fn build_sender_audio_chain(args: &SendArgs) -> Result<String> {
     let clients = multi_udp_clients_force_port(&args.host, args.audio_port)?;
     Ok(format!(
         "wasapi2src loopback=true low-latency=true buffer-time=10000 latency-time=2500 provide-clock=false \
-         ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! queue max-size-buffers=2 max-size-time=20000000 max-size-bytes=0 leaky=downstream \
          ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 \
          ! opusenc bitrate={} bitrate-type=cbr audio-type=restricted-lowdelay frame-size={} inband-fec=false dtx=false \
          ! rtpopuspay pt=97 mtu={} perfect-rtptime=true \
@@ -449,10 +464,10 @@ fn build_receiver_audio_chain(args: &RecvArgs) -> Result<String> {
     };
     Ok(format!(
         "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false caps=\"application/x-rtp,media=(string)audio,clock-rate=(int)48000,encoding-name=(string)OPUS,payload=(int)97\" \
-         ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! queue max-size-buffers=4 max-size-time=20000000 max-size-bytes=0 leaky=downstream \
          ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets=2 \
          ! rtpopusdepay ! opusdec plc=true \
-         ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 leaky=downstream \
+         ! queue max-size-buffers=2 max-size-time=10000000 max-size-bytes=0 leaky=downstream \
          ! audioconvert ! audioresample ! {sink}",
         args.audio_port, args.udp_buffer_size, args.mtu, args.audio_jitter_ms
     ))
@@ -564,7 +579,7 @@ fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) ->
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum SelectedEncoder {
     Nvidia,
     MediaFoundation,
@@ -573,8 +588,25 @@ enum SelectedEncoder {
 }
 
 impl SelectedEncoder {
-    fn uses_d3d11_input(self) -> bool {
-        matches!(self, Self::Nvidia)
+    fn supports_d3d11_input(self) -> bool {
+        if self == Self::X264 {
+            return false;
+        }
+        let d3d11_caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:D3D11Memory"])
+            .field("format", "NV12")
+            .build();
+        gst::ElementFactory::find(self.name())
+            .is_some_and(|factory| factory.can_sink_any_caps(&d3d11_caps))
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvd3d11h264enc",
+            Self::MediaFoundation => "mfh264enc",
+            Self::QuickSync => "qsvh264enc",
+            Self::X264 => "x264enc",
+        }
     }
 
     fn chain(self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {
@@ -642,8 +674,8 @@ fn select_encoder(requested: Encoder, allow_software_encoder: bool) -> Result<Se
 fn first_available_encoder(allow_software_encoder: bool) -> Result<SelectedEncoder> {
     let hardware_encoder = [
         ("nvd3d11h264enc", SelectedEncoder::Nvidia),
-        ("mfh264enc", SelectedEncoder::MediaFoundation),
         ("qsvh264enc", SelectedEncoder::QuickSync),
+        ("mfh264enc", SelectedEncoder::MediaFoundation),
     ]
     .into_iter()
     .find_map(|(name, encoder)| has_element(name).then_some(encoder));
@@ -856,5 +888,12 @@ mod tests {
         assert!(error
             .to_string()
             .contains("refusing ambiguous monitor-index"));
+    }
+
+    #[test]
+    fn d3d11_caps_keep_frames_on_gpu_without_download() {
+        let caps = video_caps(30, Some(1920), Some(1080), true);
+        assert!(caps.contains("memory:D3D11Memory"));
+        assert!(!caps.contains("d3d11download"));
     }
 }

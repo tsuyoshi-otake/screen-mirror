@@ -10,6 +10,7 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -21,6 +22,10 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class DiscoveryAgent {
+    interface Listener {
+        void onError(Throwable error);
+    }
+
     static final int DISCOVERY_PORT = 47777;
     static final int DISCOVERY_PROBE_PORT = 47776;
     private static final String PROTOCOL = "screen-mirror.discovery";
@@ -58,21 +63,69 @@ final class DiscoveryAgent {
 
     private final String instanceId = Build.MODEL.replace(' ', '-') + "-" + UUID.randomUUID();
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean discovering = new AtomicBoolean(false);
+    private volatile Listener listener;
+    private volatile DatagramSocket beaconSocket;
+    private volatile DatagramSocket discoveryBroadcastSocket;
+    private volatile DatagramSocket discoveryProbeSocket;
     private Thread thread;
 
-    void startReceiverBeacon(int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
-        stop();
-        running.set(true);
-        String normalizedPin = Pin.normalize(pin);
-        thread = new Thread(() -> runBeacon("receiver", streamPort, audioPort, displayWidth, displayHeight, refreshHz, normalizedPin), "discovery-beacon");
-        thread.start();
+    void setListener(Listener listener) {
+        this.listener = listener;
     }
 
-    void stop() {
+    synchronized void startReceiverBeacon(int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) throws Exception {
+        stop();
+        String normalizedPin = Pin.normalize(pin);
+        byte[] payload = announcement("receiver", streamPort, audioPort, displayWidth, displayHeight, refreshHz, normalizedPin);
+        DatagramSocket localSocket = new DatagramSocket(null);
+        try {
+            localSocket.setReuseAddress(true);
+            localSocket.bind(new InetSocketAddress(DISCOVERY_PROBE_PORT));
+            localSocket.setBroadcast(true);
+            localSocket.setSoTimeout(200);
+        } catch (Exception error) {
+            localSocket.close();
+            throw error;
+        }
+        beaconSocket = localSocket;
+        running.set(true);
+        thread = new Thread(() -> runBeacon(localSocket, "receiver", normalizedPin, payload), "discovery-beacon");
+        thread.start();
+        AppLog.info("receiver discovery beacon started");
+    }
+
+    synchronized void stop() {
         running.set(false);
-        if (thread != null) {
-            thread.interrupt();
-            thread = null;
+        discovering.set(false);
+        DatagramSocket activeBroadcastSocket = discoveryBroadcastSocket;
+        discoveryBroadcastSocket = null;
+        if (activeBroadcastSocket != null) {
+            activeBroadcastSocket.close();
+        }
+        DatagramSocket activeProbeSocket = discoveryProbeSocket;
+        discoveryProbeSocket = null;
+        if (activeProbeSocket != null) {
+            activeProbeSocket.close();
+        }
+        DatagramSocket activeSocket = beaconSocket;
+        beaconSocket = null;
+        if (activeSocket != null) {
+            activeSocket.close();
+        }
+        Thread worker = thread;
+        thread = null;
+        if (worker != null && worker != Thread.currentThread()) {
+            worker.interrupt();
+            try {
+                worker.join(1000L);
+                if (worker.isAlive()) {
+                    AppLog.warn("discovery beacon did not stop within one second", null);
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                AppLog.warn("interrupted while stopping discovery beacon", error);
+            }
         }
     }
 
@@ -82,15 +135,20 @@ final class DiscoveryAgent {
         byte[] buffer = new byte[2048];
         String expectedPinHash = Pin.hash(pin);
 
-        try (DatagramSocket broadcastSocket = new DatagramSocket(null);
-             DatagramSocket probeSocket = new DatagramSocket()) {
+        DatagramSocket broadcastSocket = new DatagramSocket(null);
+        DatagramSocket probeSocket = null;
+        try {
+            probeSocket = new DatagramSocket();
+            discoveryBroadcastSocket = broadcastSocket;
+            discoveryProbeSocket = probeSocket;
+            discovering.set(true);
             broadcastSocket.setReuseAddress(true);
             broadcastSocket.bind(new InetSocketAddress(DISCOVERY_PORT));
             broadcastSocket.setSoTimeout(100);
             probeSocket.setSoTimeout(100);
             long nextProbeAt = 0;
 
-            while (System.currentTimeMillis() < deadline) {
+            while (discovering.get() && System.currentTimeMillis() < deadline) {
                 long now = System.currentTimeMillis();
                 if (now >= nextProbeAt) {
                     sendDiscoveryProbes(probeSocket, pin);
@@ -99,18 +157,29 @@ final class DiscoveryAgent {
                 addDiscoveredPeer(peers, receivePeer(broadcastSocket, buffer, expectedPinHash));
                 addDiscoveredPeer(peers, receivePeer(probeSocket, buffer, expectedPinHash));
             }
+        } catch (SocketException error) {
+            if (discovering.get()) {
+                throw error;
+            }
+        } finally {
+            discovering.set(false);
+            broadcastSocket.close();
+            if (probeSocket != null) {
+                probeSocket.close();
+            }
+            if (discoveryBroadcastSocket == broadcastSocket) {
+                discoveryBroadcastSocket = null;
+            }
+            if (probeSocket != null && discoveryProbeSocket == probeSocket) {
+                discoveryProbeSocket = null;
+            }
         }
 
         return peers;
     }
 
-    private void runBeacon(String role, int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) {
-        try (DatagramSocket socket = new DatagramSocket(null)) {
-            socket.setReuseAddress(true);
-            socket.bind(new InetSocketAddress(DISCOVERY_PROBE_PORT));
-            socket.setBroadcast(true);
-            socket.setSoTimeout(200);
-            byte[] payload = announcement(role, streamPort, audioPort, displayWidth, displayHeight, refreshHz, pin);
+    private void runBeacon(DatagramSocket socket, String role, String pin, byte[] payload) {
+        try (DatagramSocket activeSocket = socket) {
             byte[] buffer = new byte[2048];
             long nextBroadcastAt = 0;
             while (running.get()) {
@@ -122,26 +191,44 @@ final class DiscoveryAgent {
                             InetAddress.getByName("255.255.255.255"),
                             DISCOVERY_PORT
                     );
-                    socket.send(packet);
+                    activeSocket.send(packet);
                     nextBroadcastAt = now + 1000;
                 }
 
                 try {
                     DatagramPacket probePacket = new DatagramPacket(buffer, buffer.length);
-                    socket.receive(probePacket);
+                    activeSocket.receive(probePacket);
                     if (matchesProbe(probePacket, role, pin)) {
-                        socket.send(new DatagramPacket(
+                        activeSocket.send(new DatagramPacket(
                                 payload,
                                 payload.length,
                                 probePacket.getAddress(),
                                 probePacket.getPort()
                         ));
                     }
-                } catch (SocketTimeoutException ignored) {
-                } catch (Exception ignored) {
+                } catch (SocketTimeoutException timeout) {
+                    // Expected: the timeout makes stop/restart responsive.
+                } catch (SocketException error) {
+                    if (running.get()) {
+                        throw error;
+                    }
+                } catch (Exception malformedProbe) {
+                    AppLog.warn("ignored malformed discovery probe", malformedProbe);
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception error) {
+            if (running.get()) {
+                running.set(false);
+                AppLog.error("receiver discovery beacon failed", error);
+                Listener activeListener = listener;
+                if (activeListener != null) {
+                    activeListener.onError(error);
+                }
+            }
+        } finally {
+            if (beaconSocket == socket) {
+                beaconSocket = null;
+            }
         }
     }
 
@@ -154,6 +241,8 @@ final class DiscoveryAgent {
         json.put("timestamp_ms", System.currentTimeMillis());
         byte[] payload = json.toString().getBytes(StandardCharsets.UTF_8);
 
+        Exception lastError = null;
+        int sent = 0;
         for (InetAddress address : unicastProbeAddresses()) {
             try {
                 socket.send(new DatagramPacket(
@@ -162,8 +251,16 @@ final class DiscoveryAgent {
                         address,
                         DISCOVERY_PROBE_PORT
                 ));
-            } catch (Exception ignored) {
+                sent++;
+            } catch (Exception error) {
+                lastError = error;
             }
+        }
+        if (sent == 0 && lastError != null) {
+            throw lastError;
+        }
+        if (lastError != null) {
+            AppLog.warn("some unicast discovery probes could not be sent", lastError);
         }
     }
 
@@ -223,14 +320,17 @@ final class DiscoveryAgent {
         return wantedPinHash.isEmpty() || wantedPinHash.equals(Pin.hash(pin));
     }
 
-    private static Peer receivePeer(DatagramSocket socket, byte[] buffer, String expectedPinHash) {
+    private static Peer receivePeer(DatagramSocket socket, byte[] buffer, String expectedPinHash) throws SocketException {
         try {
             DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
             socket.receive(packet);
             return decodePeer(packet, expectedPinHash);
-        } catch (SocketTimeoutException ignored) {
+        } catch (SocketTimeoutException timeout) {
             return null;
-        } catch (Exception ignored) {
+        } catch (SocketException error) {
+            throw error;
+        } catch (Exception invalidPacket) {
+            // Other PINs, protocol versions, and malformed LAN packets are expected noise.
             return null;
         }
     }

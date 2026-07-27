@@ -1,5 +1,8 @@
 package com.screenmirror;
 
+import android.Manifest;
+import android.content.Context;
+import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioPlaybackCaptureConfiguration;
@@ -13,12 +16,18 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class AudioSender {
+    interface Listener {
+        void onError(Throwable error);
+    }
+
     private static final int SAMPLE_RATE = 48_000;
     private static final int CHANNELS = 2;
     private static final int BITRATE = 96_000;
     private static final int FRAME_MS = 5;
     private static final int PCM_FRAME_BYTES = SAMPLE_RATE * CHANNELS * 2 * FRAME_MS / 1000;
 
+    private final Context context;
+    private final Listener listener;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final RtpOpusPacketizer packetizer = new RtpOpusPacketizer();
     private final byte[] pcmBuffer = new byte[PCM_FRAME_BYTES];
@@ -28,81 +37,122 @@ final class AudioSender {
     private AudioRecord audioRecord;
     private MediaCodec encoder;
 
+    AudioSender(Context context, Listener listener) {
+        this.context = context.getApplicationContext();
+        this.listener = listener;
+    }
+
     boolean isSupported() {
         return android.os.Build.VERSION.SDK_INT >= 29;
     }
 
-    void start(MediaProjection projection, List<DiscoveryAgent.Peer> peers) throws Exception {
+    synchronized void start(MediaProjection projection, List<DiscoveryAgent.Peer> peers) throws Exception {
         stop();
         if (!isSupported()) {
             throw new IllegalStateException("Android audio capture requires Android 10 or newer");
         }
+        if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("record audio permission is not granted");
+        }
 
-        AudioPlaybackCaptureConfiguration capture = new AudioPlaybackCaptureConfiguration.Builder(projection)
-                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                .build();
+        AudioRecord localRecord = null;
+        MediaCodec localEncoder = null;
+        try {
+            AudioPlaybackCaptureConfiguration capture = new AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build();
 
-        AudioFormat audioFormat = new AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SAMPLE_RATE)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                .build();
-        int minBuffer = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT
-        );
-        int recordBuffer = Math.max(minBuffer, PCM_FRAME_BYTES * 4);
-        audioRecord = new AudioRecord.Builder()
-                .setAudioFormat(audioFormat)
-                .setBufferSizeInBytes(recordBuffer)
-                .setAudioPlaybackCaptureConfig(capture)
-                .build();
+            AudioFormat audioFormat = new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build();
+            int minBuffer = AudioRecord.getMinBufferSize(
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT
+            );
+            int recordBuffer = Math.max(minBuffer, PCM_FRAME_BYTES * 4);
+            localRecord = new AudioRecord.Builder()
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(recordBuffer)
+                    .setAudioPlaybackCaptureConfig(capture)
+                    .build();
+            if (localRecord.getState() != AudioRecord.STATE_INITIALIZED) {
+                throw new IllegalStateException("audio capture did not initialize");
+            }
 
-        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS);
-        MediaFormat format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, SAMPLE_RATE, CHANNELS);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, BITRATE);
-        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, PCM_FRAME_BYTES);
-        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-        encoder.start();
+            localEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS);
+            MediaFormat format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, SAMPLE_RATE, CHANNELS);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, BITRATE);
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, PCM_FRAME_BYTES);
+            localEncoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            localEncoder.start();
 
-        audioRecord.startRecording();
+            localRecord.startRecording();
+        } catch (Exception error) {
+            if (localRecord != null) {
+                localRecord.release();
+            }
+            if (localEncoder != null) {
+                try {
+                    localEncoder.stop();
+                } catch (Exception stopError) {
+                    AppLog.warn("audio encoder cleanup failed", stopError);
+                }
+                localEncoder.release();
+            }
+            throw error;
+        }
+
+        audioRecord = localRecord;
+        encoder = localEncoder;
         running.set(true);
         thread = new Thread(() -> captureLoop(peers), "audio-sender");
         thread.start();
+        AppLog.info("sender audio capture started");
     }
 
-    void stop() {
+    synchronized void stop() {
         running.set(false);
-        if (thread != null) {
-            thread.interrupt();
-            thread = null;
-        }
-        if (audioRecord != null) {
-            try {
-                audioRecord.stop();
-            } catch (Exception ignored) {
-            }
-            audioRecord.release();
-            audioRecord = null;
-        }
-        if (encoder != null) {
-            try {
-                encoder.stop();
-            } catch (Exception ignored) {
-            }
-            encoder.release();
-            encoder = null;
-        }
         packetizer.close();
+
+        AudioRecord activeRecord = audioRecord;
+        if (activeRecord != null) {
+            try {
+                activeRecord.stop();
+            } catch (Exception error) {
+                AppLog.warn("audio capture stop failed", error);
+            }
+        }
+
+        Thread worker = thread;
+        thread = null;
+        joinWorker(worker);
+
+        audioRecord = null;
+        if (activeRecord != null) {
+            activeRecord.release();
+        }
+
+        MediaCodec activeEncoder = encoder;
+        encoder = null;
+        if (activeEncoder != null) {
+            try {
+                activeEncoder.stop();
+            } catch (Exception error) {
+                AppLog.warn("audio encoder stop failed", error);
+            }
+            activeEncoder.release();
+        }
     }
 
     private void captureLoop(List<DiscoveryAgent.Peer> peers) {
         long samplesCaptured = 0;
-        while (running.get()) {
-            try {
+        try {
+            while (running.get()) {
                 AudioRecord activeRecord = audioRecord;
                 MediaCodec activeEncoder = encoder;
                 if (activeRecord == null || activeEncoder == null) {
@@ -111,22 +161,32 @@ final class AudioSender {
 
                 int bytesRead = activeRecord.read(pcmBuffer, 0, pcmBuffer.length, AudioRecord.READ_BLOCKING);
                 if (bytesRead <= 0) {
+                    if (bytesRead < 0 && running.get()) {
+                        throw new IllegalStateException("AudioRecord read failed with code " + bytesRead);
+                    }
                     continue;
                 }
 
                 int input = activeEncoder.dequeueInputBuffer(1_000);
                 if (input >= 0) {
                     ByteBuffer buffer = activeEncoder.getInputBuffer(input);
-                    if (buffer != null) {
+                    long presentationTimeUs = samplesCaptured * 1_000_000L / SAMPLE_RATE;
+                    if (buffer == null) {
+                        activeEncoder.queueInputBuffer(input, 0, 0, presentationTimeUs, 0);
+                    } else {
                         buffer.clear();
                         buffer.put(pcmBuffer, 0, bytesRead);
-                        long presentationTimeUs = samplesCaptured * 1_000_000L / SAMPLE_RATE;
                         activeEncoder.queueInputBuffer(input, 0, bytesRead, presentationTimeUs, 0);
                     }
                 }
                 samplesCaptured += bytesRead / (CHANNELS * 2);
                 drainEncoder(activeEncoder, peers);
-            } catch (Exception ignored) {
+            }
+        } catch (Exception error) {
+            if (running.get()) {
+                running.set(false);
+                AppLog.error("sender audio capture failed", error);
+                listener.onError(error);
             }
         }
     }
@@ -136,14 +196,33 @@ final class AudioSender {
         do {
             output = activeEncoder.dequeueOutputBuffer(bufferInfo, 0);
             if (output >= 0) {
-                ByteBuffer encoded = activeEncoder.getOutputBuffer(output);
-                if (encoded != null && bufferInfo.size > 0) {
-                    encoded.position(bufferInfo.offset);
-                    encoded.limit(bufferInfo.offset + bufferInfo.size);
-                    packetizer.sendOpus(encoded.slice(), bufferInfo.size, bufferInfo.presentationTimeUs, peers);
+                try {
+                    ByteBuffer encoded = activeEncoder.getOutputBuffer(output);
+                    if (encoded != null && bufferInfo.size > 0) {
+                        encoded.position(bufferInfo.offset);
+                        encoded.limit(bufferInfo.offset + bufferInfo.size);
+                        packetizer.sendOpus(encoded.slice(), bufferInfo.size, bufferInfo.presentationTimeUs, peers);
+                    }
+                } finally {
+                    activeEncoder.releaseOutputBuffer(output, false);
                 }
-                activeEncoder.releaseOutputBuffer(output, false);
             }
         } while (output >= 0);
+    }
+
+    private static void joinWorker(Thread worker) {
+        if (worker == null || worker == Thread.currentThread()) {
+            return;
+        }
+        worker.interrupt();
+        try {
+            worker.join(1000L);
+            if (worker.isAlive()) {
+                AppLog.warn("audio sender thread did not stop within one second", null);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            AppLog.warn("interrupted while stopping audio sender", error);
+        }
     }
 }

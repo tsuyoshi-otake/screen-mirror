@@ -18,7 +18,10 @@ if (Test-Path -LiteralPath $gradlew) {
 
 Push-Location $androidDir
 try {
-    & $gradle "assemble$Configuration"
+    & $gradle "testDebugUnitTest" "lintDebug" "assemble$Configuration"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Android tests, lint, or APK build failed with exit code $LASTEXITCODE."
+    }
 } finally {
     Pop-Location
 }

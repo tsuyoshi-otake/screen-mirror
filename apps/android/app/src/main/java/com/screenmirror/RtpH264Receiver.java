@@ -7,13 +7,26 @@ import android.view.Surface;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RtpH264Receiver {
+    interface Listener {
+        void onFirstPacket(String host);
+
+        void onDisconnected();
+
+        void onError(Throwable error);
+    }
+
     private static final byte[] START_CODE = new byte[]{0, 0, 0, 1};
-    private static final int SOCKET_BUFFER_SIZE = 4 * 1024 * 1024;
+    private static final int SOCKET_BUFFER_SIZE = 1024 * 1024;
+    private static final int SOCKET_TIMEOUT_MS = 250;
+    private static final int DISCONNECT_TIMEOUT_MS = 3000;
+    private static final int MAX_ASSEMBLED_NAL_SIZE = 4 * 1024 * 1024;
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -21,70 +34,161 @@ final class RtpH264Receiver {
     private final DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
     private final FuState fuState = new FuState();
     private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+    private final DisconnectWatchdog watchdog = new DisconnectWatchdog(DISCONNECT_TIMEOUT_MS);
 
+    private volatile Listener listener;
+    private volatile DatagramSocket socket;
     private Thread thread;
     private MediaCodec decoder;
     private volatile String lastSenderHost;
 
-    void start(int port, Surface surface) throws Exception {
-        stop();
-        decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080);
-        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
-        if (android.os.Build.VERSION.SDK_INT >= 30) {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
-        }
-        decoder.configure(format, surface, null, 0);
-        decoder.start();
-        running.set(true);
-        thread = new Thread(() -> receiveLoop(port), "rtp-h264-receiver");
-        thread.start();
+    void setListener(Listener listener) {
+        this.listener = listener;
     }
 
-    void stop() {
-        running.set(false);
-        if (thread != null) {
-            thread.interrupt();
-            thread = null;
-        }
-        if (decoder != null) {
-            try {
-                decoder.stop();
-            } catch (Exception ignored) {
+    synchronized void start(int port, Surface surface) throws Exception {
+        stop();
+
+        DatagramSocket localSocket = createSocket(port);
+        MediaCodec localDecoder = null;
+        try {
+            localDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080);
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
             }
-            decoder.release();
-            decoder = null;
+            localDecoder.configure(format, surface, null, 0);
+            localDecoder.start();
+        } catch (Exception error) {
+            localSocket.close();
+            if (localDecoder != null) {
+                localDecoder.release();
+            }
+            throw error;
         }
+
+        decoder = localDecoder;
+        socket = localSocket;
+        lastSenderHost = null;
         fuState.reset();
+        watchdog.reset();
+        running.set(true);
+        thread = new Thread(() -> receiveLoop(localSocket), "rtp-h264-receiver");
+        thread.start();
+        AppLog.info("video receiver started on UDP " + port);
+    }
+
+    synchronized void stop() {
+        running.set(false);
+        DatagramSocket activeSocket = socket;
+        socket = null;
+        if (activeSocket != null) {
+            activeSocket.close();
+        }
+
+        Thread worker = thread;
+        thread = null;
+        joinWorker(worker, "video receiver");
+
+        MediaCodec activeDecoder = decoder;
+        decoder = null;
+        if (activeDecoder != null) {
+            try {
+                activeDecoder.stop();
+            } catch (Exception error) {
+                AppLog.warn("video decoder stop failed", error);
+            }
+            activeDecoder.release();
+        }
+        lastSenderHost = null;
+        fuState.reset();
+        watchdog.reset();
+    }
+
+    boolean isRunning() {
+        return running.get();
     }
 
     String lastSenderHost() {
         return lastSenderHost;
     }
 
-    private void receiveLoop(int port) {
-        try (DatagramSocket socket = new DatagramSocket(null)) {
-            socket.setReuseAddress(true);
-            socket.setReceiveBufferSize(SOCKET_BUFFER_SIZE);
+    private static DatagramSocket createSocket(int port) throws Exception {
+        DatagramSocket localSocket = new DatagramSocket(null);
+        try {
+            localSocket.setReuseAddress(true);
+            localSocket.setReceiveBufferSize(SOCKET_BUFFER_SIZE);
+            localSocket.setSoTimeout(SOCKET_TIMEOUT_MS);
             try {
-                socket.setTrafficClass(DSCP_EF_TRAFFIC_CLASS);
-            } catch (Exception ignored) {
+                localSocket.setTrafficClass(DSCP_EF_TRAFFIC_CLASS);
+            } catch (SocketException error) {
+                AppLog.warn("video receiver could not set DSCP", error);
             }
-            socket.bind(new InetSocketAddress(port));
+            localSocket.bind(new InetSocketAddress(port));
+            return localSocket;
+        } catch (Exception error) {
+            localSocket.close();
+            throw error;
+        }
+    }
+
+    private void receiveLoop(DatagramSocket localSocket) {
+        try {
             while (running.get()) {
-                receivePacket.setData(receiveBuffer, 0, receiveBuffer.length);
-                socket.receive(receivePacket);
-                lastSenderHost = receivePacket.getAddress().getHostAddress();
-                if (depacketizeAndQueue(receiveBuffer, receivePacket.getLength())) {
-                    drainDecoder();
+                try {
+                    receivePacket.setData(receiveBuffer, 0, receiveBuffer.length);
+                    localSocket.receive(receivePacket);
+                    String senderHost = receivePacket.getAddress().getHostAddress();
+                    lastSenderHost = senderHost;
+                    if (watchdog.onPacket()) {
+                        AppLog.info("video packets started from " + senderHost);
+                        Listener activeListener = listener;
+                        if (activeListener != null) {
+                            activeListener.onFirstPacket(senderHost);
+                        }
+                    }
+                    if (depacketizeAndQueue(receiveBuffer, receivePacket.getLength())) {
+                        drainDecoder();
+                    }
+                } catch (SocketTimeoutException timeout) {
+                    if (watchdog.isTimedOut()) {
+                        running.set(false);
+                        AppLog.info("video receiver disconnected after packet timeout");
+                        Listener activeListener = listener;
+                        if (activeListener != null) {
+                            activeListener.onDisconnected();
+                        }
+                    }
+                } catch (SocketException error) {
+                    if (running.get()) {
+                        fail(error);
+                    }
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception error) {
+            if (running.get()) {
+                fail(error);
+            }
+        } finally {
+            localSocket.close();
+            if (socket == localSocket) {
+                socket = null;
+            }
+        }
+    }
+
+    private void fail(Throwable error) {
+        running.set(false);
+        AppLog.error("video receiver failed", error);
+        Listener activeListener = listener;
+        if (activeListener != null) {
+            activeListener.onError(error);
         }
     }
 
     private boolean depacketizeAndQueue(byte[] packet, int length) throws Exception {
-        if (length <= 12) {
+        if (length <= 12 || (packet[0] & 0xc0) != 0x80) {
             return false;
         }
 
@@ -119,7 +223,13 @@ final class RtpH264Receiver {
         if (!fuState.active) {
             return false;
         }
-        fuState.append(packet, fragmentOffset, fragmentLength);
+        try {
+            fuState.append(packet, fragmentOffset, fragmentLength);
+        } catch (IllegalArgumentException oversizedNal) {
+            fuState.reset();
+            AppLog.warn("dropped an oversized fragmented H.264 NAL", oversizedNal);
+            return false;
+        }
         if (end) {
             queueNal(fuState.data, 0, fuState.size);
             fuState.reset();
@@ -140,14 +250,17 @@ final class RtpH264Receiver {
         }
 
         ByteBuffer input = activeDecoder.getInputBuffer(index);
+        long presentationTimeUs = System.nanoTime() / 1000L;
         if (input == null || input.capacity() < length + START_CODE.length) {
+            activeDecoder.queueInputBuffer(index, 0, 0, presentationTimeUs, 0);
+            AppLog.warn("video decoder input buffer was too small", null);
             return;
         }
 
         input.clear();
         input.put(START_CODE);
         input.put(source, offset, length);
-        activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, System.nanoTime() / 1000, 0);
+        activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, presentationTimeUs, 0);
     }
 
     private void drainDecoder() {
@@ -163,6 +276,22 @@ final class RtpH264Receiver {
                 activeDecoder.releaseOutputBuffer(output, true);
             }
         } while (output >= 0);
+    }
+
+    private static void joinWorker(Thread worker, String name) {
+        if (worker == null || worker == Thread.currentThread()) {
+            return;
+        }
+        worker.interrupt();
+        try {
+            worker.join(1000L);
+            if (worker.isAlive()) {
+                AppLog.warn(name + " thread did not stop within one second", null);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            AppLog.warn("interrupted while stopping " + name, error);
+        }
     }
 
     private static final class FuState {
@@ -189,6 +318,9 @@ final class RtpH264Receiver {
         }
 
         void ensure(int length) {
+            if (length < 0 || size + (long) length > MAX_ASSEMBLED_NAL_SIZE) {
+                throw new IllegalArgumentException("fragmented NAL exceeds maximum size");
+            }
             if (size + length > data.length) {
                 data = Arrays.copyOf(data, Math.max(data.length * 2, size + length));
             }

@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">Screen Mirror</string>
+    <string name="status_idle">Status: idle</string>
+    <string name="pin_hint">PIN (4 digits)</string>
+    <string name="receive_audio">Receive Audio (Opus/RTP :5005)</string>
+    <string name="send_audio">Send Audio (Android 10+, app audio only)</string>
+    <string name="start_receiver">Start Receiver</string>
+    <string name="discover_receivers">Discover Receivers</string>
+    <string name="start_sender">Start Sender (up to 3 receivers)</string>
+    <string name="enable_touch_injection">Enable Android Touch Injection</string>
+    <string name="copy_diagnostics">Copy Diagnostics</string>
+    <string name="stop">Stop</string>
+    <string name="notification_channel_name">Screen capture</string>
+    <string name="notification_channel_description">Keeps screen mirroring active in the background</string>
+    <string name="notification_title">Screen Mirror sender</string>
+    <string name="notification_starting">Starting screen capture…</string>
+</resources>

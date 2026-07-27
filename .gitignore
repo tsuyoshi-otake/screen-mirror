@@ -4,6 +4,8 @@
 /apps/android/.gradle/
 /apps/android/app/build/
 /apps/android/local.properties
+*.jks
+*.keystore
 *.msi
 *.apk
 /assets/*.ico

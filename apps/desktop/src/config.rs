@@ -6,8 +6,15 @@ use std::path::PathBuf;
 
 use crate::pipeline::{CaptureApi, Decoder, Encoder, NvidiaTuning, RecvArgs, SendArgs, Sink};
 
+const CURRENT_CONFIG_VERSION: u32 = 2;
+const LEGACY_DEFAULT_FPS: u32 = 60;
+const LEGACY_DEFAULT_BITRATE: u32 = 12_000;
+const LEGACY_DEFAULT_UDP_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub config_version: u32,
     pub startup_mode: StartupMode,
     pub autostart: bool,
     #[serde(default)]
@@ -64,6 +71,8 @@ pub struct SendConfig {
     pub nvidia_tuning: ConfigNvidiaTuning,
     pub encoder: ConfigEncoder,
     pub capture_api: ConfigCaptureApi,
+    #[serde(default = "default_zero_copy")]
+    pub zero_copy: bool,
     pub show_cursor: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -90,7 +99,11 @@ fn default_mtu() -> u32 {
 }
 
 fn default_udp_buffer_size() -> u32 {
-    4 * 1024 * 1024
+    1024 * 1024
+}
+
+fn default_zero_copy() -> bool {
+    true
 }
 
 fn default_qos_dscp() -> i32 {
@@ -114,7 +127,7 @@ fn default_audio_frame_ms() -> String {
 }
 
 fn default_audio_jitter_ms() -> u32 {
-    15
+    5
 }
 
 fn default_jitter_faststart_packets() -> u32 {
@@ -205,6 +218,7 @@ pub enum ConfigCaptureApi {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: CURRENT_CONFIG_VERSION,
             startup_mode: StartupMode::Idle,
             autostart: true,
             security: SecurityConfig::default(),
@@ -234,8 +248,8 @@ impl Default for SendConfig {
             enable_virtual_display: true,
             sync_virtual_display_resolution: true,
             monitor_index: -1,
-            fps: 60,
-            bitrate: 12_000,
+            fps: 30,
+            bitrate: 8_000,
             mtu: default_mtu(),
             udp_buffer_size: default_udp_buffer_size(),
             qos_dscp: default_qos_dscp(),
@@ -243,6 +257,7 @@ impl Default for SendConfig {
             nvidia_tuning: ConfigNvidiaTuning::Auto,
             encoder: ConfigEncoder::Auto,
             capture_api: ConfigCaptureApi::Dxgi,
+            zero_copy: true,
             show_cursor: true,
             width: None,
             height: None,
@@ -281,10 +296,17 @@ impl AppConfig {
 
         let text = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        let config: Self = toml::from_str(&text)
+        let mut config: Self = toml::from_str(&text)
             .with_context(|| format!("failed to parse config: {}", path.display()))?;
         sm_core::discovery::normalize_pin(&config.security.pin)
             .with_context(|| format!("invalid PIN in config: {}", path.display()))?;
+        if migrate_legacy_defaults(&mut config) {
+            config.save_to(&path)?;
+            crate::logging::append(format!(
+                "config migrated to version {} with balanced sender defaults",
+                CURRENT_CONFIG_VERSION
+            ));
+        }
         Ok((config, path))
     }
 
@@ -335,6 +357,7 @@ impl From<SendConfig> for SendArgs {
             nvidia_tuning: config.nvidia_tuning.into(),
             encoder: config.encoder.into(),
             capture_api: config.capture_api.into(),
+            zero_copy: config.zero_copy,
             no_cursor: !config.show_cursor,
             width: config.width,
             height: config.height,
@@ -418,4 +441,66 @@ impl From<ConfigCaptureApi> for CaptureApi {
 pub fn config_path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("failed to resolve config directory")?;
     Ok(base.join("screen-mirror").join("config.toml"))
+}
+
+fn migrate_legacy_defaults(config: &mut AppConfig) -> bool {
+    if config.config_version >= CURRENT_CONFIG_VERSION {
+        return false;
+    }
+
+    if config.send.fps == LEGACY_DEFAULT_FPS {
+        config.send.fps = 30;
+    }
+    if config.send.bitrate == LEGACY_DEFAULT_BITRATE {
+        config.send.bitrate = 8_000;
+    }
+    if config.send.udp_buffer_size == LEGACY_DEFAULT_UDP_BUFFER_SIZE {
+        config.send.udp_buffer_size = default_udp_buffer_size();
+    }
+    if config.recv.udp_buffer_size == LEGACY_DEFAULT_UDP_BUFFER_SIZE {
+        config.recv.udp_buffer_size = default_udp_buffer_size();
+    }
+    config.config_version = CURRENT_CONFIG_VERSION;
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_defaults_migrate_to_balanced_resource_usage() {
+        let mut config = AppConfig {
+            config_version: 0,
+            ..AppConfig::default()
+        };
+        config.send.fps = LEGACY_DEFAULT_FPS;
+        config.send.bitrate = LEGACY_DEFAULT_BITRATE;
+        config.send.udp_buffer_size = LEGACY_DEFAULT_UDP_BUFFER_SIZE;
+        config.recv.udp_buffer_size = LEGACY_DEFAULT_UDP_BUFFER_SIZE;
+
+        assert!(migrate_legacy_defaults(&mut config));
+        assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(config.send.fps, 30);
+        assert_eq!(config.send.bitrate, 8_000);
+        assert_eq!(config.send.udp_buffer_size, 1024 * 1024);
+        assert_eq!(config.recv.udp_buffer_size, 1024 * 1024);
+        assert!(!migrate_legacy_defaults(&mut config));
+    }
+
+    #[test]
+    fn explicit_nondefault_values_survive_migration() {
+        let mut config = AppConfig {
+            config_version: 0,
+            ..AppConfig::default()
+        };
+        config.send.fps = 45;
+        config.send.bitrate = 10_000;
+        config.send.udp_buffer_size = 2 * 1024 * 1024;
+
+        assert!(migrate_legacy_defaults(&mut config));
+        assert_eq!(config.send.fps, 45);
+        assert_eq!(config.send.bitrate, 10_000);
+        assert_eq!(config.send.udp_buffer_size, 2 * 1024 * 1024);
+    }
 }

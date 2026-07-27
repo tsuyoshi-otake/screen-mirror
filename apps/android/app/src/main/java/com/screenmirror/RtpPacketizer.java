@@ -11,7 +11,7 @@ final class RtpPacketizer implements AutoCloseable {
     private static final int PAYLOAD_TYPE = 96;
     private static final int CLOCK_RATE = 90000;
     private static final int MTU = 1200;
-    private static final int SOCKET_BUFFER_SIZE = 4 * 1024 * 1024;
+    private static final int SOCKET_BUFFER_SIZE = 1024 * 1024;
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
     private static final int RTP_HEADER_SIZE = 12;
     private static final int FU_A_HEADER_SIZE = 2;
@@ -118,7 +118,8 @@ final class RtpPacketizer implements AutoCloseable {
             socket.setSendBufferSize(SOCKET_BUFFER_SIZE);
             try {
                 socket.setTrafficClass(DSCP_EF_TRAFFIC_CLASS);
-            } catch (Exception ignored) {
+            } catch (Exception error) {
+                AppLog.warn("video sender could not set DSCP", error);
             }
         }
         return socket;

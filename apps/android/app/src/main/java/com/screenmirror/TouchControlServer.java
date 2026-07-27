@@ -45,12 +45,23 @@ final class TouchControlServer {
     synchronized void stop() {
         running.set(false);
         DatagramSocket activeSocket = socket;
+        socket = null;
         if (activeSocket != null) {
             activeSocket.close();
         }
-        if (thread != null) {
-            thread.interrupt();
-            thread = null;
+        Thread worker = thread;
+        thread = null;
+        if (worker != null && worker != Thread.currentThread()) {
+            worker.interrupt();
+            try {
+                worker.join(1000L);
+                if (worker.isAlive()) {
+                    AppLog.warn("touch control server did not stop within one second", null);
+                }
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                AppLog.warn("interrupted while stopping touch control server", error);
+            }
         }
     }
 
@@ -68,14 +79,18 @@ final class TouchControlServer {
                     if (event != null) {
                         ScreenMirrorAccessibilityService.dispatchTouch(event);
                     }
-                } catch (SocketTimeoutException ignored) {
+                } catch (SocketTimeoutException timeout) {
+                    // Expected: the timeout makes stop/restart responsive.
                 } catch (SocketException error) {
                     if (running.get()) {
                         throw error;
                     }
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception error) {
+            if (running.get()) {
+                AppLog.error("touch control server failed", error);
+            }
         } finally {
             if (socket == localSocket) {
                 socket = null;
@@ -98,7 +113,8 @@ final class TouchControlServer {
                     clamp((float) json.getDouble("y")),
                     json.optInt("pointer_id", 0)
             );
-        } catch (Exception ignored) {
+        } catch (Exception invalidPacket) {
+            // Invalid or unauthenticated LAN control packets are deliberately discarded.
             return null;
         }
     }

@@ -262,8 +262,87 @@ Add-CommandOutput "Autostart" {
 
 Add-CommandOutput "Running Processes" {
     Get-Process screen-mirror -ErrorAction SilentlyContinue |
-        Select-Object Id, ProcessName, Path, StartTime |
+        Select-Object Id, ProcessName, Path, StartTime, CPU, WorkingSet64, PrivateMemorySize64, HandleCount |
         Format-Table -AutoSize
+}
+
+Add-CommandOutput "CPU, Memory, and GPU Usage" {
+    $processes = @(Get-Process screen-mirror -ErrorAction SilentlyContinue)
+    if ($processes.Count -eq 0) {
+        "screen-mirror.exe is not running."
+        return
+    }
+
+    $cpuBefore = @{}
+    foreach ($process in $processes) {
+        $cpuBefore[$process.Id] = $process.CPU
+    }
+    Start-Sleep -Seconds 1
+
+    $resourceRows = foreach ($process in $processes) {
+        $current = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
+        if (-not $current) {
+            continue
+        }
+        [pscustomobject]@{
+            Id = $current.Id
+            CpuPercent = [math]::Round((($current.CPU - $cpuBefore[$current.Id]) * 100 / [Environment]::ProcessorCount), 2)
+            WorkingSetMiB = [math]::Round($current.WorkingSet64 / 1MB, 1)
+            PrivateMiB = [math]::Round($current.PrivateMemorySize64 / 1MB, 1)
+            VirtualMiB = [math]::Round($current.VirtualMemorySize64 / 1MB, 1)
+            Handles = $current.HandleCount
+            Threads = $current.Threads.Count
+        }
+    }
+    $resourceRows | Format-Table -AutoSize
+
+    if (-not (Get-Command Get-Counter -ErrorAction SilentlyContinue)) {
+        "GPU performance counters are unavailable."
+        return
+    }
+
+    foreach ($process in $processes) {
+        try {
+            $memory = Get-Counter -Counter `
+                "\GPU Process Memory(pid_$($process.Id)*)\Dedicated Usage", `
+                "\GPU Process Memory(pid_$($process.Id)*)\Shared Usage" `
+                -ErrorAction Stop
+            $dedicated = @($memory.CounterSamples | Where-Object Path -Like "*\Dedicated Usage" |
+                Measure-Object CookedValue -Sum).Sum
+            $shared = @($memory.CounterSamples | Where-Object Path -Like "*\Shared Usage" |
+                Measure-Object CookedValue -Sum).Sum
+            [pscustomobject]@{
+                Id = $process.Id
+                GpuDedicatedMiB = [math]::Round($dedicated / 1MB, 1)
+                GpuSharedMiB = [math]::Round($shared / 1MB, 1)
+            } | Format-Table -AutoSize
+
+            $engines = Get-Counter -Counter `
+                "\GPU Engine(pid_$($process.Id)*)\Utilization Percentage" `
+                -SampleInterval 1 `
+                -MaxSamples 2 `
+                -ErrorAction Stop
+            $engineRows = @($engines.CounterSamples |
+                Where-Object CookedValue -GT 0.01 |
+                Group-Object InstanceName |
+                ForEach-Object {
+                    [pscustomobject]@{
+                        Id = $process.Id
+                        Engine = $_.Name
+                        MaxPercent = [math]::Round((($_.Group | Measure-Object CookedValue -Maximum).Maximum), 2)
+                        AveragePercent = [math]::Round((($_.Group | Measure-Object CookedValue -Average).Average), 2)
+                    }
+                } |
+                Sort-Object MaxPercent -Descending)
+            if ($engineRows.Count -eq 0) {
+                "No active GPU engine was observed for PID $($process.Id) during the sample."
+            } else {
+                $engineRows | Format-Table -AutoSize
+            }
+        } catch {
+            "GPU counters unavailable for PID $($process.Id): $($_.Exception.Message)"
+        }
+    }
 }
 
 Add-CommandOutput "Communication Health" {

@@ -75,6 +75,8 @@ screen-mirror.exe send --host auto --port 5004 --pin 1234
 Default sender config uses:
 
 ```toml
+config_version = 2
+
 [security]
 pin = "0000"
 
@@ -90,20 +92,21 @@ prefer_virtual_display = true
 enable_virtual_display = true
 sync_virtual_display_resolution = true
 monitor_index = -1
-fps = 60
-bitrate = 12000
+fps = 30
+bitrate = 8000
 mtu = 1200
-udp_buffer_size = 4194304
+udp_buffer_size = 1048576
 qos_dscp = -1
 allow_software_encoder = false
 nvidia_tuning = "auto"
+zero_copy = true
 
 [recv]
 audio_enabled = false
 audio_port = 5005
-audio_jitter_ms = 15
+audio_jitter_ms = 5
 jitter_ms = 15
-udp_buffer_size = 4194304
+udp_buffer_size = 1048576
 mtu = 1200
 jitter_faststart_packets = 2
 jitter_max_dropout_ms = 200
@@ -175,10 +178,14 @@ The tray menu includes `Open Virtual Display Driver Page` for manual repair/upda
 The sender uses D3D11 screen capture and prefers hardware encoders:
 
 1. `nvd3d11h264enc` for NVIDIA GeForce GTX/RTX
-2. `mfh264enc` for Windows Media Foundation hardware encoders
-3. `qsvh264enc` for Intel Quick Sync
+2. `qsvh264enc` for Intel Quick Sync
+3. `mfh264enc` for Windows Media Foundation hardware encoders
 
 By default `allow_software_encoder = false`, so `auto` will not silently fall back to CPU `x264enc`. Set it to `true` only if software fallback is acceptable.
+
+Balanced sender defaults are `30 fps`, `8000 kbit/s`, and a `1 MiB` UDP buffer. `zero_copy = true` keeps D3D11 capture textures in GPU memory through NVIDIA, Quick Sync, and D3D11-aware Media Foundation encoders, avoiding a full-frame GPU-to-RAM copy. The app checks the installed encoder caps and automatically falls back to system-memory frames when that runtime cannot accept D3D11 textures. Set `zero_copy = false` only to diagnose an older driver or cross-adapter negotiation failure. Use `60 fps` as an explicit quality/latency tradeoff; it roughly doubles capture and encode work.
+
+When a pre-v2 config still contains the old unchanged defaults (`60 fps`, `12000 kbit/s`, `4 MiB` buffers), it is migrated once to the balanced values. Nondefault user-tuned values are preserved.
 
 NVIDIA tuning:
 
@@ -297,7 +304,7 @@ audio_frame_ms = "5"
 [recv]
 audio_enabled = true
 audio_port = 5005
-audio_jitter_ms = 15
+audio_jitter_ms = 5
 ```
 
 - Sender capture: Windows WASAPI loopback via `wasapi2src`.
@@ -323,15 +330,39 @@ Build the APK:
 .\scripts\build-apk.ps1 -Configuration Debug
 ```
 
-The Android MVP includes:
+The Android implementation includes:
 
 - LAN receiver discovery compatible with the desktop app
 - Android receiver mode using `MediaCodec` AVC decode to a `SurfaceView`
 - Android sender mode using `MediaProjection` + `MediaCodec` AVC encode
+- A MediaProjection foreground service with a persistent notification and Stop action
 - Sender fan-out to up to three discovered receivers
 - Four-digit PIN pairing compatible with the desktop app
 - Touch on the Android receiver surface sends normalized control events back to the sender
 - Android sender touch injection through the bundled AccessibilityService after enabling `Screen Mirror` in Android Accessibility settings
+- A three-second video disconnect timeout that exits the stale receiver screen
+- Restart-safe UDP receiver shutdown, bounded touch-event queuing, and copyable in-app diagnostics
+- Local JVM tests for PIN handling, RTP headers, sender profile limits, and disconnect timing
+
+The build script runs `testDebugUnitTest`, `lintDebug`, and the selected APK build. The equivalent direct verification is:
+
+```powershell
+cd apps\android
+.\gradlew.bat testDebugUnitTest lintDebug assembleDebug
+```
+
+Release builds require all four signing values as Gradle properties or environment variables:
+
+```text
+SCREEN_MIRROR_KEYSTORE_FILE
+SCREEN_MIRROR_KEYSTORE_PASSWORD
+SCREEN_MIRROR_KEY_ALIAS
+SCREEN_MIRROR_KEY_PASSWORD
+```
+
+`assembleRelease` fails instead of silently producing an unsigned APK when those values are missing. Do not commit the keystore or credentials.
+
+Final distribution still requires a signed release build and bidirectional Windows/Android testing on physical Android hardware; local JVM tests cannot validate device-specific `MediaCodec`, `MediaProjection`, audio-capture, or Accessibility behavior.
 
 ## Touch Control
 
@@ -361,21 +392,22 @@ Android build requirements:
 - Use wired LAN or 5GHz/6GHz Wi-Fi
 - Keep receiver jitter low: `--jitter-ms 10` to `20`; default is `15`
 - Keep `mtu = 1200` on Wi-Fi; try `mtu = 1400` only on a clean wired LAN
-- Keep `udp_buffer_size = 4194304` for burst tolerance without building application-level latency
+- Keep `udp_buffer_size = 1048576` for low memory usage with adequate burst tolerance; raise it only after observing packet drops
 - Set `qos_dscp = 46` only if your router/switch honors DSCP; otherwise leave `-1`
 - Use GPU encode/decode where available: `nvd3d11h264enc`, `mfh264enc`, `qsvh264enc`, `d3d11h264dec`
 - Increase bitrate for desktop readability: `--bitrate 16000`
-- For lowest audio latency, keep `audio_frame_ms = "5"` or `"2.5"` and `audio_jitter_ms = 10` to `20`
+- For lowest audio latency, keep `audio_frame_ms = "5"` or `"2.5"` and `audio_jitter_ms = 5`; raise it toward `15` only if Wi-Fi causes audible dropouts
 
 ### Transfer pipeline
 
 The desktop sender uses a low-latency RTP/UDP pipeline:
 
-- D3D11 screen capture stays in GPU memory when the selected encoder accepts D3D11 input.
+- D3D11 screen capture stays in GPU memory for NVIDIA, Quick Sync, and D3D11-aware Media Foundation encoders when `zero_copy = true`.
 - Sender queues are leaky and capped at one frame so old frames are dropped instead of delayed.
 - RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.
-- UDP send/receive buffers default to `4 MiB`.
+- UDP send/receive buffers default to `1 MiB`.
 - Receiver `udpsrc` disables sender-address metadata collection to avoid unnecessary per-packet work.
+- `Run Diagnostics` records process working set/private memory, handle/thread counts, GPU process memory, and per-engine utilization samples.
 
 ## Third-Party Licensing
 
@@ -398,6 +430,6 @@ The Android packet path is optimized for the hot loop:
 
 - DRM/protected content is out of scope.
 - UDP favors latency over guaranteed delivery; unstable Wi-Fi can produce visible corruption.
-- Android sender chooses an encoder-aligned resolution from discovered receiver display metadata, capped at `1920x1080` for latency.
+- Android sender chooses an encoder-aligned resolution from discovered receiver display metadata, capped at `1920x1080@30` for balanced GPU load and latency.
 - Android sender touch injection requires manually enabling the bundled `Screen Mirror` AccessibilityService in Android system settings.
 - Desktop audio transfer is implemented for Windows sender/receiver. Android receiver audio playback and Android sender app-audio capture are implemented; Android sender audio is limited by Android's AudioPlaybackCapture rules and app opt-out behavior.

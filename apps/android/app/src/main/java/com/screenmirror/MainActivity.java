@@ -55,6 +55,8 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     private SharedPreferences preferences;
     private boolean receiverRequested;
     private boolean receiverAudioEnabled;
+    private boolean senderActive;
+    private boolean updatingAudioControls;
     private String receiverPin = Pin.DEFAULT;
 
     @Override
@@ -103,10 +105,16 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         receiveAudio = new CheckBox(this);
         receiveAudio.setText(R.string.receive_audio);
         receiveAudio.setChecked(preferences.getBoolean(PREF_RECEIVE_AUDIO, false));
+        receiveAudio.setOnCheckedChangeListener(
+                (button, enabled) -> onReceiveAudioChanged(enabled)
+        );
 
         sendAudio = new CheckBox(this);
         sendAudio.setText(R.string.send_audio);
         sendAudio.setChecked(preferences.getBoolean(PREF_SEND_AUDIO, false));
+        sendAudio.setOnCheckedChangeListener(
+                (button, enabled) -> onSendAudioChanged(enabled)
+        );
 
         Button startReceiver = button(R.string.start_receiver, view -> startReceiver());
         Button discover = button(R.string.discover_receivers, view -> discoverReceivers());
@@ -205,7 +213,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             return;
         }
         if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            setStatus("Audio permission granted; tap Start Sender again");
+            setStatus("Audio permission granted; enable Send Audio or tap Start Sender");
         } else {
             setStatus("Audio permission denied; disable Send Audio or allow it in Settings");
         }
@@ -213,9 +221,83 @@ public final class MainActivity extends Activity implements ScreenCaptureService
 
     @Override
     public void onSenderStatus(String message, boolean active) {
+        senderActive = active;
+        if (active) {
+            setSendAudioChecked(ScreenCaptureService.isAudioEnabled());
+        }
         if (!receiverRequested) {
             setStatus(message);
         }
+    }
+
+    private void onReceiveAudioChanged(boolean enabled) {
+        if (updatingAudioControls) {
+            return;
+        }
+        preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, enabled).apply();
+        if (!receiverRequested) {
+            return;
+        }
+
+        receiverAudioEnabled = enabled;
+        try {
+            if (enabled && receiver.isRunning()) {
+                audioReceiver.start(RtpOpusReceiver.DEFAULT_AUDIO_PORT);
+            } else if (!enabled) {
+                audioReceiver.stop();
+            }
+            setStatus(receiverStatus(enabled));
+            AppLog.info("receiver audio "
+                    + (enabled ? "enabled" : "disabled")
+                    + " without restarting video");
+        } catch (Exception error) {
+            receiverAudioEnabled = false;
+            audioReceiver.stop();
+            setReceiveAudioChecked(false);
+            preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, false).apply();
+            AppLog.error("receiver audio toggle failed; video remains active", error);
+            setStatus(receiverStatus(false) + " (audio change failed: "
+                    + errorMessage(error) + ")");
+        }
+    }
+
+    private void onSendAudioChanged(boolean enabled) {
+        if (updatingAudioControls) {
+            return;
+        }
+        preferences.edit().putBoolean(PREF_SEND_AUDIO, enabled).apply();
+        if (!senderActive) {
+            return;
+        }
+        if (enabled && !canSendAudio()) {
+            setSendAudioChecked(false);
+            preferences.edit().putBoolean(PREF_SEND_AUDIO, false).apply();
+            ensureAudioPermission();
+            return;
+        }
+
+        try {
+            ScreenCaptureService.setAudioEnabled(this, enabled);
+            AppLog.info("requested sender audio "
+                    + (enabled ? "enable" : "disable")
+                    + " without restarting video");
+        } catch (RuntimeException error) {
+            setSendAudioChecked(ScreenCaptureService.isAudioEnabled());
+            AppLog.error("sender audio toggle failed; video remains active", error);
+            setStatus("Sender audio change failed: " + errorMessage(error));
+        }
+    }
+
+    private void setReceiveAudioChecked(boolean enabled) {
+        updatingAudioControls = true;
+        receiveAudio.setChecked(enabled);
+        updatingAudioControls = false;
+    }
+
+    private void setSendAudioChecked(boolean enabled) {
+        updatingAudioControls = true;
+        sendAudio.setChecked(enabled);
+        updatingAudioControls = false;
     }
 
     private void configureComponentListeners() {
@@ -257,6 +339,8 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             }
             audioReceiver.stop();
             receiverAudioEnabled = false;
+            setReceiveAudioChecked(false);
+            preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, false).apply();
             setStatus(receiverStatus(false) + " (audio stopped: " + errorMessage(error) + ")");
         }));
         discovery.setListener(error -> runOnUiThread(() -> {
@@ -587,7 +671,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             return true;
         }
         requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
-        setStatus("Audio permission requested; tap Start Sender again after allowing it");
+        setStatus("Audio permission requested; enable Send Audio again after allowing it");
         return false;
     }
 

@@ -31,6 +31,7 @@ public final class ScreenCaptureService extends Service {
 
     private static final String ACTION_START = "com.screenmirror.action.START_CAPTURE";
     private static final String ACTION_STOP = "com.screenmirror.action.STOP_CAPTURE";
+    private static final String ACTION_SET_AUDIO = "com.screenmirror.action.SET_AUDIO";
     private static final String EXTRA_RESULT_CODE = "result_code";
     private static final String EXTRA_CAPTURE_DATA = "capture_data";
     private static final String EXTRA_PEERS = "peers";
@@ -42,6 +43,7 @@ public final class ScreenCaptureService extends Service {
     private static final Object STATE_LOCK = new Object();
     private static WeakReference<Listener> statusListener = new WeakReference<>(null);
     private static boolean active;
+    private static boolean currentAudioEnabled;
     private static String currentStatus = "Status: idle";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -49,6 +51,9 @@ public final class ScreenCaptureService extends Service {
     private TouchControlServer touchServer;
     private boolean foregroundStarted;
     private boolean shuttingDown;
+    private boolean audioEnabled;
+    private boolean touchEnabled;
+    private int peerCount;
 
     static void start(
             Context context,
@@ -77,8 +82,16 @@ public final class ScreenCaptureService extends Service {
     static void stop(Context context) {
         boolean stopped = context.stopService(new Intent(context, ScreenCaptureService.class));
         if (!stopped) {
+            setCurrentAudioEnabled(false);
             publishStatus("Status: idle", false);
         }
+    }
+
+    static void setAudioEnabled(Context context, boolean enabled) {
+        Intent intent = new Intent(context, ScreenCaptureService.class);
+        intent.setAction(ACTION_SET_AUDIO);
+        intent.putExtra(EXTRA_AUDIO, enabled);
+        context.startService(intent);
     }
 
     static void setListener(Listener listener) {
@@ -102,7 +115,13 @@ public final class ScreenCaptureService extends Service {
 
     static String stateDescription() {
         synchronized (STATE_LOCK) {
-            return currentStatus + "; active=" + active;
+            return currentStatus + "; active=" + active + "; audio=" + currentAudioEnabled;
+        }
+    }
+
+    static boolean isAudioEnabled() {
+        synchronized (STATE_LOCK) {
+            return currentAudioEnabled;
         }
     }
 
@@ -114,6 +133,11 @@ public final class ScreenCaptureService extends Service {
             @Override
             public void onError(Throwable error) {
                 mainHandler.post(() -> failSession("Sender failed", error));
+            }
+
+            @Override
+            public void onAudioError(Throwable error) {
+                mainHandler.post(() -> handleAudioFailure(error));
             }
 
             @Override
@@ -133,6 +157,25 @@ public final class ScreenCaptureService extends Service {
         }
         if (ACTION_STOP.equals(intent.getAction())) {
             finishSession("Status: idle");
+            return START_NOT_STICKY;
+        }
+        if (ACTION_SET_AUDIO.equals(intent.getAction())) {
+            try {
+                changeAudioTransfer(intent.getBooleanExtra(EXTRA_AUDIO, false));
+            } catch (Exception error) {
+                AppLog.error("sender audio toggle failed; video remains active", error);
+                String detail = error.getMessage() == null
+                        ? error.getClass().getSimpleName()
+                        : error.getMessage();
+                boolean videoActive = sender != null && sender.isRunning();
+                String status = videoActive
+                        ? sessionStatus() + " (audio change failed: " + detail + ")"
+                        : "Status: idle (audio change ignored: " + detail + ")";
+                publishStatus(status, videoActive);
+                if (videoActive) {
+                    updateNotification(status);
+                }
+            }
             return START_NOT_STICKY;
         }
         if (!ACTION_START.equals(intent.getAction())) {
@@ -201,7 +244,10 @@ public final class ScreenCaptureService extends Service {
         }
 
         sender.start(projection, peers, audioEnabled);
-        boolean touchEnabled = false;
+        this.audioEnabled = audioEnabled;
+        setCurrentAudioEnabled(audioEnabled);
+        peerCount = peers.size();
+        touchEnabled = false;
         try {
             touchServer.start(pin);
             touchEnabled = touchServer.isInjectingEnabled();
@@ -209,12 +255,53 @@ public final class ScreenCaptureService extends Service {
             AppLog.warn("touch control could not start; video will continue", error);
         }
 
-        String message = "Status: sending " + sender.profileDescription()
-                + " to " + peers.size() + " receiver(s)"
-                + (audioEnabled ? " with audio" : "")
-                + (touchEnabled ? " with touch" : " (enable Accessibility for touch)");
+        String message = sessionStatus();
         publishStatus(message, true);
         updateNotification(message);
+    }
+
+    private void changeAudioTransfer(boolean enabled) throws Exception {
+        if (sender == null || !sender.isRunning()) {
+            throw new IllegalStateException("screen sender is not running");
+        }
+        if (enabled
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("record audio permission is not granted");
+        }
+        sender.setAudioEnabled(enabled);
+        audioEnabled = enabled;
+        setCurrentAudioEnabled(enabled);
+        String message = sessionStatus();
+        publishStatus(message, true);
+        updateNotification(message);
+    }
+
+    private void handleAudioFailure(Throwable error) {
+        if (sender == null || !sender.isRunning()) {
+            return;
+        }
+        try {
+            sender.setAudioEnabled(false);
+        } catch (Exception cleanupError) {
+            AppLog.warn("sender audio cleanup failed; video remains active", cleanupError);
+        }
+        audioEnabled = false;
+        setCurrentAudioEnabled(false);
+        String detail = error.getMessage() == null
+                ? error.getClass().getSimpleName()
+                : error.getMessage();
+        String message = sessionStatus() + " (audio stopped: " + detail + ")";
+        publishStatus(message, true);
+        updateNotification(message);
+    }
+
+    private String sessionStatus() {
+        String profile = sender == null ? "screen" : sender.profileDescription();
+        return "Status: sending " + profile
+                + " to " + peerCount + " receiver(s)"
+                + (audioEnabled ? " with audio" : "")
+                + (touchEnabled ? " with touch" : " (enable Accessibility for touch)");
     }
 
     private void failSession(String prefix, Throwable error) {
@@ -247,6 +334,10 @@ public final class ScreenCaptureService extends Service {
         if (sender != null) {
             sender.stop();
         }
+        audioEnabled = false;
+        setCurrentAudioEnabled(false);
+        touchEnabled = false;
+        peerCount = 0;
     }
 
     private void startInForeground(String text) {
@@ -368,6 +459,12 @@ public final class ScreenCaptureService extends Service {
         }
         if (listener != null) {
             listener.onSenderStatus(message, isActive);
+        }
+    }
+
+    private static void setCurrentAudioEnabled(boolean enabled) {
+        synchronized (STATE_LOCK) {
+            currentAudioEnabled = enabled;
         }
     }
 }

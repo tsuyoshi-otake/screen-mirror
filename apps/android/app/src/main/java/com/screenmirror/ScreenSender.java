@@ -21,6 +21,8 @@ final class ScreenSender {
     interface Listener {
         void onError(Throwable error);
 
+        void onAudioError(Throwable error);
+
         void onProjectionStopped();
     }
 
@@ -40,6 +42,7 @@ final class ScreenSender {
     private final AtomicBoolean failureReported = new AtomicBoolean(false);
     private final RtpPacketizer packetizer = new RtpPacketizer();
     private final AudioSender audioSender;
+    private final ArrayList<DiscoveryAgent.Peer> activePeers = new ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private Thread thread;
@@ -52,7 +55,7 @@ final class ScreenSender {
 
     ScreenSender(Context context, Listener listener) {
         this.listener = listener;
-        this.audioSender = new AudioSender(context, this::reportFailure);
+        this.audioSender = new AudioSender(context, this::reportAudioFailure);
     }
 
     synchronized void start(MediaProjection projection, List<DiscoveryAgent.Peer> peers, boolean sendAudio) throws Exception {
@@ -60,6 +63,8 @@ final class ScreenSender {
         failureReported.set(false);
         this.projection = projection;
         ArrayList<DiscoveryAgent.Peer> targets = new ArrayList<>(peers);
+        activePeers.clear();
+        activePeers.addAll(targets);
 
         try {
             projectionCallback = new MediaProjection.Callback() {
@@ -104,10 +109,10 @@ final class ScreenSender {
                 throw new IllegalStateException("failed to create capture virtual display");
             }
             activeProfile = profile;
+            running.set(true);
             if (sendAudio) {
                 audioSender.start(projection, targets);
             }
-            running.set(true);
             thread = new Thread(() -> drainLoop(targets), "screen-sender");
             thread.start();
             AppLog.info("screen sender started " + profileDescription() + " bitrate=" + profile.bitrate);
@@ -129,10 +134,30 @@ final class ScreenSender {
         return running.get();
     }
 
+    boolean isAudioEnabled() {
+        return audioSender.isRunning();
+    }
+
+    synchronized void setAudioEnabled(boolean enabled) throws Exception {
+        if (!running.get() || projection == null) {
+            throw new IllegalStateException("screen sender is not running");
+        }
+        if (enabled) {
+            if (!audioSender.isRunning()) {
+                audioSender.start(projection, new ArrayList<>(activePeers));
+                AppLog.info("sender audio enabled without restarting video");
+            }
+        } else {
+            audioSender.stop();
+            AppLog.info("sender audio disabled without restarting video");
+        }
+    }
+
     synchronized void stop() {
         running.set(false);
         packetizer.close();
         audioSender.stop();
+        activePeers.clear();
 
         Thread worker = thread;
         thread = null;
@@ -214,6 +239,11 @@ final class ScreenSender {
         }
         AppLog.error("screen sender failed", error);
         mainHandler.post(() -> listener.onError(error));
+    }
+
+    private void reportAudioFailure(Throwable error) {
+        AppLog.error("sender audio failed; video remains active", error);
+        mainHandler.post(() -> listener.onAudioError(error));
     }
 
     private static void joinWorker(Thread worker) {

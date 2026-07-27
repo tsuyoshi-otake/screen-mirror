@@ -173,6 +173,14 @@ monitor_index = 1
 
 The tray menu includes `Open Virtual Display Driver Page` for manual repair/update.
 
+### Protected video and DRM
+
+The current sender captures a Windows display through DXGI or Windows Graphics Capture after the virtual monitor has been created. Windows intentionally prevents the Desktop Duplication API from exposing protected video content, so DRM-protected playback can appear black even when the rest of the desktop is visible. Creating a generic VDD does not remove that restriction because screen-mirror still recaptures the completed display.
+
+There is no supported capture flag that bypasses this protection. A SuperDisplay-class implementation would require a screen-mirror-owned [IddCx indirect display driver](https://learn.microsoft.com/windows-hardware/drivers/display/indirect-display-driver-model-overview) that receives and transports the display swapchain directly and correctly implements Output Protection Manager behavior, driver signing, installation, and hardware/content-protection requirements. The bundled MTT VDD is only used to create a monitor and does not expose its swapchain to this app. The current release therefore does not claim support for Netflix or other DRM-protected video. This is an architectural limitation, not an encoder or bitrate setting.
+
+Android has the equivalent platform restriction: windows marked [`FLAG_SECURE`](https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE) are excluded from screenshots, non-secure displays, and media projection. Screen Mirror does not attempt to bypass content-provider protection on either platform.
+
 ## GPU Encoding
 
 The sender uses D3D11 screen capture and prefers hardware encoders:
@@ -293,7 +301,7 @@ The Windows receiver uses GStreamer `d3d11videosink` for GPU rendering, but scre
 
 Audio transfer is optional and uses a separate low-latency Opus/RTP stream:
 
-- On each desktop endpoint, choose `Enable System Audio Transfer` from the tray menu. This updates both local sender and receiver settings and restarts the active mode.
+- On each desktop endpoint, choose `Enable System Audio Transfer` from the tray menu. Video and audio run in independent pipelines, so toggling audio starts or stops only the audio transport and keeps the active video session connected.
 - Audio must be enabled on both the sender and receiver. The tray status shows `audio on` or `audio off` for the active mode.
 
 ```toml
@@ -314,6 +322,7 @@ audio_jitter_ms = 10
 - Windows receiver playback: `opusdec` into `wasapi2sink low-latency=true`.
 - Android receiver playback: RTP/Opus packets on `:5005` are decoded with `MediaCodec` and played through low-latency `AudioTrack`. Playback starts with a 10 ms application buffer and expands in 5 ms steps only after an underrun.
 - Android sender capture: Android 10+ `AudioPlaybackCapture` records eligible app/game audio, encodes Opus with `MediaCodec`, and sends RTP/Opus to the receiver audio port.
+- Android sender and receiver audio controls also start or stop only their audio transport while video remains active.
 - Audio stays CPU-side; libopus uses its own CPU/SIMD optimizations where available.
 - Keep video on `5004` and audio on `5005` through the firewall.
 

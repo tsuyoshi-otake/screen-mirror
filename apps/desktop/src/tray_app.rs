@@ -86,6 +86,7 @@ pub fn run() -> Result<()> {
         app.poll_tray_menu_fallback();
         app.poll_update_status();
         app.reap_finished_pipeline();
+        app.reap_finished_audio_pipeline();
     });
 }
 
@@ -94,6 +95,7 @@ struct TrayApp {
     config_path: std::path::PathBuf,
     active_mode: ActiveMode,
     pipeline: Option<PipelineHandle>,
+    audio_pipeline: Option<PipelineHandle>,
     sender_supervisor: Option<crate::lan::SenderSupervisor>,
     control_server: Option<crate::control::ControlServer>,
     diagnostics_server: Option<crate::diagnostics::DiagnosticsServer>,
@@ -133,6 +135,7 @@ impl TrayApp {
             config_path,
             active_mode: ActiveMode::Idle,
             pipeline: None,
+            audio_pipeline: None,
             sender_supervisor: None,
             control_server: None,
             diagnostics_server: None,
@@ -373,14 +376,9 @@ impl TrayApp {
                 eprintln!("touch control server failed: {error:#}");
             }
         }
-        let audio_port = self
-            .config
-            .send
-            .audio_enabled
-            .then_some(self.config.send.audio_port);
         match crate::lan::Announcer::sender(
             self.config.send.port,
-            audio_port,
+            Some(self.config.send.audio_port),
             &self.config.security.pin,
         ) {
             Ok(announcer) => self.announcer = Some(announcer),
@@ -406,18 +404,39 @@ impl TrayApp {
                 return;
             }
         };
-        match pipeline::build_sender_pipeline(&args) {
-            Ok(description) => {
-                eprintln!("sender pipeline: {description}");
-                crate::logging::append(format!("sender pipeline started: target={}", args.host));
-                self.pipeline = Some(pipeline::spawn_pipeline(description));
-                self.active_mode = ActiveMode::Sender;
-                self.config.startup_mode = StartupMode::Sender;
-                self.save_config();
-                self.sync_menu();
+        let video_description = match pipeline::build_sender_video_pipeline(&args) {
+            Ok(description) => description,
+            Err(error) => {
+                self.set_error(format!("Sender start failed: {error:#}"));
+                return;
             }
-            Err(error) => self.set_error(format!("Sender start failed: {error:#}")),
+        };
+        let audio_description = if args.audio_enabled {
+            match pipeline::build_sender_audio_pipeline(&args) {
+                Ok(description) => Some(description),
+                Err(error) => {
+                    self.set_error(format!("Sender audio start failed: {error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        eprintln!("sender video pipeline: {video_description}");
+        crate::logging::append(format!("sender pipeline started: target={}", args.host));
+        self.pipeline = Some(pipeline::spawn_pipeline(video_description));
+        if let Some(description) = audio_description {
+            crate::logging::append(format!(
+                "sender audio pipeline started: target={}",
+                args.host
+            ));
+            self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
         }
+        self.active_mode = ActiveMode::Sender;
+        self.config.startup_mode = StartupMode::Sender;
+        self.save_config();
+        self.sync_menu();
     }
 
     fn start_receiver(&mut self) {
@@ -433,43 +452,64 @@ impl TrayApp {
         }
 
         let args = self.config.recv_args();
-        match pipeline::build_receiver_pipeline(&args) {
-            Ok(description) => {
-                crate::logging::append(format!("receiver pipeline: {description}"));
-                eprintln!("receiver pipeline: {description}");
-                self.pipeline = Some(pipeline::spawn_pipeline(description));
-                self.sleep_guard = Some(crate::power::SleepGuard::receiver());
-                self.render_window = Some(crate::receiver_window::RenderWindowGuard::start());
-                let audio_port = self
-                    .config
-                    .recv
-                    .audio_enabled
-                    .then_some(self.config.recv.audio_port);
-                match crate::lan::Announcer::receiver(
-                    self.config.recv.port,
-                    audio_port,
-                    &self.config.security.pin,
-                ) {
-                    Ok(announcer) => self.announcer = Some(announcer),
-                    Err(error) => {
-                        crate::logging::append(format!(
-                            "receiver discovery announce failed: {error:#}"
-                        ));
-                        eprintln!("receiver discovery announce failed: {error:#}");
-                    }
-                }
-                self.active_mode = ActiveMode::Receiver;
-                self.config.startup_mode = StartupMode::Receiver;
-                self.save_config();
-                self.sync_menu();
+        let video_description = match pipeline::build_receiver_video_pipeline(&args) {
+            Ok(description) => description,
+            Err(error) => {
+                self.set_error(format!("Receiver start failed: {error:#}"));
+                return;
             }
-            Err(error) => self.set_error(format!("Receiver start failed: {error:#}")),
+        };
+        let audio_description = if args.audio_enabled {
+            match pipeline::build_receiver_audio_pipeline(&args) {
+                Ok(description) => Some(description),
+                Err(error) => {
+                    self.set_error(format!("Receiver audio start failed: {error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        crate::logging::append(format!("receiver video pipeline: {video_description}"));
+        eprintln!("receiver video pipeline: {video_description}");
+        self.pipeline = Some(pipeline::spawn_pipeline(video_description));
+        if let Some(description) = audio_description {
+            crate::logging::append(format!("receiver audio pipeline: {description}"));
+            self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
         }
+        self.sleep_guard = Some(crate::power::SleepGuard::receiver());
+        self.render_window = Some(crate::receiver_window::RenderWindowGuard::start());
+        match crate::lan::Announcer::receiver(
+            self.config.recv.port,
+            Some(self.config.recv.audio_port),
+            &self.config.security.pin,
+        ) {
+            Ok(announcer) => self.announcer = Some(announcer),
+            Err(error) => {
+                crate::logging::append(format!("receiver discovery announce failed: {error:#}"));
+                eprintln!("receiver discovery announce failed: {error:#}");
+            }
+        }
+        self.active_mode = ActiveMode::Receiver;
+        self.config.startup_mode = StartupMode::Receiver;
+        self.save_config();
+        self.sync_menu();
     }
 
     fn stop_current(&mut self) -> Result<()> {
+        let mut first_error = None;
+        if let Some(handle) = self.audio_pipeline.take() {
+            if let Err(error) = handle.stop() {
+                first_error = Some(error);
+            }
+        }
         if let Some(handle) = self.pipeline.take() {
-            handle.stop()?;
+            if let Err(error) = handle.stop() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         if let Some(supervisor) = self.sender_supervisor.take() {
             supervisor.stop();
@@ -484,7 +524,10 @@ impl TrayApp {
         self.sleep_guard = None;
         self.active_mode = ActiveMode::Idle;
         self.sync_menu();
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn reap_finished_pipeline(&mut self) {
@@ -503,7 +546,7 @@ impl TrayApp {
 
         if result.is_ok() && self.active_mode == ActiveMode::Receiver {
             let args = self.config.recv_args();
-            match pipeline::build_receiver_pipeline(&args) {
+            match pipeline::build_receiver_video_pipeline(&args) {
                 Ok(description) => {
                     crate::logging::append(
                         "receiver stream disconnected; fullscreen closed and listener restarted",
@@ -534,12 +577,48 @@ impl TrayApp {
         if let Some(announcer) = self.announcer.take() {
             announcer.stop();
         }
+        if let Some(handle) = self.audio_pipeline.take() {
+            if let Err(error) = handle.stop() {
+                crate::logging::append(format!("audio pipeline cleanup failed: {error:#}"));
+            }
+        }
         self.render_window = None;
         self.sleep_guard = None;
         self.active_mode = ActiveMode::Idle;
         self.config.startup_mode = StartupMode::Idle;
         self.save_config();
         self.sync_menu();
+    }
+
+    fn reap_finished_audio_pipeline(&mut self) {
+        let Some(handle) = self.audio_pipeline.as_ref() else {
+            return;
+        };
+        if !handle.is_finished() {
+            return;
+        }
+
+        let result = self
+            .audio_pipeline
+            .take()
+            .map(PipelineHandle::finish)
+            .unwrap_or(Ok(()));
+        match self.active_mode {
+            ActiveMode::Sender => self.config.send.audio_enabled = false,
+            ActiveMode::Receiver => self.config.recv.audio_enabled = false,
+            ActiveMode::Idle => {}
+        }
+        self.save_config();
+        self.sync_menu();
+
+        match result {
+            Ok(()) => crate::logging::append(
+                "audio pipeline stopped independently; video session remains active",
+            ),
+            Err(error) => self.set_error(format!(
+                "Audio pipeline stopped; video session remains active: {error:#}"
+            )),
+        }
     }
 
     fn toggle_autostart(&mut self) {
@@ -572,11 +651,52 @@ impl TrayApp {
             "system audio transfer {}",
             if enabled { "enabled" } else { "disabled" }
         ));
-        match self.active_mode {
-            ActiveMode::Sender => self.start_sender(),
-            ActiveMode::Receiver => self.start_receiver(),
-            ActiveMode::Idle => self.sync_menu(),
+
+        if let Err(error) = self.apply_audio_toggle(enabled) {
+            if enabled {
+                self.config.send.audio_enabled = previous_send;
+                self.config.recv.audio_enabled = previous_recv;
+                self.save_config();
+            }
+            self.set_error(format!("Audio setting update failed: {error:#}"));
+            return;
         }
+        crate::logging::append(
+            "system audio pipeline changed without restarting the video session",
+        );
+        self.sync_menu();
+    }
+
+    fn apply_audio_toggle(&mut self, enabled: bool) -> Result<()> {
+        match self.active_mode {
+            ActiveMode::Sender => {
+                if let Some(supervisor) = self.sender_supervisor.as_ref() {
+                    return supervisor.set_audio_enabled(enabled);
+                }
+                if enabled {
+                    if self.audio_pipeline.is_none() {
+                        let args = self.config.send_args();
+                        let description = pipeline::build_sender_audio_pipeline(&args)?;
+                        self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
+                    }
+                } else if let Some(handle) = self.audio_pipeline.take() {
+                    handle.stop()?;
+                }
+            }
+            ActiveMode::Receiver => {
+                if enabled {
+                    if self.audio_pipeline.is_none() {
+                        let args = self.config.recv_args();
+                        let description = pipeline::build_receiver_audio_pipeline(&args)?;
+                        self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
+                    }
+                } else if let Some(handle) = self.audio_pipeline.take() {
+                    handle.stop()?;
+                }
+            }
+            ActiveMode::Idle => {}
+        }
+        Ok(())
     }
 
     fn check_for_updates(&self) {

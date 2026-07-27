@@ -18,8 +18,13 @@ pub struct Announcer {
 }
 
 pub struct SenderSupervisor {
-    stop: Sender<()>,
+    command: Sender<SenderSupervisorCommand>,
     thread: Option<JoinHandle<()>>,
+}
+
+enum SenderSupervisorCommand {
+    SetAudioEnabled(bool),
+    Stop,
 }
 
 struct ResolvedSender {
@@ -48,65 +53,107 @@ impl SenderPreparationState {
 
 impl SenderSupervisor {
     pub fn start(args: SendArgs) -> Self {
-        let (stop, stop_rx) = mpsc::channel();
+        let (command, command_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
             log_sender("sender supervisor started; waiting for matching receivers");
+            let mut args = args;
             let mut active_hosts = String::new();
-            let mut active_pipeline: Option<PipelineHandle> = None;
+            let mut active_video_pipeline: Option<PipelineHandle> = None;
+            let mut active_audio_pipeline: Option<PipelineHandle> = None;
             let mut detached_for_no_receivers = false;
             let mut last_receiver_seen: Option<Instant> = None;
             let mut preparation = SenderPreparationState::default();
 
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    break;
+            'supervisor: loop {
+                while let Ok(message) = command_rx.try_recv() {
+                    if apply_sender_supervisor_command(
+                        message,
+                        &mut args,
+                        &active_hosts,
+                        &mut active_audio_pipeline,
+                    ) {
+                        break 'supervisor;
+                    }
                 }
 
-                if active_pipeline
+                if active_video_pipeline
                     .as_ref()
                     .map(|handle| handle.is_finished())
                     .unwrap_or(false)
                 {
-                    if let Some(handle) = active_pipeline.take() {
+                    if let Some(handle) = active_video_pipeline.take() {
                         if let Err(error) = handle.finish() {
-                            log_sender(format!("sender pipeline stopped: {error:#}"));
+                            log_sender(format!("sender video pipeline stopped: {error:#}"));
+                        }
+                    }
+                    if let Some(handle) = active_audio_pipeline.take() {
+                        if let Err(error) = handle.stop() {
+                            log_sender(format!(
+                                "sender audio cleanup after video stop failed: {error:#}"
+                            ));
                         }
                     }
                     active_hosts.clear();
                     preparation.reset();
                 }
 
+                if active_audio_pipeline
+                    .as_ref()
+                    .map(|handle| handle.is_finished())
+                    .unwrap_or(false)
+                {
+                    if let Some(handle) = active_audio_pipeline.take() {
+                        if let Err(error) = handle.finish() {
+                            log_sender(format!(
+                                "sender audio pipeline stopped; video remains active: {error:#}"
+                            ));
+                        }
+                    }
+                }
+
                 match discover_sender_args(args.clone()) {
                     Ok(resolved) if resolved.args.host != active_hosts => {
                         last_receiver_seen = Some(Instant::now());
-                        if let Some(handle) = active_pipeline.take() {
+                        if let Some(handle) = active_audio_pipeline.take() {
                             if let Err(error) = handle.stop() {
-                                log_sender(format!("sender restart stop failed: {error:#}"));
+                                log_sender(format!("sender audio target update failed: {error:#}"));
                             }
                         }
+                        if let Some(handle) = active_video_pipeline.take() {
+                            if let Err(error) = handle.stop() {
+                                log_sender(format!("sender video target update failed: {error:#}"));
+                            }
+                        }
+                        active_hosts.clear();
                         if preparation.should_prepare(&resolved.args.host)
                             && prepare_sender_environment(&resolved)
                         {
                             detached_for_no_receivers = false;
                         }
-                        match pipeline::build_sender_pipeline(&resolved.args) {
+                        match pipeline::build_sender_video_pipeline(&resolved.args) {
                             Ok(description) => {
                                 log_sender(format!(
                                     "sender targets updated: {}",
                                     resolved.args.host
                                 ));
                                 active_hosts = resolved.args.host;
-                                active_pipeline = Some(pipeline::spawn_pipeline(description));
+                                active_video_pipeline = Some(pipeline::spawn_pipeline(description));
+                                apply_sender_audio_state(
+                                    &args,
+                                    &active_hosts,
+                                    &mut active_audio_pipeline,
+                                );
                                 detached_for_no_receivers = false;
                             }
                             Err(error) => {
-                                log_sender(format!("sender pipeline build failed: {error:#}"))
+                                log_sender(format!("sender video pipeline build failed: {error:#}"))
                             }
                         }
                     }
                     Ok(_) => {
                         detached_for_no_receivers = false;
                         last_receiver_seen = Some(Instant::now());
+                        apply_sender_audio_state(&args, &active_hosts, &mut active_audio_pipeline);
                     }
                     Err(error) => {
                         if !detached_for_no_receivers
@@ -120,14 +167,21 @@ impl SenderSupervisor {
                             thread::sleep(Duration::from_secs(1));
                             continue;
                         }
-                        if let Some(handle) = active_pipeline.take() {
+                        if let Some(handle) = active_audio_pipeline.take() {
                             if let Err(error) = handle.stop() {
                                 log_sender(format!(
-                                    "sender stop after receiver loss failed: {error:#}"
+                                    "sender audio stop after receiver loss failed: {error:#}"
                                 ));
                             }
-                            active_hosts.clear();
                         }
+                        if let Some(handle) = active_video_pipeline.take() {
+                            if let Err(error) = handle.stop() {
+                                log_sender(format!(
+                                    "sender video stop after receiver loss failed: {error:#}"
+                                ));
+                            }
+                        }
+                        active_hosts.clear();
                         if args.enable_virtual_display && !detached_for_no_receivers {
                             crate::monitors::remove_bundled_virtual_display();
                             detached_for_no_receivers = true;
@@ -139,32 +193,94 @@ impl SenderSupervisor {
                 }
 
                 for _ in 0..50 {
-                    if stop_rx.try_recv().is_ok() {
-                        if let Some(handle) = active_pipeline.take() {
-                            let _ = handle.stop();
+                    match command_rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(message) => {
+                            if apply_sender_supervisor_command(
+                                message,
+                                &mut args,
+                                &active_hosts,
+                                &mut active_audio_pipeline,
+                            ) {
+                                break 'supervisor;
+                            }
                         }
-                        return;
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break 'supervisor,
                     }
-                    thread::sleep(Duration::from_millis(100));
                 }
             }
 
-            if let Some(handle) = active_pipeline {
+            if let Some(handle) = active_audio_pipeline {
+                let _ = handle.stop();
+            }
+            if let Some(handle) = active_video_pipeline {
                 let _ = handle.stop();
             }
         });
 
         Self {
-            stop,
+            command,
             thread: Some(thread),
         }
     }
 
+    pub fn set_audio_enabled(&self, enabled: bool) -> Result<()> {
+        self.command
+            .send(SenderSupervisorCommand::SetAudioEnabled(enabled))
+            .map_err(|_| anyhow!("sender supervisor is not running"))
+    }
+
     pub fn stop(mut self) {
-        let _ = self.stop.send(());
+        let _ = self.command.send(SenderSupervisorCommand::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn apply_sender_supervisor_command(
+    message: SenderSupervisorCommand,
+    args: &mut SendArgs,
+    active_hosts: &str,
+    active_audio_pipeline: &mut Option<PipelineHandle>,
+) -> bool {
+    match message {
+        SenderSupervisorCommand::SetAudioEnabled(enabled) => {
+            args.audio_enabled = enabled;
+            apply_sender_audio_state(args, active_hosts, active_audio_pipeline);
+            false
+        }
+        SenderSupervisorCommand::Stop => true,
+    }
+}
+
+fn apply_sender_audio_state(
+    args: &SendArgs,
+    active_hosts: &str,
+    active_audio_pipeline: &mut Option<PipelineHandle>,
+) {
+    if !args.audio_enabled {
+        if let Some(handle) = active_audio_pipeline.take() {
+            if let Err(error) = handle.stop() {
+                log_sender(format!("sender audio stop failed: {error:#}"));
+            } else {
+                log_sender("sender audio stopped without restarting video");
+            }
+        }
+        return;
+    }
+    if active_hosts.is_empty() || active_audio_pipeline.is_some() {
+        return;
+    }
+
+    let mut audio_args = args.clone();
+    audio_args.host = active_hosts.to_string();
+    match pipeline::build_sender_audio_pipeline(&audio_args) {
+        Ok(description) => {
+            *active_audio_pipeline = Some(pipeline::spawn_pipeline(description));
+            log_sender("sender audio started without restarting video");
+        }
+        Err(error) => log_sender(format!("sender audio pipeline build failed: {error:#}")),
     }
 }
 
@@ -176,7 +292,7 @@ fn log_sender(message: impl AsRef<str>) {
 
 impl Drop for SenderSupervisor {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.command.send(SenderSupervisorCommand::Stop);
     }
 }
 

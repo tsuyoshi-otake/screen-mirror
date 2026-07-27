@@ -46,6 +46,10 @@ final class AudioSender {
         return android.os.Build.VERSION.SDK_INT >= 29;
     }
 
+    boolean isRunning() {
+        return running.get();
+    }
+
     synchronized void start(MediaProjection projection, List<DiscoveryAgent.Peer> peers) throws Exception {
         stop();
         if (!isSupported()) {

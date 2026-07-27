@@ -266,14 +266,21 @@ pub fn spawn_pipeline(description: String) -> PipelineHandle {
 }
 
 pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
+    let video = build_sender_video_pipeline(args)?;
+    if !args.audio_enabled {
+        return Ok(video);
+    }
+
+    Ok(format!("{video} {}", build_sender_audio_pipeline(args)?))
+}
+
+pub fn build_sender_video_pipeline(args: &SendArgs) -> Result<String> {
     ensure_positive("fps", args.fps)?;
     ensure_positive("bitrate", args.bitrate)?;
     ensure_positive("mtu", args.mtu)?;
     ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
     ensure_positive("max-receivers", args.max_receivers)?;
-    ensure_positive("audio-bitrate", args.audio_bitrate)?;
     validate_qos_dscp(args.qos_dscp)?;
-    validate_audio_frame_ms(&args.audio_frame_ms)?;
 
     if args.width.is_some() != args.height.is_some() {
         return Err(anyhow!("--width and --height must be specified together"));
@@ -359,11 +366,21 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
         args.qos_dscp
     );
 
-    if !args.audio_enabled {
-        return Ok(video);
-    }
+    Ok(video)
+}
 
-    Ok(format!("{video} {}", build_sender_audio_chain(args)?))
+pub fn build_sender_audio_pipeline(args: &SendArgs) -> Result<String> {
+    ensure_positive("audio-bitrate", args.audio_bitrate)?;
+    ensure_positive("mtu", args.mtu)?;
+    ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
+    validate_qos_dscp(args.qos_dscp)?;
+    validate_audio_frame_ms(&args.audio_frame_ms)?;
+    if args.host.trim().is_empty() || args.host.trim().eq_ignore_ascii_case("auto") {
+        return Err(anyhow!(
+            "sender host was not resolved; run discovery first or pass explicit --host"
+        ));
+    }
+    build_sender_audio_chain(args)
 }
 
 fn capture_source_for_target(
@@ -391,13 +408,21 @@ fn capture_source_for_target(
 }
 
 pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
+    let video = build_receiver_video_pipeline(args)?;
+    if !args.audio_enabled {
+        return Ok(video);
+    }
+
+    Ok(format!("{video} {}", build_receiver_audio_pipeline(args)?))
+}
+
+pub fn build_receiver_video_pipeline(args: &RecvArgs) -> Result<String> {
     ensure_positive("jitter-ms", args.jitter_ms)?;
     ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
     ensure_positive("mtu", args.mtu)?;
     ensure_positive("jitter-faststart-packets", args.jitter_faststart_packets)?;
     ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
     ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
-    ensure_positive("audio-jitter-ms", args.audio_jitter_ms)?;
 
     let decoder = select_decoder(args.decoder)?;
     let sink = select_sink(args.sink, args.fullscreen)?;
@@ -421,11 +446,14 @@ pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
         args.jitter_max_misorder_ms
     );
 
-    if !args.audio_enabled {
-        return Ok(video);
-    }
+    Ok(video)
+}
 
-    Ok(format!("{video} {}", build_receiver_audio_chain(args)?))
+pub fn build_receiver_audio_pipeline(args: &RecvArgs) -> Result<String> {
+    ensure_positive("audio-jitter-ms", args.audio_jitter_ms)?;
+    ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
+    ensure_positive("mtu", args.mtu)?;
+    build_receiver_audio_chain(args)
 }
 
 fn build_sender_audio_chain(args: &SendArgs) -> Result<String> {

@@ -7,6 +7,12 @@
     Scope="perMachine">
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Screen Mirror is already installed." />
+    <SetProperty
+      Id="REINSTALLMODE"
+      Value="amus"
+      Before="CostFinalize"
+      Sequence="both"
+      Condition="WIX_UPGRADE_DETECTED" />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="AppIcon.ico" SourceFile="$(var.StageDir)\screen-mirror.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />

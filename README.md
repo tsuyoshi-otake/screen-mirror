@@ -283,6 +283,9 @@ The Windows receiver uses GStreamer `d3d11videosink` for GPU rendering, but scre
 
 Audio transfer is optional and uses a separate low-latency Opus/RTP stream:
 
+- On each desktop endpoint, choose `Enable System Audio Transfer` from the tray menu. This updates both local sender and receiver settings and restarts the active mode.
+- Audio must be enabled on both the sender and receiver. The tray status shows `audio on` or `audio off` for the active mode.
+
 ```toml
 [send]
 audio_enabled = true

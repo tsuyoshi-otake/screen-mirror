@@ -266,6 +266,35 @@ Add-CommandOutput "Running Processes" {
         Format-Table -AutoSize
 }
 
+Add-CommandOutput "Bundled Runtime" {
+    $appRoot = Split-Path -Parent $screenMirror
+    $requiredFiles = @(
+        "glib-2.0-0.dll",
+        "gobject-2.0-0.dll",
+        "gstreamer-1.0-0.dll",
+        "lib\gstreamer-1.0\gstwasapi2.dll",
+        "lib\gstreamer-1.0\gstopus.dll",
+        "lib\gstreamer-1.0\gstrtp.dll",
+        "lib\gstreamer-1.0\gstudp.dll"
+    )
+    $rows = @($requiredFiles | ForEach-Object {
+        $path = Join-Path $appRoot $_
+        $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            File = $_
+            Status = if ($item) { "present" } else { "MISSING" }
+            Version = if ($item) { $item.VersionInfo.FileVersion } else { $null }
+            Bytes = if ($item) { $item.Length } else { $null }
+        }
+    })
+    $rows | Format-Table -AutoSize
+    if ($rows.Status -contains "MISSING") {
+        "Overall: FAIL - reinstall or repair Screen Mirror."
+    } else {
+        "Overall: OK"
+    }
+}
+
 Add-Section "Config"
 if (Test-Path -LiteralPath $configPath) {
     $configText = (Get-Content -LiteralPath $configPath -Raw).TrimEnd()

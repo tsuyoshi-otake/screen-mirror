@@ -13,6 +13,7 @@ use crate::pipeline::{self, PipelineHandle};
 const ID_START_SENDER: &str = "start-sender";
 const ID_START_RECEIVER: &str = "start-receiver";
 const ID_STOP: &str = "stop";
+const ID_TOGGLE_AUDIO: &str = "toggle-audio";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
@@ -105,6 +106,7 @@ struct TrayItems {
     start_sender: MenuItem,
     start_receiver: MenuItem,
     stop: MenuItem,
+    audio: MenuItem,
     autostart: MenuItem,
 }
 
@@ -187,6 +189,7 @@ impl TrayApp {
         menu.append(&items.start_sender)?;
         menu.append(&items.start_receiver)?;
         menu.append(&items.stop)?;
+        menu.append(&items.audio)?;
         menu.append(&sep2)?;
         menu.append(&items.autostart)?;
         menu.append(&check_update)?;
@@ -264,6 +267,7 @@ impl TrayApp {
                 self.config.startup_mode = StartupMode::Idle;
                 self.save_config();
             }
+            ID_TOGGLE_AUDIO => self.toggle_audio(),
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
             ID_RUN_DIAGNOSTICS => self.run_diagnostics(),
@@ -476,6 +480,31 @@ impl TrayApp {
         }
     }
 
+    fn toggle_audio(&mut self) {
+        let previous_send = self.config.send.audio_enabled;
+        let previous_recv = self.config.recv.audio_enabled;
+        let enabled = !(self.config.send.audio_enabled && self.config.recv.audio_enabled);
+        self.config.send.audio_enabled = enabled;
+        self.config.recv.audio_enabled = enabled;
+
+        if let Err(error) = self.config.save_to(&self.config_path) {
+            self.config.send.audio_enabled = previous_send;
+            self.config.recv.audio_enabled = previous_recv;
+            self.set_error(format!("Audio setting update failed: {error:#}"));
+            return;
+        }
+
+        crate::logging::append(format!(
+            "system audio transfer {}",
+            if enabled { "enabled" } else { "disabled" }
+        ));
+        match self.active_mode {
+            ActiveMode::Sender => self.start_sender(),
+            ActiveMode::Receiver => self.start_receiver(),
+            ActiveMode::Idle => self.sync_menu(),
+        }
+    }
+
     fn check_for_updates(&self) {
         crate::updater::start_manual_update_check(self.update_status_tx.clone());
         if let Some(items) = self.items.as_ref() {
@@ -659,17 +688,20 @@ impl TrayApp {
         match self.active_mode {
             ActiveMode::Idle => items.status.set_text("Status: stopped"),
             ActiveMode::Sender => items.status.set_text(format!(
-                "Status: sending to {}:{}",
+                "Status: sending to {}:{} ({})",
                 if self.config.send.host.eq_ignore_ascii_case("auto") {
                     "auto".to_string()
                 } else {
                     self.config.send.host.clone()
                 },
-                self.config.send.port
+                self.config.send.port,
+                audio_status(self.config.send.audio_enabled)
             )),
-            ActiveMode::Receiver => items
-                .status
-                .set_text(format!("Status: receiving on :{}", self.config.recv.port)),
+            ActiveMode::Receiver => items.status.set_text(format!(
+                "Status: receiving on :{} ({})",
+                self.config.recv.port,
+                audio_status(self.config.recv.audio_enabled)
+            )),
         }
 
         items
@@ -679,6 +711,13 @@ impl TrayApp {
             .start_receiver
             .set_enabled(self.active_mode != ActiveMode::Receiver);
         items.stop.set_enabled(self.active_mode != ActiveMode::Idle);
+        items.audio.set_text(
+            if self.config.send.audio_enabled && self.config.recv.audio_enabled {
+                "Disable System Audio Transfer"
+            } else {
+                "Enable System Audio Transfer"
+            },
+        );
         items.autostart.set_text(if self.config.autostart {
             "Disable Autostart"
         } else {
@@ -720,6 +759,7 @@ impl TrayItems {
         let start_sender = MenuItem::with_id(ID_START_SENDER, "Start as Sender", true, None);
         let start_receiver = MenuItem::with_id(ID_START_RECEIVER, "Start as Receiver", true, None);
         let stop = MenuItem::with_id(ID_STOP, "Stop", false, None);
+        let audio = MenuItem::with_id(ID_TOGGLE_AUDIO, "Enable System Audio Transfer", true, None);
         let autostart = MenuItem::with_id(
             ID_AUTOSTART,
             if autostart_enabled {
@@ -736,8 +776,17 @@ impl TrayItems {
             start_sender,
             start_receiver,
             stop,
+            audio,
             autostart,
         })
+    }
+}
+
+fn audio_status(enabled: bool) -> &'static str {
+    if enabled {
+        "audio on"
+    } else {
+        "audio off"
     }
 }
 

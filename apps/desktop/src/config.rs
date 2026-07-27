@@ -6,10 +6,14 @@ use std::path::PathBuf;
 
 use crate::pipeline::{CaptureApi, Decoder, Encoder, NvidiaTuning, RecvArgs, SendArgs, Sink};
 
-const CURRENT_CONFIG_VERSION: u32 = 2;
+const CURRENT_CONFIG_VERSION: u32 = 3;
+const BALANCED_RESOURCE_CONFIG_VERSION: u32 = 2;
+const LOW_LATENCY_AUDIO_CONFIG_VERSION: u32 = 3;
 const LEGACY_DEFAULT_FPS: u32 = 60;
 const LEGACY_DEFAULT_BITRATE: u32 = 12_000;
 const LEGACY_DEFAULT_UDP_BUFFER_SIZE: u32 = 4 * 1024 * 1024;
+const LEGACY_DEFAULT_AUDIO_FRAME_MS: &str = "5";
+const LEGACY_DEFAULT_AUDIO_JITTER_MS: [u32; 2] = [5, 15];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -123,11 +127,11 @@ fn default_audio_bitrate() -> u32 {
 }
 
 fn default_audio_frame_ms() -> String {
-    "5".to_string()
+    "2.5".to_string()
 }
 
 fn default_audio_jitter_ms() -> u32 {
-    5
+    3
 }
 
 fn default_jitter_faststart_packets() -> u32 {
@@ -303,7 +307,7 @@ impl AppConfig {
         if migrate_legacy_defaults(&mut config) {
             config.save_to(&path)?;
             crate::logging::append(format!(
-                "config migrated to version {} with balanced sender defaults",
+                "config migrated to version {} with balanced resource and low-latency audio defaults",
                 CURRENT_CONFIG_VERSION
             ));
         }
@@ -448,17 +452,27 @@ fn migrate_legacy_defaults(config: &mut AppConfig) -> bool {
         return false;
     }
 
-    if config.send.fps == LEGACY_DEFAULT_FPS {
-        config.send.fps = 30;
+    if config.config_version < BALANCED_RESOURCE_CONFIG_VERSION {
+        if config.send.fps == LEGACY_DEFAULT_FPS {
+            config.send.fps = 30;
+        }
+        if config.send.bitrate == LEGACY_DEFAULT_BITRATE {
+            config.send.bitrate = 8_000;
+        }
+        if config.send.udp_buffer_size == LEGACY_DEFAULT_UDP_BUFFER_SIZE {
+            config.send.udp_buffer_size = default_udp_buffer_size();
+        }
+        if config.recv.udp_buffer_size == LEGACY_DEFAULT_UDP_BUFFER_SIZE {
+            config.recv.udp_buffer_size = default_udp_buffer_size();
+        }
     }
-    if config.send.bitrate == LEGACY_DEFAULT_BITRATE {
-        config.send.bitrate = 8_000;
-    }
-    if config.send.udp_buffer_size == LEGACY_DEFAULT_UDP_BUFFER_SIZE {
-        config.send.udp_buffer_size = default_udp_buffer_size();
-    }
-    if config.recv.udp_buffer_size == LEGACY_DEFAULT_UDP_BUFFER_SIZE {
-        config.recv.udp_buffer_size = default_udp_buffer_size();
+    if config.config_version < LOW_LATENCY_AUDIO_CONFIG_VERSION {
+        if config.send.audio_frame_ms == LEGACY_DEFAULT_AUDIO_FRAME_MS {
+            config.send.audio_frame_ms = default_audio_frame_ms();
+        }
+        if LEGACY_DEFAULT_AUDIO_JITTER_MS.contains(&config.recv.audio_jitter_ms) {
+            config.recv.audio_jitter_ms = default_audio_jitter_ms();
+        }
     }
     config.config_version = CURRENT_CONFIG_VERSION;
     true
@@ -478,6 +492,8 @@ mod tests {
         config.send.bitrate = LEGACY_DEFAULT_BITRATE;
         config.send.udp_buffer_size = LEGACY_DEFAULT_UDP_BUFFER_SIZE;
         config.recv.udp_buffer_size = LEGACY_DEFAULT_UDP_BUFFER_SIZE;
+        config.send.audio_frame_ms = LEGACY_DEFAULT_AUDIO_FRAME_MS.to_string();
+        config.recv.audio_jitter_ms = 15;
 
         assert!(migrate_legacy_defaults(&mut config));
         assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
@@ -485,7 +501,26 @@ mod tests {
         assert_eq!(config.send.bitrate, 8_000);
         assert_eq!(config.send.udp_buffer_size, 1024 * 1024);
         assert_eq!(config.recv.udp_buffer_size, 1024 * 1024);
+        assert_eq!(config.send.audio_frame_ms, "2.5");
+        assert_eq!(config.recv.audio_jitter_ms, 3);
         assert!(!migrate_legacy_defaults(&mut config));
+    }
+
+    #[test]
+    fn version_two_audio_defaults_migrate_to_lower_latency() {
+        for legacy_jitter_ms in LEGACY_DEFAULT_AUDIO_JITTER_MS {
+            let mut config = AppConfig {
+                config_version: BALANCED_RESOURCE_CONFIG_VERSION,
+                ..AppConfig::default()
+            };
+            config.send.audio_frame_ms = LEGACY_DEFAULT_AUDIO_FRAME_MS.to_string();
+            config.recv.audio_jitter_ms = legacy_jitter_ms;
+
+            assert!(migrate_legacy_defaults(&mut config));
+            assert_eq!(config.config_version, CURRENT_CONFIG_VERSION);
+            assert_eq!(config.send.audio_frame_ms, "2.5");
+            assert_eq!(config.recv.audio_jitter_ms, 3);
+        }
     }
 
     #[test]
@@ -497,10 +532,14 @@ mod tests {
         config.send.fps = 45;
         config.send.bitrate = 10_000;
         config.send.udp_buffer_size = 2 * 1024 * 1024;
+        config.send.audio_frame_ms = "10".to_string();
+        config.recv.audio_jitter_ms = 12;
 
         assert!(migrate_legacy_defaults(&mut config));
         assert_eq!(config.send.fps, 45);
         assert_eq!(config.send.bitrate, 10_000);
         assert_eq!(config.send.udp_buffer_size, 2 * 1024 * 1024);
+        assert_eq!(config.send.audio_frame_ms, "10");
+        assert_eq!(config.recv.audio_jitter_ms, 12);
     }
 }

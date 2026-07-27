@@ -30,4 +30,10 @@ public final class RtpOpusReceiverTest {
         byte[] packet = new byte[]{0x01, 0x23, 0x45, 0x67};
         assertEquals(0x01234567, RtpOpusReceiver.readInt(packet, 0));
     }
+
+    @Test
+    public void lowLatencyOutputStartsWithTenMilliseconds() {
+        assertEquals(480, RtpOpusReceiver.audioFramesForMilliseconds(10));
+        assertEquals(1920, RtpOpusReceiver.audioBytesForMilliseconds(10));
+    }
 }

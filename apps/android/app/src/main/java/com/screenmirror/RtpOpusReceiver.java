@@ -28,6 +28,10 @@ final class RtpOpusReceiver {
     private static final int SOCKET_TIMEOUT_MS = 250;
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
     private static final int RTP_HEADER_SIZE = 12;
+    private static final int PCM_BYTES_PER_FRAME = CHANNELS * 2;
+    static final int LOW_LATENCY_BUFFER_MS = 10;
+    private static final int BUFFER_CAPACITY_MS = 20;
+    private static final int BUFFER_GROWTH_MS = 5;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final byte[] receiveBuffer = new byte[1500];
@@ -40,6 +44,9 @@ final class RtpOpusReceiver {
     private MediaCodec decoder;
     private AudioTrack audioTrack;
     private int baseTimestamp = -1;
+    private int outputBufferFrames;
+    private int lastUnderrunCount;
+    private boolean audioTrackStarted;
 
     void setListener(Listener listener) {
         this.listener = listener;
@@ -51,6 +58,7 @@ final class RtpOpusReceiver {
         DatagramSocket localSocket = createSocket(port);
         MediaCodec localDecoder = null;
         AudioTrack localTrack = null;
+        int localOutputBufferFrames = 0;
         try {
             localDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_OPUS);
             MediaFormat format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_OPUS, SAMPLE_RATE, CHANNELS);
@@ -64,7 +72,10 @@ final class RtpOpusReceiver {
                     AudioFormat.CHANNEL_OUT_STEREO,
                     AudioFormat.ENCODING_PCM_16BIT
             );
-            int targetBuffer = Math.max(minBuffer, SAMPLE_RATE * CHANNELS * 2 / 50);
+            if (minBuffer <= 0) {
+                throw new IllegalStateException("AudioTrack minimum buffer query failed with code " + minBuffer);
+            }
+            int capacityBuffer = Math.max(minBuffer, audioBytesForMilliseconds(BUFFER_CAPACITY_MS));
             localTrack = new AudioTrack.Builder()
                     .setAudioAttributes(new AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -76,9 +87,24 @@ final class RtpOpusReceiver {
                             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                             .build())
                     .setTransferMode(AudioTrack.MODE_STREAM)
-                    .setBufferSizeInBytes(targetBuffer)
+                    .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                    .setBufferSizeInBytes(capacityBuffer)
                     .build();
-            localTrack.play();
+            if (localTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+                throw new IllegalStateException("AudioTrack did not initialize");
+            }
+            int requestedFrames = audioFramesForMilliseconds(LOW_LATENCY_BUFFER_MS);
+            int configuredFrames = localTrack.setBufferSizeInFrames(requestedFrames);
+            if (configuredFrames < 0) {
+                int errorCode = configuredFrames;
+                configuredFrames = localTrack.getBufferSizeInFrames();
+                AppLog.warn(
+                        "audio output rejected the 10 ms buffer request with code "
+                                + errorCode,
+                        null
+                );
+            }
+            localOutputBufferFrames = configuredFrames;
         } catch (Exception error) {
             localSocket.close();
             if (localTrack != null) {
@@ -99,10 +125,19 @@ final class RtpOpusReceiver {
         audioTrack = localTrack;
         socket = localSocket;
         baseTimestamp = -1;
+        outputBufferFrames = localOutputBufferFrames;
+        lastUnderrunCount = 0;
+        audioTrackStarted = false;
         running.set(true);
         thread = new Thread(() -> receiveLoop(localSocket), "rtp-opus-receiver");
         thread.start();
-        AppLog.info("audio receiver started on UDP " + port);
+        AppLog.info(
+                "audio receiver started on UDP "
+                        + port
+                        + " with "
+                        + framesToMilliseconds(localOutputBufferFrames)
+                        + " ms output buffer"
+        );
     }
 
     synchronized void stop() {
@@ -140,6 +175,9 @@ final class RtpOpusReceiver {
             activeTrack.release();
         }
         baseTimestamp = -1;
+        outputBufferFrames = 0;
+        lastUnderrunCount = 0;
+        audioTrackStarted = false;
     }
 
     boolean isRunning() {
@@ -251,9 +289,19 @@ final class RtpOpusReceiver {
                     if (buffer != null && bufferInfo.size > 0) {
                         buffer.position(bufferInfo.offset);
                         buffer.limit(bufferInfo.offset + bufferInfo.size);
-                        int written = activeTrack.write(buffer, bufferInfo.size, AudioTrack.WRITE_NON_BLOCKING);
+                        boolean starting = !audioTrackStarted;
+                        if (starting) {
+                            activeTrack.play();
+                            audioTrackStarted = true;
+                        }
+                        int written = activeTrack.write(buffer, bufferInfo.size, AudioTrack.WRITE_BLOCKING);
                         if (written < 0) {
                             throw new IllegalStateException("AudioTrack write failed with code " + written);
+                        }
+                        if (starting) {
+                            lastUnderrunCount = activeTrack.getUnderrunCount();
+                        } else {
+                            adaptOutputBuffer(activeTrack);
                         }
                     }
                 } finally {
@@ -261,6 +309,48 @@ final class RtpOpusReceiver {
                 }
             }
         } while (output >= 0);
+    }
+
+    private void adaptOutputBuffer(AudioTrack activeTrack) {
+        if (!audioTrackStarted) {
+            return;
+        }
+        int underrunCount = activeTrack.getUnderrunCount();
+        if (underrunCount <= lastUnderrunCount) {
+            return;
+        }
+        lastUnderrunCount = underrunCount;
+
+        int capacityFrames = activeTrack.getBufferCapacityInFrames();
+        int requestedFrames = Math.min(
+                capacityFrames,
+                outputBufferFrames + audioFramesForMilliseconds(BUFFER_GROWTH_MS)
+        );
+        if (requestedFrames <= outputBufferFrames) {
+            return;
+        }
+        int configuredFrames = activeTrack.setBufferSizeInFrames(requestedFrames);
+        if (configuredFrames > outputBufferFrames) {
+            outputBufferFrames = configuredFrames;
+            AppLog.warn(
+                    "audio output underrun; expanded buffer to "
+                            + framesToMilliseconds(configuredFrames)
+                            + " ms",
+                    null
+            );
+        }
+    }
+
+    static int audioFramesForMilliseconds(int milliseconds) {
+        return SAMPLE_RATE * milliseconds / 1000;
+    }
+
+    static int audioBytesForMilliseconds(int milliseconds) {
+        return audioFramesForMilliseconds(milliseconds) * PCM_BYTES_PER_FRAME;
+    }
+
+    private static double framesToMilliseconds(int frames) {
+        return Math.round(frames * 1000.0 / SAMPLE_RATE * 10.0) / 10.0;
     }
 
     static int payloadOffset(byte[] packet, int length) {

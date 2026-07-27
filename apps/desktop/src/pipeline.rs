@@ -30,7 +30,7 @@ pub struct SendArgs {
     pub audio_bitrate: u32,
 
     /// Opus frame size in ms: 2.5, 5, 10, 20, 40, or 60.
-    #[arg(long, default_value = "5")]
+    #[arg(long, default_value = "2.5")]
     pub audio_frame_ms: String,
 
     /// Maximum receivers to auto-connect to when host is "auto".
@@ -125,7 +125,7 @@ pub struct RecvArgs {
     pub audio_port: u16,
 
     /// RTP audio jitter buffer latency in milliseconds.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 3)]
     pub audio_jitter_ms: u32,
 
     /// Four-digit PIN advertised for LAN discovery pairing.
@@ -437,8 +437,8 @@ fn build_sender_audio_chain(args: &SendArgs) -> Result<String> {
     require_element("multiudpsink", ())?;
     let clients = multi_udp_clients_force_port(&args.host, args.audio_port)?;
     Ok(format!(
-        "wasapi2src loopback=true low-latency=true buffer-time=10000 latency-time=2500 provide-clock=false \
-         ! queue max-size-buffers=2 max-size-time=20000000 max-size-bytes=0 leaky=downstream \
+        "wasapi2src loopback=true low-latency=true provide-clock=false \
+         ! queue max-size-buffers=1 max-size-time=5000000 max-size-bytes=0 leaky=downstream \
          ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,rate=48000,channels=2 \
          ! opusenc bitrate={} bitrate-type=cbr audio-type=restricted-lowdelay frame-size={} inband-fec=false dtx=false \
          ! rtpopuspay pt=97 mtu={} perfect-rtptime=true \
@@ -458,16 +458,16 @@ fn build_receiver_audio_chain(args: &RecvArgs) -> Result<String> {
     require_element("audioconvert", ())?;
     require_element("audioresample", ())?;
     let sink = if has_element("wasapi2sink") {
-        "wasapi2sink low-latency=true buffer-time=10000 latency-time=2500 sync=false async=false"
+        "wasapi2sink low-latency=true sync=false async=false"
     } else {
         "autoaudiosink sync=false"
     };
     Ok(format!(
         "udpsrc port={} buffer-size={} mtu={} retrieve-sender-address=false caps=\"application/x-rtp,media=(string)audio,clock-rate=(int)48000,encoding-name=(string)OPUS,payload=(int)97\" \
-         ! queue max-size-buffers=4 max-size-time=20000000 max-size-bytes=0 leaky=downstream \
-         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets=2 \
+         ! queue max-size-buffers=1 max-size-time=5000000 max-size-bytes=0 leaky=downstream \
+         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets=1 \
          ! rtpopusdepay ! opusdec plc=true \
-         ! queue max-size-buffers=2 max-size-time=10000000 max-size-bytes=0 leaky=downstream \
+         ! queue max-size-buffers=1 max-size-time=5000000 max-size-bytes=0 leaky=downstream \
          ! audioconvert ! audioresample ! {sink}",
         args.audio_port, args.udp_buffer_size, args.mtu, args.audio_jitter_ms
     ))

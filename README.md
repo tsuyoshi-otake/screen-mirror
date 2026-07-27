@@ -75,7 +75,7 @@ screen-mirror.exe send --host auto --port 5004 --pin 1234
 Default sender config uses:
 
 ```toml
-config_version = 2
+config_version = 3
 
 [security]
 pin = "0000"
@@ -86,7 +86,7 @@ port = 5004
 audio_enabled = false
 audio_port = 5005
 audio_bitrate = 96000
-audio_frame_ms = "5"
+audio_frame_ms = "2.5"
 max_receivers = 3
 prefer_virtual_display = true
 enable_virtual_display = true
@@ -104,7 +104,7 @@ zero_copy = true
 [recv]
 audio_enabled = false
 audio_port = 5005
-audio_jitter_ms = 5
+audio_jitter_ms = 3
 jitter_ms = 15
 udp_buffer_size = 1048576
 mtu = 1200
@@ -186,6 +186,8 @@ By default `allow_software_encoder = false`, so `auto` will not silently fall ba
 Balanced sender defaults are `30 fps`, `8000 kbit/s`, and a `1 MiB` UDP buffer. `zero_copy = true` keeps D3D11 capture textures in GPU memory through NVIDIA, Quick Sync, and D3D11-aware Media Foundation encoders, avoiding a full-frame GPU-to-RAM copy. The app checks the installed encoder caps and automatically falls back to system-memory frames when that runtime cannot accept D3D11 textures. Set `zero_copy = false` only to diagnose an older driver or cross-adapter negotiation failure. Use `60 fps` as an explicit quality/latency tradeoff; it roughly doubles capture and encode work.
 
 When a pre-v2 config still contains the old unchanged defaults (`60 fps`, `12000 kbit/s`, `4 MiB` buffers), it is migrated once to the balanced values. Nondefault user-tuned values are preserved.
+
+When a pre-v3 config still contains the former audio defaults (`5 ms` Opus frames and `5` or `15 ms` audio jitter), it is migrated once to `2.5 ms` frames and `3 ms` jitter. Other audio jitter values are preserved.
 
 NVIDIA tuning:
 
@@ -299,18 +301,18 @@ Audio transfer is optional and uses a separate low-latency Opus/RTP stream:
 audio_enabled = true
 audio_port = 5005
 audio_bitrate = 96000
-audio_frame_ms = "5"
+audio_frame_ms = "2.5"
 
 [recv]
 audio_enabled = true
 audio_port = 5005
-audio_jitter_ms = 5
+audio_jitter_ms = 3
 ```
 
 - Sender capture: Windows WASAPI loopback via `wasapi2src`.
 - Encoding: `opusenc audio-type=restricted-lowdelay` with configurable frame size.
 - Windows receiver playback: `opusdec` into `wasapi2sink low-latency=true`.
-- Android receiver playback: RTP/Opus packets on `:5005` are decoded with `MediaCodec` and played through `AudioTrack`.
+- Android receiver playback: RTP/Opus packets on `:5005` are decoded with `MediaCodec` and played through low-latency `AudioTrack`. Playback starts with a 10 ms application buffer and expands in 5 ms steps only after an underrun.
 - Android sender capture: Android 10+ `AudioPlaybackCapture` records eligible app/game audio, encodes Opus with `MediaCodec`, and sends RTP/Opus to the receiver audio port.
 - Audio stays CPU-side; libopus uses its own CPU/SIMD optimizations where available.
 - Keep video on `5004` and audio on `5005` through the firewall.
@@ -396,7 +398,7 @@ Android build requirements:
 - Set `qos_dscp = 46` only if your router/switch honors DSCP; otherwise leave `-1`
 - Use GPU encode/decode where available: `nvd3d11h264enc`, `mfh264enc`, `qsvh264enc`, `d3d11h264dec`
 - Increase bitrate for desktop readability: `--bitrate 16000`
-- For lowest audio latency, keep `audio_frame_ms = "5"` or `"2.5"` and `audio_jitter_ms = 5`; raise it toward `15` only if Wi-Fi causes audible dropouts
+- For lowest audio latency, keep `audio_frame_ms = "2.5"` and `audio_jitter_ms = 3`; raise jitter toward `10` to `15` only if Wi-Fi causes audible dropouts
 
 ### Transfer pipeline
 
@@ -404,6 +406,7 @@ The desktop sender uses a low-latency RTP/UDP pipeline:
 
 - D3D11 screen capture stays in GPU memory for NVIDIA, Quick Sync, and D3D11-aware Media Foundation encoders when `zero_copy = true`.
 - Sender queues are leaky and capped at one frame so old frames are dropped instead of delayed.
+- Audio uses 2.5 ms Opus frames, a one-packet queue cap, one-packet jitter-buffer fast start, and the native WASAPI low-latency mode.
 - RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.
 - UDP send/receive buffers default to `1 MiB`.
 - Receiver `udpsrc` disables sender-address metadata collection to avoid unnecessary per-packet work.

@@ -23,8 +23,8 @@ final class AudioSender {
     private static final int SAMPLE_RATE = 48_000;
     private static final int CHANNELS = 2;
     private static final int BITRATE = 96_000;
-    private static final int FRAME_MS = 5;
-    private static final int PCM_FRAME_BYTES = SAMPLE_RATE * CHANNELS * 2 * FRAME_MS / 1000;
+    static final int FRAME_SAMPLES = SAMPLE_RATE / 400;
+    static final int PCM_FRAME_BYTES = FRAME_SAMPLES * CHANNELS * 2;
 
     private final Context context;
     private final Listener listener;
@@ -112,7 +112,11 @@ final class AudioSender {
         running.set(true);
         thread = new Thread(() -> captureLoop(peers), "audio-sender");
         thread.start();
-        AppLog.info("sender audio capture started");
+        AppLog.info(
+                "sender audio capture started with "
+                        + localRecord.getBufferSizeInFrames()
+                        + "-frame buffer"
+        );
     }
 
     synchronized void stop() {

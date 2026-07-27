@@ -9,6 +9,7 @@
     <DefineConstants>$(DefineConstants);ProductVersion=$(ProductVersion);StageDir=$(StageDir)</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="WixToolset.Firewall.wixext" Version="6.0.2" />
     <PackageReference Include="WixToolset.Util.wixext" Version="6.0.2" />
   </ItemGroup>
 </Project>

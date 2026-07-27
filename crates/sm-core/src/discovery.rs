@@ -6,7 +6,9 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DISCOVERY_PORT: u16 = 47777;
+pub const DISCOVERY_PROBE_PORT: u16 = 47776;
 pub const PROTOCOL: &str = "screen-mirror.discovery";
+pub const PROBE_PROTOCOL: &str = "screen-mirror.discovery-probe";
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_PIN: &str = "0000";
 
@@ -49,6 +51,57 @@ pub enum PeerRole {
 pub struct DiscoveredPeer {
     pub announcement: PeerAnnouncement,
     pub address: Ipv4Addr,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiscoveryProbe {
+    pub protocol: String,
+    pub version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wanted_role: Option<PeerRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_hash: Option<String>,
+    pub timestamp_ms: u64,
+}
+
+impl DiscoveryProbe {
+    pub fn new(wanted_role: Option<PeerRole>, pin: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            protocol: PROBE_PROTOCOL.to_string(),
+            version: PROTOCOL_VERSION,
+            wanted_role,
+            pin_hash: pin.map(pin_hash).transpose()?,
+            timestamp_ms: now_ms(),
+        })
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).context("failed to encode discovery probe")
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let probe: Self =
+            serde_json::from_slice(bytes).context("failed to decode discovery probe")?;
+        anyhow::ensure!(
+            probe.protocol == PROBE_PROTOCOL,
+            "unexpected probe protocol"
+        );
+        anyhow::ensure!(
+            probe.version == PROTOCOL_VERSION,
+            "unsupported probe version"
+        );
+        Ok(probe)
+    }
+
+    pub fn accepts(&self, announcement: &PeerAnnouncement) -> bool {
+        !self
+            .wanted_role
+            .is_some_and(|wanted| announcement.role != wanted)
+            && !self
+                .pin_hash
+                .as_deref()
+                .is_some_and(|wanted| announcement.pin_hash.as_deref() != Some(wanted))
+    }
 }
 
 impl PeerAnnouncement {
@@ -133,6 +186,18 @@ pub fn bind_ephemeral_broadcast_socket() -> Result<UdpSocket> {
     Ok(socket)
 }
 
+pub fn bind_probe_responder_socket() -> Result<UdpSocket> {
+    let socket = UdpSocket::bind(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        DISCOVERY_PROBE_PORT,
+    ))
+    .context("failed to bind discovery probe UDP socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("failed to set discovery probe socket nonblocking")?;
+    Ok(socket)
+}
+
 pub fn broadcast(socket: &UdpSocket, announcement: &PeerAnnouncement) -> Result<()> {
     let bytes = announcement.encode()?;
     for address in broadcast_addresses()? {
@@ -186,13 +251,70 @@ pub fn discover_with_pin(
     pin: Option<&str>,
 ) -> Result<Vec<DiscoveredPeer>> {
     let wanted_pin_hash = pin.map(pin_hash).transpose()?;
-    let socket = bind_discovery_socket()?;
+    let broadcast_socket = bind_discovery_socket().ok();
+    let probe_socket = bind_ephemeral_broadcast_socket()?;
+    let probe = DiscoveryProbe::new(role, pin)?;
+    let probe_bytes = probe.encode()?;
+    let probe_targets = unicast_probe_addresses()?;
+    let broadcast_targets = broadcast_addresses()?;
     let deadline = Instant::now() + timeout;
+    let mut next_probe = Instant::now();
     let mut peers = Vec::new();
     let mut buffer = [0_u8; 2048];
 
     while Instant::now() < deadline {
-        match socket.recv_from(&mut buffer) {
+        if Instant::now() >= next_probe {
+            send_discovery_probes(
+                &probe_socket,
+                &probe_bytes,
+                &probe_targets,
+                &broadcast_targets,
+            );
+            next_probe = Instant::now() + Duration::from_secs(1);
+        }
+
+        if let Some(socket) = broadcast_socket.as_ref() {
+            receive_announcements(
+                socket,
+                &mut buffer,
+                role,
+                wanted_pin_hash.as_deref(),
+                &mut peers,
+            )?;
+        }
+        receive_announcements(
+            &probe_socket,
+            &mut buffer,
+            role,
+            wanted_pin_hash.as_deref(),
+            &mut peers,
+        )?;
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    Ok(peers)
+}
+
+fn send_discovery_probes(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    unicast_targets: &[Ipv4Addr],
+    broadcast_targets: &[Ipv4Addr],
+) {
+    for address in unicast_targets.iter().chain(broadcast_targets) {
+        let _ = socket.send_to(bytes, SocketAddrV4::new(*address, DISCOVERY_PROBE_PORT));
+    }
+}
+
+fn receive_announcements(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    role: Option<PeerRole>,
+    wanted_pin_hash: Option<&str>,
+    peers: &mut Vec<DiscoveredPeer>,
+) -> Result<()> {
+    loop {
+        match socket.recv_from(buffer) {
             Ok((len, source)) => {
                 let Ok(announcement) = PeerAnnouncement::decode(&buffer[..len]) else {
                     continue;
@@ -201,7 +323,6 @@ pub fn discover_with_pin(
                     continue;
                 }
                 if wanted_pin_hash
-                    .as_deref()
                     .is_some_and(|wanted| announcement.pin_hash.as_deref() != Some(wanted))
                 {
                     continue;
@@ -209,9 +330,10 @@ pub fn discover_with_pin(
                 let std::net::SocketAddr::V4(source) = source else {
                     continue;
                 };
-                if peers.iter().any(|peer: &DiscoveredPeer| {
-                    peer.announcement.instance_id == announcement.instance_id
-                }) {
+                if peers
+                    .iter()
+                    .any(|peer| peer.announcement.instance_id == announcement.instance_id)
+                {
                     continue;
                 }
                 peers.push(DiscoveredPeer {
@@ -219,14 +341,63 @@ pub fn discover_with_pin(
                     address: *source.ip(),
                 });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(())
             }
             Err(error) => return Err(error).context("failed to receive discovery packet"),
         }
     }
+}
 
-    Ok(peers)
+pub fn unicast_probe_addresses() -> Result<Vec<Ipv4Addr>> {
+    let mut addresses = Vec::new();
+    for interface in get_if_addrs().context("failed to enumerate network interfaces")? {
+        let IfAddr::V4(ipv4) = interface.addr else {
+            continue;
+        };
+        let ip = ipv4.ip;
+        if ip.is_loopback() || ip.is_link_local() || !is_lan_address(ip) {
+            continue;
+        }
+        append_probe_subnet(&mut addresses, ip, ipv4.netmask);
+        if addresses.len() >= 2048 {
+            break;
+        }
+    }
+    addresses.truncate(2048);
+    Ok(addresses)
+}
+
+fn append_probe_subnet(addresses: &mut Vec<Ipv4Addr>, own_ip: Ipv4Addr, netmask: Ipv4Addr) {
+    let own = u32::from(own_ip);
+    let mask = u32::from(netmask);
+    let scan_mask = if mask.count_ones() < 24 {
+        u32::from(Ipv4Addr::new(255, 255, 255, 0))
+    } else {
+        mask
+    };
+    let network = own & scan_mask;
+    let broadcast = own | !scan_mask;
+    if broadcast <= network + 1 {
+        return;
+    }
+    for candidate in (network + 1)..broadcast {
+        let candidate = Ipv4Addr::from(candidate);
+        if candidate != own_ip && !addresses.contains(&candidate) {
+            addresses.push(candidate);
+        }
+    }
+}
+
+fn is_lan_address(ip: Ipv4Addr) -> bool {
+    ip.is_private() || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
 }
 
 pub fn normalize_pin(pin: &str) -> Result<String> {
@@ -259,4 +430,47 @@ fn now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        append_probe_subnet, DiscoveryProbe, PeerAnnouncement, PeerRole, DISCOVERY_PROBE_PORT,
+    };
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn discovery_probe_round_trips_and_filters_role_and_pin() {
+        let probe = DiscoveryProbe::new(Some(PeerRole::Receiver), Some("9700")).unwrap();
+        let decoded = DiscoveryProbe::decode(&probe.encode().unwrap()).unwrap();
+        let matching = PeerAnnouncement::new("receiver-1", "receiver", PeerRole::Receiver, 5004)
+            .with_pin("9700")
+            .unwrap();
+        let wrong_role = PeerAnnouncement::new("sender-1", "sender", PeerRole::Sender, 5004)
+            .with_pin("9700")
+            .unwrap();
+        let wrong_pin = PeerAnnouncement::new("receiver-2", "receiver", PeerRole::Receiver, 5004)
+            .with_pin("0000")
+            .unwrap();
+
+        assert!(decoded.accepts(&matching));
+        assert!(!decoded.accepts(&wrong_role));
+        assert!(!decoded.accepts(&wrong_pin));
+        assert_eq!(DISCOVERY_PROBE_PORT, 47776);
+    }
+
+    #[test]
+    fn probe_scan_is_bounded_to_the_local_slash_24() {
+        let mut addresses = Vec::new();
+        append_probe_subnet(
+            &mut addresses,
+            Ipv4Addr::new(10, 255, 10, 144),
+            Ipv4Addr::new(255, 255, 0, 0),
+        );
+
+        assert_eq!(addresses.len(), 253);
+        assert!(addresses.contains(&Ipv4Addr::new(10, 255, 10, 90)));
+        assert!(!addresses.contains(&Ipv4Addr::new(10, 255, 10, 144)));
+        assert!(!addresses.contains(&Ipv4Addr::new(10, 255, 11, 1)));
+    }
 }

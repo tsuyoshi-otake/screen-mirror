@@ -28,6 +28,9 @@ const ID_OPEN_VDD: &str = "open-vdd";
 const ID_OPEN_CONFIG: &str = "open-config";
 const ID_RELOAD_CONFIG: &str = "reload-config";
 const ID_QUIT: &str = "quit";
+const TRAY_MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TRAY_RIGHT_CLICK_FALLBACK: Duration = Duration::from_millis(350);
+const TRAY_MENU_REOPEN_GUARD: Duration = Duration::from_millis(750);
 
 #[derive(Debug)]
 enum UserEvent {
@@ -48,10 +51,14 @@ pub fn run() -> Result<()> {
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |event| {
-        let _ = menu_proxy.send_event(UserEvent::Menu(event));
+        if let Err(error) = menu_proxy.send_event(UserEvent::Menu(event)) {
+            crate::logging::append(format!("failed to deliver tray menu event: {error}"));
+        }
     }));
     TrayIconEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::Tray(event));
+        if let Err(error) = proxy.send_event(UserEvent::Tray(event)) {
+            crate::logging::append(format!("failed to deliver tray icon event: {error}"));
+        }
     }));
 
     let mut app = TrayApp::new()?;
@@ -63,7 +70,7 @@ pub fn run() -> Result<()> {
     crate::logging::append("tray initialized");
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + TRAY_MENU_POLL_INTERVAL);
 
         match event {
             Event::UserEvent(UserEvent::Menu(event)) => {
@@ -76,6 +83,7 @@ pub fn run() -> Result<()> {
             _ => {}
         }
 
+        app.poll_tray_menu_fallback();
         app.poll_update_status();
         app.reap_finished_pipeline();
     });
@@ -98,6 +106,8 @@ struct TrayApp {
     menu: Option<Menu>,
     #[cfg(windows)]
     menu_owner: Option<crate::tray_menu_owner::TrayMenuOwner>,
+    pending_tray_right_click: Option<Instant>,
+    last_tray_menu_closed: Option<Instant>,
     items: Option<TrayItems>,
 }
 
@@ -135,6 +145,8 @@ impl TrayApp {
             menu: None,
             #[cfg(windows)]
             menu_owner: None,
+            pending_tray_right_click: None,
+            last_tray_menu_closed: None,
             items: None,
         })
     }
@@ -292,22 +304,53 @@ impl TrayApp {
         }
     }
 
-    fn handle_tray_event(&self, event: TrayIconEvent) {
-        if !matches!(
-            event,
+    fn handle_tray_event(&mut self, event: TrayIconEvent) {
+        match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Right,
+                button_state: MouseButtonState::Down,
+                ..
+            } => {
+                self.pending_tray_right_click = Some(Instant::now());
+                crate::logging::append("tray right button down received");
+            }
             TrayIconEvent::Click {
                 button: MouseButton::Right,
                 button_state: MouseButtonState::Up,
                 ..
+            } => {
+                self.pending_tray_right_click = None;
+                self.show_tray_menu("button-up");
             }
-        ) {
+            _ => {}
+        }
+    }
+
+    fn poll_tray_menu_fallback(&mut self) {
+        let Some(pressed_at) = self.pending_tray_right_click else {
+            return;
+        };
+        if pressed_at.elapsed() < TRAY_RIGHT_CLICK_FALLBACK {
+            return;
+        }
+        self.pending_tray_right_click = None;
+        self.show_tray_menu("button-up fallback");
+    }
+
+    fn show_tray_menu(&mut self, trigger: &str) {
+        if self
+            .last_tray_menu_closed
+            .is_some_and(|closed_at| closed_at.elapsed() < TRAY_MENU_REOPEN_GUARD)
+        {
+            crate::logging::append(format!("tray menu duplicate suppressed: trigger={trigger}"));
             return;
         }
 
-        crate::logging::append("tray right click received");
+        crate::logging::append(format!("tray right click received: trigger={trigger}"));
         #[cfg(windows)]
         if let (Some(menu), Some(owner)) = (self.menu.as_ref(), self.menu_owner.as_ref()) {
             owner.show(menu);
+            self.last_tray_menu_closed = Some(Instant::now());
         }
     }
 
@@ -325,7 +368,10 @@ impl TrayApp {
         let args = self.config.send_args();
         match crate::control::ControlServer::start(&self.config.security.pin) {
             Ok(server) => self.control_server = Some(server),
-            Err(error) => eprintln!("touch control server failed: {error:#}"),
+            Err(error) => {
+                crate::logging::append(format!("touch control server failed: {error:#}"));
+                eprintln!("touch control server failed: {error:#}");
+            }
         }
         let audio_port = self
             .config
@@ -338,7 +384,10 @@ impl TrayApp {
             &self.config.security.pin,
         ) {
             Ok(announcer) => self.announcer = Some(announcer),
-            Err(error) => eprintln!("sender discovery announce failed: {error:#}"),
+            Err(error) => {
+                crate::logging::append(format!("sender discovery announce failed: {error:#}"));
+                eprintln!("sender discovery announce failed: {error:#}");
+            }
         }
 
         if crate::lan::wants_auto_host(&args.host) {
@@ -360,6 +409,7 @@ impl TrayApp {
         match pipeline::build_sender_pipeline(&args) {
             Ok(description) => {
                 eprintln!("sender pipeline: {description}");
+                crate::logging::append(format!("sender pipeline started: target={}", args.host));
                 self.pipeline = Some(pipeline::spawn_pipeline(description));
                 self.active_mode = ActiveMode::Sender;
                 self.config.startup_mode = StartupMode::Sender;
@@ -401,7 +451,12 @@ impl TrayApp {
                     &self.config.security.pin,
                 ) {
                     Ok(announcer) => self.announcer = Some(announcer),
-                    Err(error) => eprintln!("receiver discovery announce failed: {error:#}"),
+                    Err(error) => {
+                        crate::logging::append(format!(
+                            "receiver discovery announce failed: {error:#}"
+                        ));
+                        eprintln!("receiver discovery announce failed: {error:#}");
+                    }
                 }
                 self.active_mode = ActiveMode::Receiver;
                 self.config.startup_mode = StartupMode::Receiver;
@@ -445,6 +500,25 @@ impl TrayApp {
             .take()
             .map(PipelineHandle::finish)
             .unwrap_or(Ok(()));
+
+        if result.is_ok() && self.active_mode == ActiveMode::Receiver {
+            let args = self.config.recv_args();
+            match pipeline::build_receiver_pipeline(&args) {
+                Ok(description) => {
+                    crate::logging::append(
+                        "receiver stream disconnected; fullscreen closed and listener restarted",
+                    );
+                    crate::logging::append(format!("receiver pipeline: {description}"));
+                    self.pipeline = Some(pipeline::spawn_pipeline(description));
+                    self.sync_menu();
+                    return;
+                }
+                Err(error) => {
+                    self.set_error(format!("Receiver restart failed: {error:#}"));
+                }
+            }
+        }
+
         if let Err(error) = result {
             self.set_error(format!("Pipeline stopped: {error:#}"));
         } else {

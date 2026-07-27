@@ -34,7 +34,7 @@ function Start-ElevatedSelf {
     if ($Force) {
         $arguments += "-Force"
     }
-    Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -Verb RunAs | Out-Null
+    Start-Process -FilePath "powershell.exe" -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden | Out-Null
 }
 
 function Assert-BundledFiles {

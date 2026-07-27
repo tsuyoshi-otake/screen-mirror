@@ -72,7 +72,7 @@ pub fn request_remote_report(host: Ipv4Addr, port: u16, pin: &str) -> Result<Str
     let mut stream = TcpStream::connect_timeout(&address.into(), Duration::from_secs(3))
         .with_context(|| format!("failed to connect to diagnostics endpoint {host}:{port}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(90)))
         .context("failed to set diagnostics read timeout")?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
@@ -142,7 +142,7 @@ fn handle_request(mut stream: TcpStream, expected_pin_hash: &str) -> Result<()> 
         .set_read_timeout(Some(Duration::from_secs(5)))
         .context("failed to set diagnostics server read timeout")?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
+        .set_write_timeout(Some(Duration::from_secs(60)))
         .context("failed to set diagnostics server write timeout")?;
 
     let mut bytes = Vec::new();

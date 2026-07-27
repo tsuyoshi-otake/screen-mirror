@@ -1,4 +1,6 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix
+  xmlns="http://wixtoolset.org/schemas/v4/wxs"
+  xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <Package
     Name="Screen Mirror"
     Manufacturer="tsuyoshi-otake"
@@ -30,7 +32,18 @@
       <ComponentGroupRef Id="AppComponents" />
       <ComponentGroupRef Id="RuntimeComponents" />
     </Feature>
-    <CustomAction Id="StopExistingScreenMirror" Directory="INSTALLFOLDER" ExeCommand="[SystemFolder]taskkill.exe /IM screen-mirror.exe /F" Execute="immediate" Return="ignore" Impersonate="yes" />
+    <SetProperty
+      Id="WixQuietExecCmdLine"
+      Value="&quot;[SystemFolder]taskkill.exe&quot; /IM screen-mirror.exe /F"
+      Before="StopExistingScreenMirror"
+      Sequence="execute" />
+    <CustomAction
+      Id="StopExistingScreenMirror"
+      BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+      DllEntry="WixQuietExec"
+      Execute="immediate"
+      Return="ignore"
+      Impersonate="yes" />
     <Property Id="WixUnelevatedShellExecTarget" Value="[#ScreenMirrorExe]" />
     <CustomAction
       Id="LaunchScreenMirror"
@@ -52,6 +65,12 @@
           Source="$(var.StageDir)\screen-mirror.exe"
           Name="screen-mirror.exe"
           KeyPath="yes">
+          <firewall:FirewallException
+            Id="ScreenMirrorInboundLan"
+            Name="Screen Mirror"
+            Description="Allows Screen Mirror discovery, diagnostics, touch control, video, and audio on the local network."
+            Profile="all"
+            Scope="localSubnet" />
           <Shortcut
             Id="StartMenuShortcut"
             Directory="ProgramMenuScreenMirror"

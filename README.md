@@ -12,7 +12,7 @@ Low-latency LAN screen mirroring for Windows and Android. This is not Miracast-c
 
 ## Transport Model
 
-- Discovery: UDP broadcast on port `47777`
+- Discovery: UDP broadcast on port `47777`, plus PIN-filtered local-subnet unicast probes on UDP `47776` when broadcasts are suppressed
 - Touch/control: UDP JSON on port `47778`
 - Diagnostics: TCP JSON request/report response on port `47779`
 - Video: RTP/H.264 over UDP on port `5004`
@@ -20,7 +20,7 @@ Low-latency LAN screen mirroring for Windows and Android. This is not Miracast-c
 - Pairing: sender and receiver must use the same four-digit PIN; discovery/control packets carry only a SHA-256 PIN hash
 - Sender fan-out: one sender can stream to multiple receivers with `multiudpsink`
 - Default auto-connect limit: `3` receivers, so `1:3` is the standard target
-- Reconnect: receiver advertisements repeat once per second; desktop auto sender refreshes receiver targets while running
+- Reconnect: receiver advertisements repeat once per second; after a stream disconnects, the receiver closes the render window but keeps listening and advertising for reconnection
 
 ## Desktop App
 
@@ -230,7 +230,7 @@ Build the MSI:
 .\scripts\build-msi.ps1
 ```
 
-The MSI installs `screen-mirror.exe`, the tray/start-menu icon, autostart registration, and the required GStreamer runtime DLL/plugin files.
+The MSI installs `screen-mirror.exe`, the tray/start-menu icon, autostart registration, a local-subnet Windows Firewall exception for all network profiles, and the required GStreamer runtime DLL/plugin files.
 The tray app is launched after install/update and is registered under HKCU Run for the installing Windows user.
 
 ## Diagnostics
@@ -246,7 +246,8 @@ The report includes:
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
 - Bundled VDD device status and other virtual display candidates
-- Windows display list, GStreamer probe, receiver discovery, UDP endpoints, network adapters, and related firewall rule summaries
+- Communication health verdict, Windows network profiles, active UDP/TCP endpoints, and the installed Screen Mirror firewall rule
+- Windows display list, GStreamer probe, receiver discovery, network adapters, and virtual display state
 
 ## Auto Update
 
@@ -258,7 +259,7 @@ The tray app checks GitHub Releases automatically:
 - Asset name: `ScreenMirror.msi`
 - Version lookup runs inside the Screen Mirror process over HTTPS; periodic checks only notify through the tray status and never download or start an installer
 - Selecting `Check for Updates` downloads the MSI in-process, then requests one Windows UAC approval for the per-machine update
-- Install mode: elevated hidden `msiexec.exe /i <msi> /qn /norestart`; no `cmd.exe` wrapper window
+- Install mode: elevated hidden `msiexec.exe /i <msi> /qn /norestart`; the update runner and MSI process-stop helper do not create a console window
 - The update runner waits for the exact old process ID to exit before invoking MSI
 - Failed update details and the MSI log are retained for diagnostics; no automatic install retry is scheduled
 
@@ -269,7 +270,7 @@ Receiver mode prevents the display and system from sleeping while video receptio
 - Windows receiver calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`.
 - Android receiver sets `FLAG_KEEP_SCREEN_ON` and `SurfaceView.setKeepScreenOn(true)`.
 - The sleep/display guard is released when receiver mode stops.
-- Windows receiver mode exits back to idle after video packets stop arriving, so a fullscreen receiver window is not left behind after sender disconnect.
+- After video packets stop arriving, the Windows receiver destroys the fullscreen render pipeline and immediately returns to background listening mode so the sender can reconnect without manual intervention.
 
 ## Receiver Window
 

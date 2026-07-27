@@ -28,7 +28,7 @@ $configPath = Join-Path $env:APPDATA "screen-mirror\config.toml"
 $logPath = Join-Path $env:LOCALAPPDATA "ScreenMirror\screen-mirror.log"
 $updatesPath = Join-Path $env:LOCALAPPDATA "ScreenMirror\Updates"
 $reportPath = Join-Path $env:TEMP ("ScreenMirror-diagnostics-{0}.txt" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
-$interestingPorts = @(47777, 47778, 47779, 5004, 5005)
+$interestingPorts = @(47776, 47777, 47778, 47779, 5004, 5005)
 $lines = New-Object System.Collections.Generic.List[string]
 
 function Add-Line([string] $Line = "") {
@@ -266,6 +266,79 @@ Add-CommandOutput "Running Processes" {
         Format-Table -AutoSize
 }
 
+Add-CommandOutput "Communication Health" {
+    $config = if (Test-Path -LiteralPath $configPath) {
+        Get-Content -LiteralPath $configPath -Raw
+    } else {
+        ""
+    }
+    $modeMatch = [regex]::Match($config, '(?m)^startup_mode\s*=\s*"([^"]+)"')
+    $mode = if ($modeMatch.Success) { $modeMatch.Groups[1].Value } else { "unknown" }
+    $hostMatch = [regex]::Match($config, '(?m)^host\s*=\s*"([^"]+)"')
+    $senderHost = if ($hostMatch.Success) { $hostMatch.Groups[1].Value } else { "unknown" }
+    $processes = @(Get-Process screen-mirror -ErrorAction SilentlyContinue)
+    $udp = if (Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue) {
+        @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPort -in $interestingPorts })
+    } else {
+        @()
+    }
+    $tcp = if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPort -in $interestingPorts })
+    } else {
+        @()
+    }
+    $firewall = if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+        @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.DisplayName -like "Screen Mirror*" -and
+                "$($_.Enabled)" -eq "True" -and
+                "$($_.Direction)" -eq "Inbound" -and
+                "$($_.Action)" -eq "Allow"
+            })
+    } else {
+        @()
+    }
+
+    [pscustomobject]@{
+        ConfiguredMode = $mode
+        SenderHost = $senderHost
+        ProcessCount = $processes.Count
+        DiscoveryProbeUdp47776 = @($udp | Where-Object LocalPort -eq 47776).Count -gt 0
+        DiscoveryUdp47777 = @($udp | Where-Object LocalPort -eq 47777).Count -gt 0
+        TouchUdp47778 = @($udp | Where-Object LocalPort -eq 47778).Count -gt 0
+        DiagnosticsTcp47779 = @($tcp | Where-Object LocalPort -eq 47779).Count -gt 0
+        ReceiverVideoUdp5004 = @($udp | Where-Object LocalPort -eq 5004).Count -gt 0
+        ReceiverAudioUdp5005 = @($udp | Where-Object LocalPort -eq 5005).Count -gt 0
+        FirewallInboundAllow = @($firewall).Count -gt 0
+    } | Format-List
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    if ($processes.Count -eq 0) {
+        $failures.Add("screen-mirror.exe is not running.") | Out-Null
+    }
+    if (@($tcp | Where-Object LocalPort -eq 47779).Count -eq 0) {
+        $failures.Add("diagnostics TCP 47779 is not listening.") | Out-Null
+    }
+    if ($mode -in @("sender", "receiver") -and @($udp | Where-Object LocalPort -eq 47776).Count -eq 0) {
+        $failures.Add("active mode is configured but unicast discovery UDP 47776 is not listening.") | Out-Null
+    }
+    if ($mode -eq "receiver" -and @($udp | Where-Object LocalPort -eq 5004).Count -eq 0) {
+        $failures.Add("receiver mode is configured but video UDP 5004 is not listening.") | Out-Null
+    }
+    if (@($firewall).Count -eq 0) {
+        $failures.Add("no enabled Screen Mirror inbound firewall rule was found.") | Out-Null
+    }
+
+    if ($failures.Count -eq 0) {
+        "Overall: OK"
+    } else {
+        "Overall: FAIL"
+        $failures | ForEach-Object { "- $_" }
+    }
+}
+
 Add-CommandOutput "Bundled Runtime" {
     $appRoot = Split-Path -Parent $screenMirror
     $requiredFiles = @(
@@ -396,12 +469,41 @@ Add-CommandOutput "Receiver Discovery" {
 
 Add-CommandOutput "UDP Endpoints" {
     if (Get-Command Get-NetUDPEndpoint -ErrorAction SilentlyContinue) {
-        Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
+        $endpoints = @(Get-NetUDPEndpoint -ErrorAction SilentlyContinue |
             Where-Object { $_.LocalPort -in $interestingPorts } |
-            Select-Object LocalAddress, LocalPort, OwningProcess |
-            Format-Table -AutoSize
+            Select-Object LocalAddress, LocalPort, OwningProcess)
+        if ($endpoints.Count -eq 0) {
+            "none"
+        } else {
+            $endpoints | Format-Table -AutoSize
+        }
     } else {
         netstat -ano -p udp | Select-String -Pattern ($interestingPorts -join "|")
+    }
+}
+
+Add-CommandOutput "TCP Endpoints" {
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        $endpoints = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalPort -in $interestingPorts } |
+            Select-Object LocalAddress, LocalPort, OwningProcess, State)
+        if ($endpoints.Count -eq 0) {
+            "none"
+        } else {
+            $endpoints | Format-Table -AutoSize
+        }
+    } else {
+        netstat -ano -p tcp | Select-String -Pattern ($interestingPorts -join "|")
+    }
+}
+
+Add-CommandOutput "Network Profiles" {
+    if (Get-Command Get-NetConnectionProfile -ErrorAction SilentlyContinue) {
+        Get-NetConnectionProfile -ErrorAction SilentlyContinue |
+            Select-Object InterfaceAlias, Name, NetworkCategory, IPv4Connectivity, IPv6Connectivity |
+            Format-Table -AutoSize
+    } else {
+        netsh advfirewall show currentprofile
     }
 }
 
@@ -417,10 +519,40 @@ Add-CommandOutput "Network Adapters" {
 
 Add-CommandOutput "Firewall Rules" {
     if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
-        Get-NetFirewallRule -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -match "Screen|Mirror|GStreamer" -or $_.Direction -eq "Inbound" } |
-            Select-Object -First 80 DisplayName, Enabled, Direction, Action, Profile |
-            Format-Table -AutoSize
+        $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like "Screen Mirror*" })
+        if ($rules.Count -eq 0) {
+            "Overall: FAIL - no Screen Mirror firewall rule is installed."
+            "Expected: enabled inbound allow rule for the Screen Mirror executable on the local subnet."
+            return
+        }
+
+        $rows = foreach ($rule in $rules) {
+            $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+            $port = $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+            $address = $rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+            [pscustomobject]@{
+                DisplayName = $rule.DisplayName
+                Enabled = $rule.Enabled
+                Direction = $rule.Direction
+                Action = $rule.Action
+                Profile = $rule.Profile
+                Program = $application.Program
+                Protocol = $port.Protocol
+                LocalPort = $port.LocalPort
+                RemoteAddress = $address.RemoteAddress
+            }
+        }
+        $rows | Format-List
+
+        $usable = @($rules | Where-Object {
+            $_.Enabled -eq "True" -and $_.Direction -eq "Inbound" -and $_.Action -eq "Allow"
+        })
+        if ($usable.Count -eq 0) {
+            "Overall: FAIL - Screen Mirror has no enabled inbound allow rule."
+        } else {
+            "Overall: OK - Screen Mirror has an enabled inbound allow rule."
+        }
     } else {
         netsh advfirewall show currentprofile
     }

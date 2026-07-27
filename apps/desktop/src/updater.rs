@@ -398,7 +398,7 @@ try {
 } catch {
     Write-UpdateFailure $_.Exception.Message 1
     if (Test-Path -LiteralPath $CurrentExe) {
-        Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
+        Start-Process -FilePath $CurrentExe -ArgumentList "tray" -WindowStyle Hidden | Out-Null
     }
     exit 1
 }
@@ -406,7 +406,7 @@ try {
 if ($process.ExitCode -ne 0) {
     Write-UpdateFailure "msiexec failed." $process.ExitCode
     if (Test-Path -LiteralPath $CurrentExe) {
-        Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
+        Start-Process -FilePath $CurrentExe -ArgumentList "tray" -WindowStyle Hidden | Out-Null
     }
     exit $process.ExitCode
 }
@@ -418,9 +418,9 @@ $running = @(Get-Process screen-mirror -ErrorAction SilentlyContinue)
 if ($running.Count -eq 0) {
     $installedExe = Join-Path $env:ProgramFiles "Screen Mirror\screen-mirror.exe"
     if (Test-Path -LiteralPath $installedExe) {
-        Start-Process -FilePath $installedExe -ArgumentList "tray" | Out-Null
+        Start-Process -FilePath $installedExe -ArgumentList "tray" -WindowStyle Hidden | Out-Null
     } elseif (Test-Path -LiteralPath $CurrentExe) {
-        Start-Process -FilePath $CurrentExe -ArgumentList "tray" | Out-Null
+        Start-Process -FilePath $CurrentExe -ArgumentList "tray" -WindowStyle Hidden | Out-Null
     }
 }
 "#

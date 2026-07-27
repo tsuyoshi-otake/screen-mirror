@@ -50,6 +50,7 @@ impl SenderSupervisor {
     pub fn start(args: SendArgs) -> Self {
         let (stop, stop_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
+            log_sender("sender supervisor started; waiting for matching receivers");
             let mut active_hosts = String::new();
             let mut active_pipeline: Option<PipelineHandle> = None;
             let mut detached_for_no_receivers = false;
@@ -68,7 +69,7 @@ impl SenderSupervisor {
                 {
                     if let Some(handle) = active_pipeline.take() {
                         if let Err(error) = handle.finish() {
-                            eprintln!("sender pipeline stopped: {error:#}");
+                            log_sender(format!("sender pipeline stopped: {error:#}"));
                         }
                     }
                     active_hosts.clear();
@@ -80,7 +81,7 @@ impl SenderSupervisor {
                         last_receiver_seen = Some(Instant::now());
                         if let Some(handle) = active_pipeline.take() {
                             if let Err(error) = handle.stop() {
-                                eprintln!("sender restart stop failed: {error:#}");
+                                log_sender(format!("sender restart stop failed: {error:#}"));
                             }
                         }
                         if preparation.should_prepare(&resolved.args.host)
@@ -90,12 +91,17 @@ impl SenderSupervisor {
                         }
                         match pipeline::build_sender_pipeline(&resolved.args) {
                             Ok(description) => {
-                                eprintln!("sender targets updated: {}", resolved.args.host);
+                                log_sender(format!(
+                                    "sender targets updated: {}",
+                                    resolved.args.host
+                                ));
                                 active_hosts = resolved.args.host;
                                 active_pipeline = Some(pipeline::spawn_pipeline(description));
                                 detached_for_no_receivers = false;
                             }
-                            Err(error) => eprintln!("sender pipeline build failed: {error:#}"),
+                            Err(error) => {
+                                log_sender(format!("sender pipeline build failed: {error:#}"))
+                            }
                         }
                     }
                     Ok(_) => {
@@ -107,16 +113,18 @@ impl SenderSupervisor {
                             && last_receiver_seen
                                 .is_some_and(|last_seen| last_seen.elapsed() < RECEIVER_LOSS_GRACE)
                         {
-                            eprintln!(
+                            log_sender(format!(
                                 "receiver rediscovery missed; keeping sender pipeline for {}s: {error:#}",
                                 RECEIVER_LOSS_GRACE.as_secs()
-                            );
+                            ));
                             thread::sleep(Duration::from_secs(1));
                             continue;
                         }
                         if let Some(handle) = active_pipeline.take() {
                             if let Err(error) = handle.stop() {
-                                eprintln!("sender stop after receiver loss failed: {error:#}");
+                                log_sender(format!(
+                                    "sender stop after receiver loss failed: {error:#}"
+                                ));
                             }
                             active_hosts.clear();
                         }
@@ -126,7 +134,7 @@ impl SenderSupervisor {
                             last_receiver_seen = None;
                             preparation.reset();
                         }
-                        eprintln!("waiting for receivers: {error:#}");
+                        log_sender(format!("waiting for receivers: {error:#}"));
                     }
                 }
 
@@ -160,6 +168,12 @@ impl SenderSupervisor {
     }
 }
 
+fn log_sender(message: impl AsRef<str>) {
+    let message = message.as_ref();
+    eprintln!("{message}");
+    crate::logging::append(message);
+}
+
 impl Drop for SenderSupervisor {
     fn drop(&mut self) {
         let _ = self.stop.send(());
@@ -185,15 +199,66 @@ impl Announcer {
         if let Some(display) = crate::monitors::primary_display_info() {
             announcement = announcement.with_display(display);
         }
+        let announcement_bytes = announcement.encode()?;
+        let probe_socket = match discovery::bind_probe_responder_socket() {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                crate::logging::append(format!(
+                    "discovery unicast responder unavailable: {error:#}"
+                ));
+                None
+            }
+        };
         let (stop, stop_rx) = mpsc::channel();
-        let thread = thread::spawn(move || loop {
-            if stop_rx.try_recv().is_ok() {
-                break;
+        let thread = thread::spawn(move || {
+            let mut next_broadcast = Instant::now();
+            let mut buffer = [0_u8; 2048];
+            let mut logged_unicast_response = false;
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+
+                if Instant::now() >= next_broadcast {
+                    if let Err(error) = discovery::broadcast(&socket, &announcement) {
+                        crate::logging::append(format!("discovery broadcast failed: {error:#}"));
+                        eprintln!("discovery broadcast failed: {error:#}");
+                    }
+                    next_broadcast = Instant::now() + Duration::from_secs(1);
+                }
+
+                if let Some(probe_socket) = probe_socket.as_ref() {
+                    loop {
+                        match probe_socket.recv_from(&mut buffer) {
+                            Ok((length, source)) => {
+                                let Ok(probe) =
+                                    discovery::DiscoveryProbe::decode(&buffer[..length])
+                                else {
+                                    continue;
+                                };
+                                if probe.accepts(&announcement) {
+                                    let _ = probe_socket.send_to(&announcement_bytes, source);
+                                    if !logged_unicast_response {
+                                        crate::logging::append(format!(
+                                            "discovery unicast response sent to {source}"
+                                        ));
+                                        logged_unicast_response = true;
+                                    }
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => {
+                                crate::logging::append(format!(
+                                    "discovery unicast responder failed: {error}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(50));
             }
-            if let Err(error) = discovery::broadcast(&socket, &announcement) {
-                eprintln!("discovery broadcast failed: {error:#}");
-            }
-            thread::sleep(Duration::from_secs(1));
         });
 
         Ok(Self {

@@ -946,6 +946,13 @@ mod tests {
     }
 
     #[test]
+    fn native_video_caps_do_not_force_a_receiver_aspect_ratio() {
+        let caps = video_caps(30, None, None, true);
+        assert!(!caps.contains("width="));
+        assert!(!caps.contains("height="));
+    }
+
+    #[test]
     fn receiver_h264_loss_recovery_drops_damaged_frames_without_extra_buffering() {
         assert_eq!(VIDEO_RTP_JITTER_LOSS_SIGNAL, "do-lost=true");
         assert!(VIDEO_H264_DEPAY_LOSS_RECOVERY.contains("wait-for-keyframe=true"));

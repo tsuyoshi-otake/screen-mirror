@@ -493,17 +493,17 @@ fn stable_unique_receivers(mut receivers: Vec<DiscoveredPeer>) -> Vec<Discovered
     receivers
 }
 
+/// Preserve the capture source's native mode unless the user explicitly requested output caps.
+///
+/// A receiver's display dimensions are only a target for VDD mode sync. Using them as encoder
+/// caps stretches the source when Windows cannot apply that mode (for example, a 1366x768 VDD
+/// paired with a portrait phone).
 fn effective_video_size(
     width: Option<u32>,
     height: Option<u32>,
-    display: Option<&DisplayInfo>,
+    _receiver_display: Option<&DisplayInfo>,
 ) -> (Option<u32>, Option<u32>) {
-    if width.is_some() || height.is_some() {
-        return (width, height);
-    }
-    display
-        .map(|display| (Some(display.width), Some(display.height)))
-        .unwrap_or((None, None))
+    (width, height)
 }
 
 /// Gives every receiver its own virtual display, so a second phone joining gets a new desktop
@@ -678,25 +678,16 @@ mod tests {
     }
 
     #[test]
-    fn each_receiver_gets_its_own_video_size_unless_the_user_overrides_it() {
+    fn receiver_display_size_never_overrides_capture_native_size() {
         let portrait = DisplayInfo {
             width: 720,
             height: 1604,
             refresh_hz: Some(60),
         };
-        let landscape = DisplayInfo {
-            width: 1366,
-            height: 768,
-            refresh_hz: Some(60),
-        };
 
         assert_eq!(
             effective_video_size(None, None, Some(&portrait)),
-            (Some(720), Some(1604))
-        );
-        assert_eq!(
-            effective_video_size(None, None, Some(&landscape)),
-            (Some(1366), Some(768))
+            (None, None)
         );
         assert_eq!(
             effective_video_size(Some(1920), Some(1080), Some(&portrait)),

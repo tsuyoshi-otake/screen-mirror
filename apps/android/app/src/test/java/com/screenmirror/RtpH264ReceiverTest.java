@@ -108,21 +108,12 @@ public final class RtpH264ReceiverTest {
     }
 
     @Test
-    public void sequenceGapDropsRestOfDamagedAccessUnitUntilNextIdr() throws Exception {
+    public void sequenceGapDoesNotPauseFollowingFrames() throws Exception {
         assertTrue(receiver.depacketizeAndQueue(h264Packet(10, 100, (byte) 0x65), 13));
-        assertFalse(receiver.isAwaitingKeyFrame());
-
-        // Packet 11 was lost. Packets 12 and 13 belong to the same access unit, including an
-        // IDR-looking NAL, so neither may reopen the decoder.
-        assertFalse(receiver.depacketizeAndQueue(h264Packet(12, 100, (byte) 0x65), 13));
-        assertFalse(receiver.depacketizeAndQueue(h264Packet(13, 100, (byte) 0x65), 13));
-        assertTrue(receiver.isAwaitingKeyFrame());
-
-        // A later P-frame stays discarded; a complete new IDR is the recovery point.
+        // A loss in an unrelated single-NAL packet must not freeze the receiver until the next
+        // key frame. Fragmented NALs retain their own stricter sequence guard below.
+        assertTrue(receiver.depacketizeAndQueue(h264Packet(12, 100, (byte) 0x61), 13));
         assertTrue(receiver.depacketizeAndQueue(h264Packet(14, 200, (byte) 0x61), 13));
-        assertTrue(receiver.isAwaitingKeyFrame());
-        assertTrue(receiver.depacketizeAndQueue(h264Packet(15, 300, (byte) 0x65), 13));
-        assertFalse(receiver.isAwaitingKeyFrame());
     }
 
     @Test
@@ -130,19 +121,16 @@ public final class RtpH264ReceiverTest {
         assertFalse(receiver.depacketizeAndQueue(fuPacket(20, 500, true, false, (byte) 0x11), 15));
         // Sequence 21 is absent. Its end fragment must not be emitted as a damaged IDR NAL.
         assertFalse(receiver.depacketizeAndQueue(fuPacket(22, 500, false, true, (byte) 0x22), 15));
-        assertTrue(receiver.isAwaitingKeyFrame());
 
-        assertTrue(receiver.depacketizeAndQueue(h264Packet(23, 600, (byte) 0x65), 13));
-        assertFalse(receiver.isAwaitingKeyFrame());
+        // A fresh FU-A starts a clean NAL immediately; no key-frame wait is introduced.
+        assertFalse(receiver.depacketizeAndQueue(fuPacket(23, 600, true, false, (byte) 0x33), 15));
+        assertTrue(receiver.depacketizeAndQueue(fuPacket(24, 600, false, true, (byte) 0x44), 15));
     }
 
     @Test
-    public void sequenceWrapDoesNotLookLikePacketLoss() throws Exception {
-        assertTrue(receiver.depacketizeAndQueue(h264Packet(0xffff, 700, (byte) 0x65), 13));
-        assertFalse(receiver.isAwaitingKeyFrame());
-
-        assertTrue(receiver.depacketizeAndQueue(h264Packet(0, 800, (byte) 0x61), 13));
-        assertFalse(receiver.isAwaitingKeyFrame());
+    public void fragmentedNalSequenceCanWrap() throws Exception {
+        assertFalse(receiver.depacketizeAndQueue(fuPacket(0xffff, 700, true, false, (byte) 0x11), 15));
+        assertTrue(receiver.depacketizeAndQueue(fuPacket(0, 700, false, true, (byte) 0x22), 15));
     }
 
     private static byte[] stapA(byte[]... nals) {

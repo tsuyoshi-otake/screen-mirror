@@ -33,7 +33,6 @@ final class RtpH264Receiver {
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
     private static final int NAL_TYPE_IDR = 5;
     private static final int NAL_TYPE_SPS = 7;
-    private static final int NAL_TYPE_PPS = 8;
     private static final int NAL_TYPE_STAP_A = 24;
     private static final int NAL_TYPE_FU_A = 28;
     private static final int RTP_HEADER_SIZE = 12;
@@ -64,13 +63,6 @@ final class RtpH264Receiver {
     private int reportedVideoHeight;
     private int reportedBufferWidth;
     private int reportedBufferHeight;
-    // No reordering buffer is intentional: late fragments are discarded rather than increasing
-    // latency or contaminating a decoded access unit.
-    private int expectedSequence = -1;
-    private int lastRtpTimestamp;
-    private boolean hasLastRtpTimestamp;
-    private boolean droppingAccessUnit;
-    private int droppedAccessUnitTimestamp;
     private volatile String lastSenderHost;
 
     RtpH264Receiver() {
@@ -111,7 +103,7 @@ final class RtpH264Receiver {
         }
         socket = localSocket;
         lastSenderHost = null;
-        resetPacketTracking();
+        fuState.reset();
         watchdog.reset();
         streamLock.reset();
         running.set(true);
@@ -134,7 +126,7 @@ final class RtpH264Receiver {
 
         releaseDecoder();
         lastSenderHost = null;
-        resetPacketTracking();
+        fuState.reset();
         watchdog.reset();
         streamLock.reset();
     }
@@ -352,81 +344,26 @@ final class RtpH264Receiver {
     }
 
     private void resyncForStreamTakeover() {
-        resetPacketTracking();
+        fuState.reset();
         synchronized (decoderLock) {
             awaitingKeyFrame = true;
             renderedAFrame = false;
         }
     }
 
-    private void resetPacketTracking() {
-        fuState.reset();
-        expectedSequence = -1;
-        hasLastRtpTimestamp = false;
-        droppingAccessUnit = false;
-    }
-
-    /** Marks a sequence gap as damage and prevents the rest of that access unit from rendering. */
-    private void notePacketSequence(RtpHeader header) {
-        if (expectedSequence >= 0 && header.sequence != expectedSequence) {
-            boolean sameAccessUnit = hasLastRtpTimestamp && header.timestamp == lastRtpTimestamp;
-            AppLog.warn("RTP sequence gap: expected " + expectedSequence + ", got " + header.sequence,
-                    null);
-            fuState.reset();
-            synchronized (decoderLock) {
-                awaitingKeyFrame = true;
-            }
-            if (sameAccessUnit) {
-                droppingAccessUnit = true;
-                droppedAccessUnitTimestamp = header.timestamp;
-            }
-        }
-        expectedSequence = (header.sequence + 1) & 0xffff;
-        lastRtpTimestamp = header.timestamp;
-        hasLastRtpTimestamp = true;
-    }
-
-    private boolean shouldDropAccessUnit(int timestamp) {
-        if (!droppingAccessUnit) {
-            return false;
-        }
-        if (timestamp == droppedAccessUnitTimestamp) {
-            return true;
-        }
-        droppingAccessUnit = false;
-        return false;
-    }
-
-    private void discardIncompleteNal(int timestamp) {
-        fuState.reset();
-        discardAccessUnit(timestamp);
-    }
-
-    private void discardAccessUnit(int timestamp) {
-        droppingAccessUnit = true;
-        droppedAccessUnitTimestamp = timestamp;
-        synchronized (decoderLock) {
-            awaitingKeyFrame = true;
-        }
-    }
-
     private boolean depacketizeAndQueue(byte[] packet, RtpHeader header) throws Exception {
-        notePacketSequence(header);
-        if (shouldDropAccessUnit(header.timestamp)) {
-            return false;
-        }
         int payloadOffset = header.payloadOffset;
         int payloadLength = header.payloadLength;
 
         int nalType = packet[payloadOffset] & 0x1f;
         if (nalType >= 1 && nalType <= 23) {
-            queueNal(packet, payloadOffset, payloadLength, header.timestamp);
+            queueNal(packet, payloadOffset, payloadLength);
             return true;
         }
 
         // The sender aggregates its parameter sets, so a stream without STAP-A support never decodes.
         if (nalType == NAL_TYPE_STAP_A) {
-            return queueAggregatedNals(packet, payloadOffset + 1, payloadLength - 1, header.timestamp);
+            return queueAggregatedNals(packet, payloadOffset + 1, payloadLength - 1);
         }
 
         if (nalType != NAL_TYPE_FU_A || payloadLength < 3) {
@@ -442,29 +379,25 @@ final class RtpH264Receiver {
         int fragmentLength = payloadLength - 2;
 
         if (start) {
-            if (fuState.active) {
-                // The unfinished NAL is corrupt. Without an access-unit buffer, conservatively
-                // drop this whole timestamp instead of combining an unknown new slice with it.
-                discardIncompleteNal(header.timestamp);
-                return false;
-            }
             fuState.reset();
-            fuState.start((byte) reconstructedHeader, header.timestamp);
+            fuState.start((byte) reconstructedHeader, header.timestamp, header.sequence);
         }
         if (!fuState.active || fuState.timestamp != header.timestamp
-                || fuState.nalHeader != (byte) reconstructedHeader) {
-            discardIncompleteNal(header.timestamp);
+                || fuState.nalHeader != (byte) reconstructedHeader
+                || (!start && fuState.expectedSequence != header.sequence)) {
+            fuState.reset();
             return false;
         }
         try {
             fuState.append(packet, fragmentOffset, fragmentLength);
+            fuState.expectedSequence = (header.sequence + 1) & 0xffff;
         } catch (IllegalArgumentException oversizedNal) {
-            discardIncompleteNal(header.timestamp);
+            fuState.reset();
             AppLog.warn("dropped an oversized fragmented H.264 NAL", oversizedNal);
             return false;
         }
         if (end) {
-            queueNal(fuState.data, 0, fuState.size, header.timestamp);
+            queueNal(fuState.data, 0, fuState.size);
             fuState.reset();
             return true;
         }
@@ -472,7 +405,7 @@ final class RtpH264Receiver {
     }
 
     /** Unpacks a STAP-A packet: a series of 2-byte lengths, each followed by one whole NAL unit. */
-    private boolean queueAggregatedNals(byte[] packet, int offset, int available, int timestamp) {
+    private boolean queueAggregatedNals(byte[] packet, int offset, int available) {
         boolean queued = false;
         int cursor = offset;
         int end = offset + available;
@@ -486,29 +419,27 @@ final class RtpH264Receiver {
                 }
                 break;
             }
-            queueNal(packet, cursor, size, timestamp);
+            queueNal(packet, cursor, size);
             cursor += size;
             queued = true;
         }
         return queued;
     }
 
-    private void queueNal(byte[] source, int offset, int length, int timestamp) {
+    private void queueNal(byte[] source, int offset, int length) {
         if (length <= 0) {
             return;
         }
         int nalType = source[offset] & 0x1f;
 
         synchronized (decoderLock) {
-            // A fresh codec chokes on data that starts mid-picture. Parameter sets are needed
-            // before an IDR, but are not themselves a recovery point after a packet loss.
+            // A fresh codec chokes on data that starts mid-picture, so wait for a parameter
+            // set or IDR only when the decoder itself has been restarted.
             if (awaitingKeyFrame) {
-                if (nalType != NAL_TYPE_SPS && nalType != NAL_TYPE_PPS && nalType != NAL_TYPE_IDR) {
+                if (nalType != NAL_TYPE_SPS && nalType != NAL_TYPE_IDR) {
                     return;
                 }
-                if (nalType == NAL_TYPE_IDR) {
-                    awaitingKeyFrame = false;
-                }
+                awaitingKeyFrame = false;
             }
             MediaCodec activeDecoder = decoder;
             if (activeDecoder == null) {
@@ -519,7 +450,7 @@ final class RtpH264Receiver {
                 int index = activeDecoder.dequeueInputBuffer(10_000);
                 if (index < 0) {
                     // Half a picture is worse than none: resync on the next key frame instead.
-                    discardAccessUnit(timestamp);
+                    awaitingKeyFrame = true;
                     return;
                 }
 
@@ -527,7 +458,6 @@ final class RtpH264Receiver {
                 long presentationTimeUs = System.nanoTime() / 1000L;
                 if (input == null || input.capacity() < length + START_CODE.length) {
                     activeDecoder.queueInputBuffer(index, 0, 0, presentationTimeUs, 0);
-                    discardAccessUnit(timestamp);
                     AppLog.warn("video decoder input buffer was too small", null);
                     return;
                 }
@@ -538,15 +468,7 @@ final class RtpH264Receiver {
                 activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, presentationTimeUs, 0);
             } catch (IllegalStateException error) {
                 restartDecoderLocked(error);
-                discardAccessUnit(timestamp);
             }
-        }
-    }
-
-    // Visible for testing: validates recovery state without requiring an Android MediaCodec.
-    boolean isAwaitingKeyFrame() {
-        synchronized (decoderLock) {
-            return awaitingKeyFrame;
         }
     }
 
@@ -752,11 +674,13 @@ final class RtpH264Receiver {
         boolean active = false;
         byte nalHeader;
         int timestamp;
+        int expectedSequence;
 
-        void start(byte header, int timestamp) {
+        void start(byte header, int timestamp, int sequence) {
             reset();
             nalHeader = header;
             this.timestamp = timestamp;
+            expectedSequence = (sequence + 1) & 0xffff;
             append(header);
         }
 
@@ -778,6 +702,7 @@ final class RtpH264Receiver {
             active = false;
             nalHeader = 0;
             timestamp = 0;
+            expectedSequence = 0;
         }
 
         void ensure(int length) {

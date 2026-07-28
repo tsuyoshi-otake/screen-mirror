@@ -32,6 +32,22 @@ public final class RtpOpusReceiverTest {
     }
 
     @Test
+    public void gainStaysWithinTheSupportedRange() {
+        assertEquals(0f, RtpOpusReceiver.clampGain(-1f), 0.0001f);
+        assertEquals(0f, RtpOpusReceiver.clampGain(Float.NaN), 0.0001f);
+        assertEquals(1.5f, RtpOpusReceiver.clampGain(1.5f), 0.0001f);
+        assertEquals(RtpOpusReceiver.MAX_GAIN, RtpOpusReceiver.clampGain(9f), 0.0001f);
+    }
+
+    @Test
+    public void gainAboveUnityMapsToMillibels() {
+        assertEquals(0, RtpOpusReceiver.gainToMillibels(0.5f));
+        assertEquals(0, RtpOpusReceiver.gainToMillibels(1f));
+        assertEquals(602, RtpOpusReceiver.gainToMillibels(2f));
+        assertEquals(1204, RtpOpusReceiver.gainToMillibels(4f));
+    }
+
+    @Test
     public void lowLatencyOutputStartsWithTenMilliseconds() {
         assertEquals(480, RtpOpusReceiver.audioFramesForMilliseconds(10));
         assertEquals(1920, RtpOpusReceiver.audioBytesForMilliseconds(10));

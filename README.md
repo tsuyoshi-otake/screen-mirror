@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.37`.
+The desktop and Android package versions for this release are `0.1.38`.
 
 ## Transport Model
 
@@ -142,13 +142,7 @@ fullscreen = true
 
 For a SuperDisplay-like extended desktop workflow, screen-mirror uses Virtual Display Driver (VDD) as the Windows virtual monitor and streams that display.
 
-The MSI bundles the signed VDD Driver Only package and `devcon.exe` from the official VDD Control release under the install directory. Use the tray menu item `Install/Repair Virtual Display Driver` to run an idempotent install:
-
-```powershell
-devcon.exe install "vdd\MttVDD.inf" Root\MttVDD
-```
-
-This launches the driver install through UAC and creates the root-enumerated MTT VDD display device only if one does not already exist. Depending on Windows/driver state, the instance can appear as `ROOT\DISPLAY\...` with an attached `DISPLAY\MTT1337\...` monitor. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
+The MSI bundles the signed VDD Driver Only package under the install directory. Use the tray menu item `Install/Repair Virtual Display Driver` to run an idempotent install. The app drives SetupAPI directly - no PowerShell and no `devcon.exe` - so the install runs through UAC in a hidden child process and creates the root-enumerated MTT VDD display device only if one does not already exist. Depending on Windows/driver state, the instance can appear as `ROOT\DISPLAY\...` with an attached `DISPLAY\MTT1337\...` monitor. `pnputil /add-driver` alone is not enough because it only stages/updates matching devices. If driver installation is blocked by policy or times out, install/update VDD manually from <https://github.com/VirtualDrivers/Virtual-Display-Driver/releases> or run:
 
 ```powershell
 winget install --id=VirtualDrivers.Virtual-Display-Driver -e
@@ -161,10 +155,10 @@ Runtime behavior:
 3. Start the desktop sender.
 4. With `host = "auto"`, the sender waits until at least one receiver with a matching PIN is discovered.
 5. After a matching receiver is found, the sender ensures the bundled MTT VDD device exists. It requests Windows extended-display mode only when that display is not already capture-ready.
-6. Sender mode prefers the bundled MTT VDD display for capture. Other virtual displays are fallback candidates, but SuperDisplay is not auto-selected for Screen Mirror capture.
-7. If the bundled MTT VDD virtual monitor is visible, the sender tries to match its resolution to the first receiver.
+6. The sender then grows the driver to one virtual monitor per receiver (`<monitors><count>` in `C:\VirtualDisplayDriver\vdd_settings.xml`, applied by restarting the device) and gives every receiver its own display and its own video pipeline. If fewer displays materialize than receivers, the extra receivers share the last one and the log says so.
+7. Each virtual display is matched to the resolution of the receiver that shows it.
 8. When auto sender mode loses every matching receiver beyond the disconnect grace period, it requests bundled VDD removal once so the virtual display is not left in Windows while disconnected.
-9. Repeated receiver discovery does not rerun PowerShell, VDD removal, or `DisplaySwitch.exe`; those operations run only when the receiver set changes.
+9. Repeated receiver discovery does not rerun the driver actions or `DisplaySwitch.exe`; those operations run only when the receiver set changes.
 10. With `prefer_virtual_display = true` and `monitor_index = -1`, the sender captures that virtual monitor and falls back to the primary monitor if none is found.
 
 Use the tray menu to show, enable, disable, or remove all bundled MTT VDD devices and monitors. If repeated installs created two or more virtual displays, the remove action deletes every bundled MTT VDD display/monitor after confirmation.

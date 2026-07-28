@@ -17,6 +17,9 @@ final class RtpH264Receiver {
     interface Listener {
         void onFirstPacket(String host);
 
+        /** Reports the decoded picture size so the view can letterbox instead of stretching. */
+        void onVideoSize(int width, int height);
+
         void onDisconnected();
 
         void onError(Throwable error);
@@ -28,6 +31,10 @@ final class RtpH264Receiver {
     private static final int DISCONNECT_TIMEOUT_MS = 3000;
     private static final int MAX_ASSEMBLED_NAL_SIZE = 4 * 1024 * 1024;
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
+    private static final int NAL_TYPE_IDR = 5;
+    private static final int NAL_TYPE_SPS = 7;
+    private static final int NAL_TYPE_STAP_A = 24;
+    private static final int NAL_TYPE_FU_A = 28;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final byte[] receiveBuffer = new byte[2048];
@@ -39,7 +46,16 @@ final class RtpH264Receiver {
     private volatile Listener listener;
     private volatile DatagramSocket socket;
     private Thread thread;
+    /**
+     * The decoder outlives no lock-free access: the receive thread feeds it while the UI thread may
+     * tear the session down, so every touch happens under {@link #decoderLock}.
+     */
+    private final Object decoderLock = new Object();
     private MediaCodec decoder;
+    private Surface decoderSurface;
+    private boolean awaitingKeyFrame = true;
+    private boolean renderedAFrame;
+    private boolean warnedAboutMalformedAggregation;
     private volatile String lastSenderHost;
 
     void setListener(Listener listener) {
@@ -50,25 +66,21 @@ final class RtpH264Receiver {
         stop();
 
         DatagramSocket localSocket = createSocket(port);
-        MediaCodec localDecoder = null;
+        MediaCodec localDecoder;
         try {
-            localDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080);
-            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
-            if (android.os.Build.VERSION.SDK_INT >= 30) {
-                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
-            }
-            localDecoder.configure(format, surface, null, 0);
-            localDecoder.start();
+            localDecoder = createDecoder(surface);
         } catch (Exception error) {
             localSocket.close();
-            if (localDecoder != null) {
-                localDecoder.release();
-            }
             throw error;
         }
 
-        decoder = localDecoder;
+        synchronized (decoderLock) {
+            decoder = localDecoder;
+            decoderSurface = surface;
+            awaitingKeyFrame = true;
+            renderedAFrame = false;
+            warnedAboutMalformedAggregation = false;
+        }
         socket = localSocket;
         lastSenderHost = null;
         fuState.reset();
@@ -91,16 +103,7 @@ final class RtpH264Receiver {
         thread = null;
         joinWorker(worker, "video receiver");
 
-        MediaCodec activeDecoder = decoder;
-        decoder = null;
-        if (activeDecoder != null) {
-            try {
-                activeDecoder.stop();
-            } catch (Exception error) {
-                AppLog.warn("video decoder stop failed", error);
-            }
-            activeDecoder.release();
-        }
+        releaseDecoder();
         lastSenderHost = null;
         fuState.reset();
         watchdog.reset();
@@ -112,6 +115,73 @@ final class RtpH264Receiver {
 
     String lastSenderHost() {
         return lastSenderHost;
+    }
+
+    private static MediaCodec createDecoder(Surface surface) throws Exception {
+        MediaCodec localDecoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+        try {
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080);
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 1024 * 1024);
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+            }
+            localDecoder.configure(format, surface, null, 0);
+            localDecoder.start();
+            return localDecoder;
+        } catch (Exception error) {
+            localDecoder.release();
+            throw error;
+        }
+    }
+
+    private void releaseDecoder() {
+        MediaCodec activeDecoder;
+        synchronized (decoderLock) {
+            activeDecoder = decoder;
+            decoder = null;
+            decoderSurface = null;
+            awaitingKeyFrame = true;
+        }
+        if (activeDecoder == null) {
+            return;
+        }
+        try {
+            activeDecoder.stop();
+        } catch (Exception error) {
+            AppLog.warn("video decoder stop failed", error);
+        }
+        activeDecoder.release();
+    }
+
+    /**
+     * A codec that dies mid-stream used to take the whole session with it. Rebuild it on the same
+     * surface instead and resync on the next key frame; the sender emits one every second.
+     */
+    private void restartDecoderLocked(Throwable error) {
+        MediaCodec failed = decoder;
+        Surface surface = decoderSurface;
+        decoder = null;
+        awaitingKeyFrame = true;
+        if (failed != null) {
+            try {
+                failed.stop();
+            } catch (Exception ignored) {
+                // The codec is already unusable; releasing it is all that still matters.
+            }
+            failed.release();
+        }
+        if (!running.get() || surface == null || !surface.isValid()) {
+            decoderSurface = null;
+            AppLog.warn("video decoder stopped and its surface is gone", error);
+            return;
+        }
+        try {
+            decoder = createDecoder(surface);
+            AppLog.warn("video decoder restarted after an error", error);
+        } catch (Exception failure) {
+            decoderSurface = null;
+            fail(failure);
+        }
     }
 
     private static DatagramSocket createSocket(int port) throws Exception {
@@ -148,9 +218,10 @@ final class RtpH264Receiver {
                             activeListener.onFirstPacket(senderHost);
                         }
                     }
-                    if (depacketizeAndQueue(receiveBuffer, receivePacket.getLength())) {
-                        drainDecoder();
-                    }
+                    depacketizeAndQueue(receiveBuffer, receivePacket.getLength());
+                    // Draining unconditionally: skipping it while the input queue is full starves
+                    // the codec of buffers and it eventually gives up with a fatal error.
+                    drainDecoder();
                 } catch (SocketTimeoutException timeout) {
                     if (watchdog.isTimedOut()) {
                         running.set(false);
@@ -187,7 +258,8 @@ final class RtpH264Receiver {
         }
     }
 
-    private boolean depacketizeAndQueue(byte[] packet, int length) throws Exception {
+    // Visible for testing: depacketization is pure parsing and needs no decoder to be exercised.
+    boolean depacketizeAndQueue(byte[] packet, int length) throws Exception {
         if (length <= 12 || (packet[0] & 0xc0) != 0x80) {
             return false;
         }
@@ -204,7 +276,12 @@ final class RtpH264Receiver {
             return true;
         }
 
-        if (nalType != 28 || payloadOffset + 2 >= length) {
+        // The sender aggregates its parameter sets, so a stream without STAP-A support never decodes.
+        if (nalType == NAL_TYPE_STAP_A) {
+            return queueAggregatedNals(packet, payloadOffset + 1, length - payloadOffset - 1);
+        }
+
+        if (nalType != NAL_TYPE_FU_A || payloadOffset + 2 >= length) {
             return false;
         }
 
@@ -238,44 +315,122 @@ final class RtpH264Receiver {
         return false;
     }
 
-    private void queueNal(byte[] source, int offset, int length) throws Exception {
-        MediaCodec activeDecoder = decoder;
-        if (activeDecoder == null || length <= 0) {
+    /** Unpacks a STAP-A packet: a series of 2-byte lengths, each followed by one whole NAL unit. */
+    private boolean queueAggregatedNals(byte[] packet, int offset, int available) {
+        boolean queued = false;
+        int cursor = offset;
+        int end = offset + available;
+        while (cursor + 2 <= end) {
+            int size = ((packet[cursor] & 0xff) << 8) | (packet[cursor + 1] & 0xff);
+            cursor += 2;
+            if (size <= 0 || cursor + size > end) {
+                if (!warnedAboutMalformedAggregation) {
+                    warnedAboutMalformedAggregation = true;
+                    AppLog.warn("dropped a malformed STAP-A packet", null);
+                }
+                break;
+            }
+            queueNal(packet, cursor, size);
+            cursor += size;
+            queued = true;
+        }
+        return queued;
+    }
+
+    private void queueNal(byte[] source, int offset, int length) {
+        if (length <= 0) {
             return;
         }
+        int nalType = source[offset] & 0x1f;
 
-        int index = activeDecoder.dequeueInputBuffer(1_000);
-        if (index < 0) {
+        synchronized (decoderLock) {
+            MediaCodec activeDecoder = decoder;
+            if (activeDecoder == null) {
+                return;
+            }
+            // A fresh codec chokes on data that starts mid-picture, so wait for a parameter set or IDR.
+            if (awaitingKeyFrame) {
+                if (nalType != NAL_TYPE_SPS && nalType != NAL_TYPE_IDR) {
+                    return;
+                }
+                awaitingKeyFrame = false;
+            }
+
+            try {
+                int index = activeDecoder.dequeueInputBuffer(10_000);
+                if (index < 0) {
+                    // Half a picture is worse than none: resync on the next key frame instead.
+                    awaitingKeyFrame = true;
+                    return;
+                }
+
+                ByteBuffer input = activeDecoder.getInputBuffer(index);
+                long presentationTimeUs = System.nanoTime() / 1000L;
+                if (input == null || input.capacity() < length + START_CODE.length) {
+                    activeDecoder.queueInputBuffer(index, 0, 0, presentationTimeUs, 0);
+                    AppLog.warn("video decoder input buffer was too small", null);
+                    return;
+                }
+
+                input.clear();
+                input.put(START_CODE);
+                input.put(source, offset, length);
+                activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, presentationTimeUs, 0);
+            } catch (IllegalStateException error) {
+                restartDecoderLocked(error);
+            }
+        }
+    }
+
+    /**
+     * The decoder reports the real picture size only once it has parsed the parameter sets, and the
+     * crop rectangle is what actually reaches the surface.
+     */
+    private void reportVideoSize(MediaFormat format) {
+        int width = videoSize(format, MediaFormat.KEY_WIDTH, "crop-left", "crop-right");
+        int height = videoSize(format, MediaFormat.KEY_HEIGHT, "crop-top", "crop-bottom");
+        if (width <= 0 || height <= 0) {
             return;
         }
-
-        ByteBuffer input = activeDecoder.getInputBuffer(index);
-        long presentationTimeUs = System.nanoTime() / 1000L;
-        if (input == null || input.capacity() < length + START_CODE.length) {
-            activeDecoder.queueInputBuffer(index, 0, 0, presentationTimeUs, 0);
-            AppLog.warn("video decoder input buffer was too small", null);
-            return;
+        AppLog.info("video size is " + width + "x" + height);
+        Listener activeListener = listener;
+        if (activeListener != null) {
+            activeListener.onVideoSize(width, height);
         }
+    }
 
-        input.clear();
-        input.put(START_CODE);
-        input.put(source, offset, length);
-        activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, presentationTimeUs, 0);
+    private static int videoSize(MediaFormat format, String sizeKey, String startKey, String endKey) {
+        if (format.containsKey(startKey) && format.containsKey(endKey)) {
+            return format.getInteger(endKey) - format.getInteger(startKey) + 1;
+        }
+        return format.containsKey(sizeKey) ? format.getInteger(sizeKey) : 0;
     }
 
     private void drainDecoder() {
-        MediaCodec activeDecoder = decoder;
-        if (activeDecoder == null) {
-            return;
-        }
-
-        int output;
-        do {
-            output = activeDecoder.dequeueOutputBuffer(bufferInfo, 0);
-            if (output >= 0) {
-                activeDecoder.releaseOutputBuffer(output, true);
+        synchronized (decoderLock) {
+            MediaCodec activeDecoder = decoder;
+            if (activeDecoder == null) {
+                return;
             }
-        } while (output >= 0);
+
+            try {
+                int output;
+                do {
+                    output = activeDecoder.dequeueOutputBuffer(bufferInfo, 0);
+                    if (output == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        reportVideoSize(activeDecoder.getOutputFormat());
+                    } else if (output >= 0) {
+                        activeDecoder.releaseOutputBuffer(output, true);
+                        if (!renderedAFrame) {
+                            renderedAFrame = true;
+                            AppLog.info("video decoder rendered its first frame");
+                        }
+                    }
+                } while (output >= 0 || output == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED);
+            } catch (IllegalStateException error) {
+                restartDecoderLocked(error);
+            }
+        }
     }
 
     private static void joinWorker(Thread worker, String name) {

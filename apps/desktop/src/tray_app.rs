@@ -287,11 +287,11 @@ impl TrayApp {
             ID_CHECK_UPDATE => self.check_for_updates(),
             ID_RUN_DIAGNOSTICS => self.run_diagnostics(),
             ID_RUN_PEER_DIAGNOSTICS => self.run_peer_diagnostics(),
-            ID_INSTALL_VDD => self.run_vdd_action("Install"),
-            ID_LIST_VDD => self.run_vdd_action("List"),
-            ID_ENABLE_VDD => self.run_vdd_action("Enable"),
-            ID_DISABLE_VDD => self.run_vdd_action("Disable"),
-            ID_REMOVE_VDD => self.run_vdd_action("Remove"),
+            ID_INSTALL_VDD => self.run_vdd_action(crate::vdd::VddAction::Install),
+            ID_LIST_VDD => self.open_vdd_status(),
+            ID_ENABLE_VDD => self.run_vdd_action(crate::vdd::VddAction::Enable),
+            ID_DISABLE_VDD => self.run_vdd_action(crate::vdd::VddAction::Disable),
+            ID_REMOVE_VDD => self.run_vdd_action(crate::vdd::VddAction::Remove),
             ID_OPEN_DISPLAY_SETTINGS => self.open_display_settings(),
             ID_OPEN_VDD => self.open_vdd_page(),
             ID_OPEN_CONFIG => self.open_config(),
@@ -786,37 +786,39 @@ impl TrayApp {
         }
     }
 
-    fn run_vdd_action(&self, action: &str) {
-        let Some(script) = std::env::current_exe().ok().and_then(|path| {
-            path.parent()
-                .map(|parent| parent.join("install-bundled-vdd.ps1"))
-        }) else {
-            self.set_error("Failed to resolve bundled VDD installer path".to_string());
-            return;
-        };
+    fn run_vdd_action(&self, action: crate::vdd::VddAction) {
+        if let Err(error) = crate::vdd::request(action, 1) {
+            self.set_error(format!("Failed to run VDD action {action:?}: {error:#}"));
+        }
+    }
 
-        if !script.exists() {
-            self.set_error(format!(
-                "Bundled VDD installer not found: {}",
-                script.display()
-            ));
-            return;
+    /// Writes the same display report the old PowerShell status action produced, then shows it.
+    fn open_vdd_status(&self) {
+        let mut report = vec![
+            "Screen Mirror Virtual Display Status".to_string(),
+            String::new(),
+        ];
+        let monitors = crate::monitors::enumerate_monitors();
+        if monitors.is_empty() {
+            report.push("No Windows display devices found.".to_string());
+        }
+        for monitor in &monitors {
+            report.push(monitor.summary());
+        }
+        report.push(String::new());
+        let targets = crate::monitors::bundled_virtual_capture_targets();
+        report.push(format!("Bundled virtual displays ready to capture: {}", targets.len()));
+        for target in &targets {
+            report.push(format!("  {}", target.adapter_name));
         }
 
-        if let Err(error) = crate::process::hidden_command("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-            ])
-            .arg(script)
-            .args(["-Action", action])
-            .spawn()
-        {
-            self.set_error(format!("Failed to start VDD action {action}: {error}"));
+        let path = std::env::temp_dir().join("ScreenMirror-vdd-status.txt");
+        if let Err(error) = std::fs::write(&path, report.join("\r\n")) {
+            self.set_error(format!("Failed to write the display report: {error}"));
+            return;
+        }
+        if let Err(error) = std::process::Command::new("notepad.exe").arg(&path).spawn() {
+            self.set_error(format!("Failed to open the display report: {error}"));
         }
     }
 

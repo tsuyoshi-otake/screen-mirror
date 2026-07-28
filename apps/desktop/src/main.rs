@@ -17,6 +17,7 @@ mod tray_app;
 #[cfg(windows)]
 mod tray_menu_owner;
 mod updater;
+mod vdd;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -49,6 +50,20 @@ enum Command {
     Print(PrintArgs),
     /// Run an explicit gst-launch-style pipeline.
     Run(RunArgs),
+    /// Manage the bundled virtual display driver. Used internally for the elevated step.
+    #[command(hide = true)]
+    Vdd(VddArgs),
+}
+
+#[derive(Args, Debug)]
+struct VddArgs {
+    /// Which driver action to perform.
+    #[arg(long, value_enum)]
+    action: vdd::VddAction,
+
+    /// Number of virtual monitors to expose, for --action set-count.
+    #[arg(long, default_value_t = 1)]
+    count: u32,
 }
 
 #[derive(Subcommand, Debug)]
@@ -83,6 +98,10 @@ struct DiscoverArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // The elevated driver step must not depend on GStreamer being loadable.
+    if let Some(Command::Vdd(args)) = &cli.command {
+        return vdd::apply(args.action, args.count);
+    }
     let tray_mode = matches!(cli.command, None | Some(Command::Tray));
     let _instance_guard = if tray_mode {
         Some(single_instance::acquire_tray_instance()?)
@@ -143,6 +162,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Run(args) => run_pipeline(&args.pipeline.join(" ")),
+        // Reached through the UAC prompt; this process is already elevated.
+        Command::Vdd(args) => vdd::apply(args.action, args.count),
     }
 }
 

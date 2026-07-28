@@ -275,6 +275,14 @@ pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
 }
 
 pub fn build_sender_video_pipeline(args: &SendArgs) -> Result<String> {
+    build_sender_video_pipeline_for(args, None)
+}
+
+/// Same pipeline, but pinned to one capture target so each receiver can get its own display.
+pub fn build_sender_video_pipeline_for(
+    args: &SendArgs,
+    target: Option<&crate::monitors::DisplayMonitor>,
+) -> Result<String> {
     ensure_positive("fps", args.fps)?;
     ensure_positive("bitrate", args.bitrate)?;
     ensure_positive("mtu", args.mtu)?;
@@ -294,7 +302,10 @@ pub fn build_sender_video_pipeline(args: &SendArgs) -> Result<String> {
     let encoder = select_encoder(args.encoder, args.allow_software_encoder)?;
     let clients = multi_udp_clients(&args.host, args.port)?;
     let show_cursor = if args.no_cursor { "false" } else { "true" };
-    let source = if args.prefer_virtual_display && args.monitor_index < 0 {
+    let source = if let Some(target) = target {
+        crate::logging::append(format!("sender assigned capture target: {}", target.summary()));
+        capture_source_for_target(args.capture_api, show_cursor, target)?
+    } else if args.prefer_virtual_display && args.monitor_index < 0 {
         match crate::monitors::preferred_virtual_capture_target() {
             Some(target) => {
                 crate::logging::append(format!(

@@ -8,6 +8,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Typeface;
+import android.media.AudioManager;
 import android.media.projection.MediaProjectionManager;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
@@ -15,14 +17,19 @@ import android.provider.Settings;
 import android.text.InputFilter;
 import android.text.InputType;
 import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.View;
+import android.view.WindowInsets;
 import android.view.WindowManager;
-import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 
 import java.util.ArrayList;
@@ -34,6 +41,9 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     private static final String PREF_RECEIVE_AUDIO = "receive_audio";
     private static final String PREF_SEND_AUDIO = "send_audio";
     private static final String PREF_NOTIFICATION_PROMPTED = "notification_prompted";
+    private static final String PREF_RECEIVE_VOLUME = "receive_volume_percent";
+    private static final int DEFAULT_VOLUME_PERCENT = 100;
+    private static final int MAX_VOLUME_PERCENT = 400;
     private static final int REQUEST_CAPTURE = 1001;
     private static final int REQUEST_RECORD_AUDIO = 1002;
     private static final int REQUEST_POST_NOTIFICATIONS = 1003;
@@ -45,11 +55,15 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     private final ArrayList<DiscoveryAgent.Peer> selectedReceivers = new ArrayList<>();
 
     private MirrorSurfaceView surfaceView;
+    private FrameLayout mirrorStage;
     private TextView status;
     private EditText pinInput;
     private CheckBox receiveAudio;
     private CheckBox sendAudio;
+    private TextView volumeLabel;
+    private SeekBar volumeBar;
     private LinearLayout toolbar;
+    private ScrollView controls;
     private MediaProjectionManager projectionManager;
     private WifiManager.MulticastLock multicastLock;
     private SharedPreferences preferences;
@@ -75,6 +89,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         surfaceView.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
+                AppLog.info("mirror surface created (receiver requested: " + receiverRequested + ")");
                 startReceiverOnSurface(holder);
             }
 
@@ -85,6 +100,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
                 if (receiverRequested) {
+                    AppLog.info("mirror surface destroyed; pausing the receiver until it comes back");
                     receiver.stop();
                     audioReceiver.stop();
                 }
@@ -92,15 +108,27 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         });
         surfaceView.setOnTouchListener(this::sendTouchEvent);
 
-        status = new TextView(this);
+        TextView appTitle = new TextView(this);
+        appTitle.setText(R.string.app_name);
+        appTitle.setTextColor(Ui.TEXT);
+        appTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        appTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+
+        status = Ui.statusPill(this);
         status.setText(R.string.status_idle);
-        status.setPadding(24, 24, 24, 24);
 
         pinInput = new EditText(this);
         pinInput.setHint(R.string.pin_hint);
         pinInput.setText(preferences.getString(PREF_PIN, Pin.DEFAULT));
         pinInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
         pinInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(4)});
+        pinInput.setTextColor(Ui.TEXT);
+        pinInput.setHintTextColor(Ui.TEXT_MUTED);
+        pinInput.setBackground(Ui.fieldBackground(this));
+        pinInput.setPadding(Ui.dp(this, 14), Ui.dp(this, 12), Ui.dp(this, 14), Ui.dp(this, 12));
+        pinInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        pinInput.setLetterSpacing(0.5f);
+        pinInput.setGravity(Gravity.CENTER);
 
         receiveAudio = new CheckBox(this);
         receiveAudio.setText(R.string.receive_audio);
@@ -108,6 +136,28 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         receiveAudio.setOnCheckedChangeListener(
                 (button, enabled) -> onReceiveAudioChanged(enabled)
         );
+        Ui.tint(receiveAudio);
+
+        volumeLabel = Ui.label(this, "");
+        volumeBar = new SeekBar(this);
+        Ui.tint(volumeBar);
+        volumeBar.setMax(MAX_VOLUME_PERCENT);
+        volumeBar.setProgress(preferences.getInt(PREF_RECEIVE_VOLUME, DEFAULT_VOLUME_PERCENT));
+        volumeBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar bar, int percent, boolean fromUser) {
+                applyReceiveVolume(percent, fromUser);
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar bar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar bar) {
+            }
+        });
+        applyReceiveVolume(volumeBar.getProgress(), false);
 
         sendAudio = new CheckBox(this);
         sendAudio.setText(R.string.send_audio);
@@ -115,36 +165,117 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         sendAudio.setOnCheckedChangeListener(
                 (button, enabled) -> onSendAudioChanged(enabled)
         );
+        Ui.tint(sendAudio);
 
-        Button startReceiver = button(R.string.start_receiver, view -> startReceiver());
-        Button discover = button(R.string.discover_receivers, view -> discoverReceivers());
-        Button startSender = button(R.string.start_sender, view -> startSender());
-        Button accessibility = button(R.string.enable_touch_injection, view -> openAccessibilitySettings());
-        Button diagnostics = button(R.string.copy_diagnostics, view -> copyDiagnostics());
-        Button stop = button(R.string.stop, view -> stopAll());
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setPadding(Ui.dp(this, 20), Ui.dp(this, 20), Ui.dp(this, 20), 0);
+        header.addView(appTitle);
+        header.addView(status, stacked(10, false));
+
+        LinearLayout pinCard = Ui.card(this);
+        pinCard.addView(Ui.sectionTitle(this, getString(R.string.pin_label)));
+        pinCard.addView(pinInput, stacked(12, true));
+
+        LinearLayout receiveCard = Ui.card(this);
+        receiveCard.addView(Ui.sectionTitle(this, getString(R.string.section_receive)));
+        receiveCard.addView(Ui.caption(this, getString(R.string.section_receive_hint)));
+        receiveCard.addView(receiveAudio);
+        receiveCard.addView(volumeLabel, stacked(10, true));
+        receiveCard.addView(volumeBar, stacked(2, true));
+        receiveCard.addView(Ui.caption(this, getString(R.string.receive_volume_hint)));
+        receiveCard.addView(
+                Ui.primaryButton(this, getString(R.string.start_receiver), view -> startReceiver()),
+                stacked(6, true)
+        );
+
+        LinearLayout senderRow = Ui.row(this);
+        senderRow.addView(
+                Ui.secondaryButton(this, getString(R.string.discover_receivers), view -> discoverReceivers()),
+                Ui.weighted(this)
+        );
+        senderRow.addView(
+                Ui.primaryButton(this, getString(R.string.start_sender), view -> startSender()),
+                Ui.weighted(this)
+        );
+
+        LinearLayout sendCard = Ui.card(this);
+        sendCard.addView(Ui.sectionTitle(this, getString(R.string.section_send)));
+        sendCard.addView(Ui.caption(this, getString(R.string.section_send_hint)));
+        sendCard.addView(sendAudio);
+        sendCard.addView(senderRow, stacked(12, true));
+
+        LinearLayout advancedRow = Ui.row(this);
+        advancedRow.addView(
+                Ui.quietButton(this, getString(R.string.enable_touch_injection), view -> openAccessibilitySettings()),
+                Ui.weighted(this)
+        );
+        advancedRow.addView(
+                Ui.quietButton(this, getString(R.string.copy_diagnostics), view -> copyDiagnostics()),
+                Ui.weighted(this)
+        );
+
+        LinearLayout advancedCard = Ui.card(this);
+        advancedCard.addView(Ui.sectionTitle(this, getString(R.string.section_advanced)));
+        advancedCard.addView(Ui.caption(this, getString(R.string.section_advanced_hint)));
+        advancedCard.addView(advancedRow);
 
         toolbar = new LinearLayout(this);
         toolbar.setOrientation(LinearLayout.VERTICAL);
-        toolbar.addView(status);
-        toolbar.addView(pinInput);
-        toolbar.addView(receiveAudio);
-        toolbar.addView(sendAudio);
-        toolbar.addView(startReceiver);
-        toolbar.addView(discover);
-        toolbar.addView(startSender);
-        toolbar.addView(accessibility);
-        toolbar.addView(diagnostics);
-        toolbar.addView(stop);
+        toolbar.addView(header);
+        toolbar.addView(pinCard, Ui.cardParams(this));
+        toolbar.addView(receiveCard, Ui.cardParams(this));
+        toolbar.addView(sendCard, Ui.cardParams(this));
+        toolbar.addView(advancedCard, Ui.cardParams(this));
+        toolbar.addView(
+                Ui.dangerButton(this, getString(R.string.stop), view -> stopAll()),
+                Ui.cardParams(this)
+        );
+
+        controls = new ScrollView(this);
+        controls.addView(toolbar);
+        controls.setClipToPadding(true);
+        // targetSdk 35 draws edge to edge, so the controls keep clear of the status and navigation bars.
+        controls.setOnApplyWindowInsetsListener((view, insets) -> {
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
+                view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            } else {
+                view.setPadding(
+                        insets.getSystemWindowInsetLeft(),
+                        insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(),
+                        insets.getSystemWindowInsetBottom()
+                );
+            }
+            return insets;
+        });
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.addView(toolbar);
-        root.addView(surfaceView, new LinearLayout.LayoutParams(
+        root.setBackgroundColor(Ui.BACKGROUND);
+        root.addView(controls, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                0,
+                1.0f
+        ));
+        // The surface keeps the sender's aspect ratio, so it needs a black stage to be centred in.
+        mirrorStage = new FrameLayout(this);
+        mirrorStage.setBackgroundColor(0xFF000000);
+        mirrorStage.setVisibility(View.GONE);
+        mirrorStage.addView(surfaceView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+        ));
+        root.addView(mirrorStage, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
                 1.0f
         ));
         setContentView(root);
+        // Hardware volume keys stay useful while the receiver runs fullscreen with the toolbar hidden.
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         AppLog.info("main activity created");
     }
 
@@ -178,7 +309,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             return;
         }
         if (resultCode != RESULT_OK || data == null) {
-            setStatus("Sender permission denied");
+            setStatus("画面キャプチャが許可されませんでした");
             return;
         }
         try {
@@ -193,7 +324,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             );
         } catch (Exception error) {
             AppLog.error("could not start foreground sender", error);
-            setStatus("Sender failed: " + errorMessage(error));
+            setStatus("送信エラー: " + errorMessage(error));
         }
     }
 
@@ -204,18 +335,18 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             if (requestCode == REQUEST_POST_NOTIFICATIONS) {
                 preferences.edit().putBoolean(PREF_NOTIFICATION_PROMPTED, true).apply();
                 if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    setStatus("Notification permission granted; continuing sender setup");
+                    setStatus("通知が許可されました。送信の準備を続けます");
                 } else {
-                    setStatus("Notification permission denied; continuing with system foreground indicator");
+                    setStatus("通知は許可されませんでした。システム表示のまま続行します");
                 }
                 startSender();
             }
             return;
         }
         if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            setStatus("Audio permission granted; enable Send Audio or tap Start Sender");
+            setStatus("マイク権限が許可されました。「音声も送る」を有効にするか送信を開始してください");
         } else {
-            setStatus("Audio permission denied; disable Send Audio or allow it in Settings");
+            setStatus("マイク権限が拒否されました。「音声も送る」を外すか設定で許可してください");
         }
     }
 
@@ -256,7 +387,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             setReceiveAudioChecked(false);
             preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, false).apply();
             AppLog.error("receiver audio toggle failed; video remains active", error);
-            setStatus(receiverStatus(false) + " (audio change failed: "
+            setStatus(receiverStatus(false) + "（音声の切り替えに失敗: "
                     + errorMessage(error) + ")");
         }
     }
@@ -284,7 +415,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         } catch (RuntimeException error) {
             setSendAudioChecked(ScreenCaptureService.isAudioEnabled());
             AppLog.error("sender audio toggle failed; video remains active", error);
-            setStatus("Sender audio change failed: " + errorMessage(error));
+            setStatus("送信音声の切り替えに失敗: " + errorMessage(error));
         }
     }
 
@@ -306,9 +437,14 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             public void onFirstPacket(String host) {
                 runOnUiThread(() -> {
                     if (receiverRequested) {
-                        setStatus(receiverStatus(receiverAudioEnabled) + " from " + host);
+                        setStatus(receiverStatus(receiverAudioEnabled) + "（" + host + "）");
                     }
                 });
+            }
+
+            @Override
+            public void onVideoSize(int width, int height) {
+                runOnUiThread(() -> surfaceView.setVideoSize(width, height));
             }
 
             @Override
@@ -318,7 +454,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                         return;
                     }
                     stopReceiverSession();
-                    setStatus("Receiver disconnected: no video for 3 seconds");
+                    setStatus("受信が切断されました（3秒間映像なし）");
                 });
             }
 
@@ -329,7 +465,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                         return;
                     }
                     stopReceiverSession();
-                    setStatus("Receiver failed: " + errorMessage(error));
+                    setStatus("受信エラー: " + errorMessage(error));
                 });
             }
         });
@@ -341,14 +477,14 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             receiverAudioEnabled = false;
             setReceiveAudioChecked(false);
             preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, false).apply();
-            setStatus(receiverStatus(false) + " (audio stopped: " + errorMessage(error) + ")");
+            setStatus(receiverStatus(false) + "（音声を停止: " + errorMessage(error) + "）");
         }));
         discovery.setListener(error -> runOnUiThread(() -> {
             if (!receiverRequested) {
                 return;
             }
             stopReceiverSession();
-            setStatus("Discovery beacon failed: " + errorMessage(error));
+            setStatus("受信側の告知に失敗: " + errorMessage(error));
         }));
     }
 
@@ -392,11 +528,13 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         control.send(host, action, x, y, event.getPointerId(index), currentPinOrDefault());
     }
 
-    private Button button(int textResource, View.OnClickListener listener) {
-        Button button = new Button(this);
-        button.setText(textResource);
-        button.setOnClickListener(listener);
-        return button;
+    private LinearLayout.LayoutParams stacked(int topMarginDp, boolean matchWidth) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                matchWidth ? LinearLayout.LayoutParams.MATCH_PARENT : LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        params.topMargin = Ui.dp(this, topMarginDp);
+        return params;
     }
 
     private void startReceiver() {
@@ -409,10 +547,11 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         receiverAudioEnabled = receiveAudio.isChecked();
         receiverRequested = true;
         preferences.edit().putBoolean(PREF_RECEIVE_AUDIO, receiverAudioEnabled).apply();
+        mirrorStage.setVisibility(View.VISIBLE);
         enterReceiverFullscreen();
         keepReceiverAwake(true);
         lockMulticast();
-        setStatus("Status: waiting for video on :" + STREAM_PORT);
+        setStatus("受信待機中 :" + STREAM_PORT);
         SurfaceHolder holder = surfaceView.getHolder();
         if (holder.getSurface().isValid()) {
             startReceiverOnSurface(holder);
@@ -436,11 +575,11 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                     displayRefreshHz(),
                     receiverPin
             );
-            setStatus("Status: waiting for sender on :" + STREAM_PORT);
+            setStatus("送信側の接続を待っています :" + STREAM_PORT);
         } catch (Exception error) {
             AppLog.error("receiver startup failed", error);
             stopReceiverSession();
-            setStatus("Receiver failed: " + errorMessage(error));
+            setStatus("受信エラー: " + errorMessage(error));
         }
     }
 
@@ -450,20 +589,20 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             return;
         }
         lockMulticast();
-        setStatus("Status: discovering receivers...");
+        setStatus("受信側を検索中…");
         new Thread(() -> {
             try {
                 List<DiscoveryAgent.Peer> peers = discovery.discoverReceivers(3000, pin);
                 ArrayList<DiscoveryAgent.Peer> selected = selectReceivers(peers);
                 runOnUiThread(() -> {
                     replaceSelectedReceivers(selected);
-                    setStatus("Discovered " + selected.size() + " receiver(s): " + selected);
+                    setStatus("受信側を " + selected.size() + " 台検出: " + selected);
                     releaseMulticast();
                 });
             } catch (Exception error) {
                 AppLog.error("receiver discovery failed", error);
                 runOnUiThread(() -> {
-                    setStatus("Discovery failed: " + errorMessage(error));
+                    setStatus("検索に失敗: " + errorMessage(error));
                     releaseMulticast();
                 });
             }
@@ -489,7 +628,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         keepReceiverAwake(false);
         ScreenCaptureService.stop(this);
         lockMulticast();
-        setStatus("Status: preparing sender...");
+        setStatus("送信を準備中…");
         ArrayList<DiscoveryAgent.Peer> existing = new ArrayList<>(selectedReceivers);
         new Thread(() -> {
             try {
@@ -502,7 +641,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                     replaceSelectedReceivers(finalSelected);
                     releaseMulticast();
                     if (finalSelected.isEmpty()) {
-                        setStatus("No receivers found");
+                        setStatus("受信側が見つかりません");
                         return;
                     }
                     startActivityForResult(
@@ -514,7 +653,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                 AppLog.error("sender setup failed", error);
                 runOnUiThread(() -> {
                     releaseMulticast();
-                    setStatus("Sender setup failed: " + errorMessage(error));
+                    setStatus("送信の準備に失敗: " + errorMessage(error));
                 });
             }
         }, "sender-setup").start();
@@ -582,7 +721,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         String report = AppLog.diagnostics(this, session);
         ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         clipboard.setPrimaryClip(ClipData.newPlainText("Screen Mirror diagnostics", report));
-        setStatus("Diagnostics copied to clipboard");
+        setStatus("診断情報をコピーしました");
     }
 
     private String currentPinOrStatus() {
@@ -591,7 +730,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             preferences.edit().putString(PREF_PIN, pin).apply();
             return pin;
         } catch (IllegalArgumentException error) {
-            setStatus("Invalid PIN: use exactly four digits");
+            setStatus("PIN は4桁の数字で入力してください");
             return null;
         }
     }
@@ -619,8 +758,8 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     }
 
     private void enterReceiverFullscreen() {
-        if (toolbar != null) {
-            toolbar.setVisibility(View.GONE);
+        if (controls != null) {
+            controls.setVisibility(View.GONE);
         }
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
@@ -633,8 +772,11 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     }
 
     private void leaveReceiverFullscreen() {
-        if (toolbar != null) {
-            toolbar.setVisibility(View.VISIBLE);
+        if (controls != null) {
+            controls.setVisibility(View.VISIBLE);
+        }
+        if (mirrorStage != null && !receiverRequested) {
+            mirrorStage.setVisibility(View.GONE);
         }
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
     }
@@ -651,6 +793,32 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         }
     }
 
+    private void applyReceiveVolume(int percent, boolean persist) {
+        if (volumeLabel != null) {
+            volumeLabel.setText(getString(R.string.receive_volume, percent));
+        }
+        audioReceiver.setGain(percent / 100.0f);
+        if (persist) {
+            preferences.edit().putInt(PREF_RECEIVE_VOLUME, percent).apply();
+        }
+    }
+
+    @Override
+    public void onBackPressed() {
+        // Back leaves the fullscreen receiver first so the controls (volume, stop) come back
+        // without tearing down the session; a second press stops it.
+        if (receiverRequested && controls != null && controls.getVisibility() != View.VISIBLE) {
+            leaveReceiverFullscreen();
+            setStatus(receiverStatus(receiverAudioEnabled) + "（もう一度戻るで停止）");
+            return;
+        }
+        if (receiverRequested) {
+            stopAll();
+            return;
+        }
+        super.onBackPressed();
+    }
+
     private void setStatus(String text) {
         if (status != null) {
             status.setText(text);
@@ -664,14 +832,14 @@ public final class MainActivity extends Activity implements ScreenCaptureService
 
     private boolean ensureAudioPermission() {
         if (android.os.Build.VERSION.SDK_INT < 29) {
-            setStatus("Audio sending requires Android 10 or newer");
+            setStatus("音声送信は Android 10 以上が必要です");
             return false;
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             return true;
         }
         requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
-        setStatus("Audio permission requested; enable Send Audio again after allowing it");
+        setStatus("マイク権限を要求しました。許可後にもう一度「音声も送る」を有効にしてください");
         return false;
     }
 
@@ -685,15 +853,15 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                 new String[]{Manifest.permission.POST_NOTIFICATIONS},
                 REQUEST_POST_NOTIFICATIONS
         );
-        setStatus("Notification permission requested; tap Start Sender again after choosing");
+        setStatus("通知権限を要求しました。選択後にもう一度「送信を開始」を押してください");
         return false;
     }
 
     private static String receiverStatus(boolean audioEnabled) {
         if (audioEnabled) {
-            return "Status: receiving video :" + STREAM_PORT + " and audio :" + RtpOpusReceiver.DEFAULT_AUDIO_PORT;
+            return "受信中 映像:" + STREAM_PORT + " 音声:" + RtpOpusReceiver.DEFAULT_AUDIO_PORT;
         }
-        return "Status: receiving on :" + STREAM_PORT;
+        return "受信中 映像:" + STREAM_PORT;
     }
 
     private static String errorMessage(Throwable error) {

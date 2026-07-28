@@ -5,6 +5,7 @@ import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.media.audiofx.LoudnessEnhancer;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -32,6 +33,7 @@ final class RtpOpusReceiver {
     static final int LOW_LATENCY_BUFFER_MS = 10;
     private static final int BUFFER_CAPACITY_MS = 20;
     private static final int BUFFER_GROWTH_MS = 5;
+    static final float MAX_GAIN = 4.0f;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final byte[] receiveBuffer = new byte[1500];
@@ -43,6 +45,8 @@ final class RtpOpusReceiver {
     private Thread thread;
     private MediaCodec decoder;
     private AudioTrack audioTrack;
+    private LoudnessEnhancer loudnessEnhancer;
+    private volatile float gain = 1.0f;
     private int baseTimestamp = -1;
     private int outputBufferFrames;
     private int lastUnderrunCount;
@@ -50,6 +54,20 @@ final class RtpOpusReceiver {
 
     void setListener(Listener listener) {
         this.listener = listener;
+    }
+
+    /**
+     * Sets the playback gain, where 1.0 is the stream as sent. Values above 1.0 are amplified with
+     * a {@link LoudnessEnhancer} because {@link AudioTrack#setVolume} cannot exceed unity. The gain
+     * survives stop/start so the receiver keeps the level the user picked.
+     */
+    synchronized void setGain(float requestedGain) {
+        gain = clampGain(requestedGain);
+        applyGain();
+    }
+
+    float gain() {
+        return gain;
     }
 
     synchronized void start(int port) throws Exception {
@@ -123,6 +141,8 @@ final class RtpOpusReceiver {
 
         decoder = localDecoder;
         audioTrack = localTrack;
+        loudnessEnhancer = createLoudnessEnhancer(localTrack);
+        applyGain();
         socket = localSocket;
         baseTimestamp = -1;
         outputBufferFrames = localOutputBufferFrames;
@@ -161,6 +181,17 @@ final class RtpOpusReceiver {
                 AppLog.warn("audio decoder stop failed", error);
             }
             activeDecoder.release();
+        }
+
+        LoudnessEnhancer activeEnhancer = loudnessEnhancer;
+        loudnessEnhancer = null;
+        if (activeEnhancer != null) {
+            try {
+                activeEnhancer.setEnabled(false);
+            } catch (RuntimeException error) {
+                AppLog.warn("audio gain effect disable failed", error);
+            }
+            activeEnhancer.release();
         }
 
         AudioTrack activeTrack = audioTrack;
@@ -339,6 +370,55 @@ final class RtpOpusReceiver {
                     null
             );
         }
+    }
+
+    private static LoudnessEnhancer createLoudnessEnhancer(AudioTrack track) {
+        try {
+            return new LoudnessEnhancer(track.getAudioSessionId());
+        } catch (RuntimeException error) {
+            // Some devices ship without the effect; playback still works up to unity gain.
+            AppLog.warn("audio gain effect unavailable; boost above 100% is disabled", error);
+            return null;
+        }
+    }
+
+    private void applyGain() {
+        AudioTrack activeTrack = audioTrack;
+        float activeGain = gain;
+        if (activeTrack == null) {
+            return;
+        }
+        try {
+            activeTrack.setVolume(Math.min(1.0f, activeGain));
+        } catch (RuntimeException error) {
+            AppLog.warn("audio volume change failed", error);
+        }
+
+        LoudnessEnhancer activeEnhancer = loudnessEnhancer;
+        if (activeEnhancer == null) {
+            return;
+        }
+        try {
+            activeEnhancer.setTargetGain(gainToMillibels(activeGain));
+            activeEnhancer.setEnabled(activeGain > 1.0f);
+        } catch (RuntimeException error) {
+            AppLog.warn("audio gain boost failed", error);
+        }
+    }
+
+    static float clampGain(float requestedGain) {
+        if (Float.isNaN(requestedGain) || requestedGain < 0f) {
+            return 0f;
+        }
+        return Math.min(MAX_GAIN, requestedGain);
+    }
+
+    static int gainToMillibels(float requestedGain) {
+        float clamped = clampGain(requestedGain);
+        if (clamped <= 1.0f) {
+            return 0;
+        }
+        return (int) Math.round(2000.0 * Math.log10(clamped));
     }
 
     static int audioFramesForMilliseconds(int milliseconds) {

@@ -30,6 +30,12 @@ enum SenderSupervisorCommand {
 struct ResolvedSender {
     args: SendArgs,
     target_display: Option<DisplayInfo>,
+    receivers: Vec<ReceiverTarget>,
+}
+
+struct ReceiverTarget {
+    host: String,
+    display: Option<DisplayInfo>,
 }
 
 #[derive(Default)]
@@ -58,7 +64,7 @@ impl SenderSupervisor {
             log_sender("sender supervisor started; waiting for matching receivers");
             let mut args = args;
             let mut active_hosts = String::new();
-            let mut active_video_pipeline: Option<PipelineHandle> = None;
+            let mut active_video_pipelines: Vec<PipelineHandle> = Vec::new();
             let mut active_audio_pipeline: Option<PipelineHandle> = None;
             let mut detached_for_no_receivers = false;
             let mut last_receiver_seen: Option<Instant> = None;
@@ -76,16 +82,13 @@ impl SenderSupervisor {
                     }
                 }
 
-                if active_video_pipeline
-                    .as_ref()
-                    .map(|handle| handle.is_finished())
-                    .unwrap_or(false)
+                // One receiver's pipeline dying takes the whole set down, so the next discovery
+                // pass rebuilds every receiver against a fresh display assignment.
+                if active_video_pipelines
+                    .iter()
+                    .any(|handle| handle.is_finished())
                 {
-                    if let Some(handle) = active_video_pipeline.take() {
-                        if let Err(error) = handle.finish() {
-                            log_sender(format!("sender video pipeline stopped: {error:#}"));
-                        }
-                    }
+                    stop_video_pipelines(&mut active_video_pipelines, "sender video pipeline stopped");
                     if let Some(handle) = active_audio_pipeline.take() {
                         if let Err(error) = handle.stop() {
                             log_sender(format!(
@@ -119,35 +122,33 @@ impl SenderSupervisor {
                                 log_sender(format!("sender audio target update failed: {error:#}"));
                             }
                         }
-                        if let Some(handle) = active_video_pipeline.take() {
-                            if let Err(error) = handle.stop() {
-                                log_sender(format!("sender video target update failed: {error:#}"));
-                            }
-                        }
+                        stop_video_pipelines(
+                            &mut active_video_pipelines,
+                            "sender video target update failed",
+                        );
                         active_hosts.clear();
                         if preparation.should_prepare(&resolved.args.host)
                             && prepare_sender_environment(&resolved)
                         {
                             detached_for_no_receivers = false;
                         }
-                        match pipeline::build_sender_video_pipeline(&resolved.args) {
-                            Ok(description) => {
-                                log_sender(format!(
-                                    "sender targets updated: {}",
-                                    resolved.args.host
-                                ));
-                                active_hosts = resolved.args.host;
-                                active_video_pipeline = Some(pipeline::spawn_pipeline(description));
-                                apply_sender_audio_state(
-                                    &args,
-                                    &active_hosts,
-                                    &mut active_audio_pipeline,
-                                );
-                                detached_for_no_receivers = false;
-                            }
-                            Err(error) => {
-                                log_sender(format!("sender video pipeline build failed: {error:#}"))
-                            }
+                        let pipelines = spawn_receiver_video_pipelines(&resolved);
+                        if pipelines.is_empty() {
+                            log_sender("no sender video pipeline could be started for the current receivers");
+                        } else {
+                            log_sender(format!(
+                                "sender targets updated: {} ({} display stream(s))",
+                                resolved.args.host,
+                                pipelines.len()
+                            ));
+                            active_hosts = resolved.args.host;
+                            active_video_pipelines = pipelines;
+                            apply_sender_audio_state(
+                                &args,
+                                &active_hosts,
+                                &mut active_audio_pipeline,
+                            );
+                            detached_for_no_receivers = false;
                         }
                     }
                     Ok(_) => {
@@ -174,13 +175,10 @@ impl SenderSupervisor {
                                 ));
                             }
                         }
-                        if let Some(handle) = active_video_pipeline.take() {
-                            if let Err(error) = handle.stop() {
-                                log_sender(format!(
-                                    "sender video stop after receiver loss failed: {error:#}"
-                                ));
-                            }
-                        }
+                        stop_video_pipelines(
+                            &mut active_video_pipelines,
+                            "sender video stop after receiver loss failed",
+                        );
                         active_hosts.clear();
                         if args.enable_virtual_display && !detached_for_no_receivers {
                             crate::monitors::remove_bundled_virtual_display();
@@ -213,7 +211,7 @@ impl SenderSupervisor {
             if let Some(handle) = active_audio_pipeline {
                 let _ = handle.stop();
             }
-            if let Some(handle) = active_video_pipeline {
+            for handle in active_video_pipelines {
                 let _ = handle.stop();
             }
         });
@@ -251,6 +249,14 @@ fn apply_sender_supervisor_command(
             false
         }
         SenderSupervisorCommand::Stop => true,
+    }
+}
+
+fn stop_video_pipelines(pipelines: &mut Vec<PipelineHandle>, context: &str) {
+    for handle in pipelines.drain(..) {
+        if let Err(error) = handle.stop() {
+            log_sender(format!("{context}: {error:#}"));
+        }
     }
 }
 
@@ -405,9 +411,20 @@ pub fn resolve_sender_args(args: SendArgs) -> Result<SendArgs> {
 
 fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
     if !is_auto_host(&args.host) {
+        let receivers = args
+            .host
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(|host| ReceiverTarget {
+                host: host.to_string(),
+                display: None,
+            })
+            .collect();
         return Ok(ResolvedSender {
             args,
             target_display: None,
+            receivers,
         });
     }
 
@@ -429,17 +446,88 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         }
     }
 
-    let selected: Vec<String> = receivers
+    let selected: Vec<ReceiverTarget> = receivers
         .into_iter()
         .take(args.max_receivers as usize)
-        .map(|peer| format!("{}:{}", peer.address, peer.announcement.stream_port))
+        .map(|peer| ReceiverTarget {
+            host: format!("{}:{}", peer.address, peer.announcement.stream_port),
+            display: peer.announcement.display.clone(),
+        })
         .collect();
 
-    args.host = selected.join(",");
+    args.host = selected
+        .iter()
+        .map(|receiver| receiver.host.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
     Ok(ResolvedSender {
         args,
         target_display,
+        receivers: selected,
     })
+}
+
+/// Gives every receiver its own virtual display, so a second phone joining gets a new desktop
+/// instead of a copy of the first one's.
+fn assign_receiver_displays(resolved: &ResolvedSender) -> Vec<Option<crate::monitors::DisplayMonitor>> {
+    let receivers = &resolved.receivers;
+    if !resolved.args.enable_virtual_display || receivers.is_empty() {
+        return receivers.iter().map(|_| None).collect();
+    }
+
+    let targets = crate::monitors::ensure_bundled_virtual_display_count(receivers.len());
+    if targets.is_empty() {
+        log_sender("no bundled virtual display is capture-ready; receivers fall back to the default capture target");
+        return receivers.iter().map(|_| None).collect();
+    }
+    if targets.len() < receivers.len() {
+        log_sender(format!(
+            "only {} virtual display(s) for {} receiver(s); the remaining receivers share the last display",
+            targets.len(),
+            receivers.len()
+        ));
+    }
+
+    receivers
+        .iter()
+        .enumerate()
+        .map(|(index, receiver)| {
+            let target = targets[index.min(targets.len() - 1)].clone();
+            if resolved.args.sync_virtual_display_resolution {
+                if let Err(error) =
+                    crate::monitors::sync_virtual_display_mode(&target, receiver.display.as_ref())
+                {
+                    log_sender(format!(
+                        "virtual display sync for {} failed: {error:#}",
+                        receiver.host
+                    ));
+                }
+            }
+            log_sender(format!(
+                "receiver {} captures {}",
+                receiver.host, target.adapter_name
+            ));
+            Some(target)
+        })
+        .collect()
+}
+
+/// One video pipeline per receiver; a build failure only drops that receiver.
+fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Vec<PipelineHandle> {
+    let assignments = assign_receiver_displays(resolved);
+    let mut pipelines = Vec::new();
+    for (receiver, target) in resolved.receivers.iter().zip(assignments) {
+        let mut receiver_args = resolved.args.clone();
+        receiver_args.host = receiver.host.clone();
+        match pipeline::build_sender_video_pipeline_for(&receiver_args, target.as_ref()) {
+            Ok(description) => pipelines.push(pipeline::spawn_pipeline(description)),
+            Err(error) => log_sender(format!(
+                "sender video pipeline build failed for {}: {error:#}",
+                receiver.host
+            )),
+        }
+    }
+    pipelines
 }
 
 fn prepare_sender_environment(resolved: &ResolvedSender) -> bool {

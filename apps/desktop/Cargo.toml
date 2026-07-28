@@ -1,6 +1,6 @@
 [package]
 name = "screen-mirror"
-version = "0.1.37"
+version = "0.1.38"
 edition = "2021"
 
 [dependencies]
@@ -17,7 +17,7 @@ tray-icon = "0.24"
 ureq = { version = "3.3", features = ["platform-verifier", "win-system-proxy"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.52"
 
 [target.'cfg(windows)'.build-dependencies]

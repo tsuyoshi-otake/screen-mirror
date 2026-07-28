@@ -58,7 +58,6 @@ function Copy-RuntimeFile([string] $source, [string] $relativeDestination) {
     $script:runtimeFiles += $relativeDestination
 }
 
-Copy-RuntimeFile (Join-Path $repo "scripts\install-bundled-vdd.ps1") "install-bundled-vdd.ps1"
 Copy-RuntimeFile (Join-Path $repo "scripts\diagnose-screen-mirror.ps1") "diagnose-screen-mirror.ps1"
 Copy-RuntimeFile (Join-Path $repo "assets\screen-mirror-dark.ico") "screen-mirror-dark.ico"
 
@@ -163,36 +162,26 @@ if (Test-Path -LiteralPath $licenseRoot) {
 if ($IncludeVdd) {
     $vddVersion = "25.7.23"
     $vddUrl = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$vddVersion/VirtualDisplayDriver-x86.Driver.Only.zip"
-    $vddControlUrl = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$vddVersion/VDD.Control.$vddVersion.zip"
     $vddLicenseUrl = "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/master/LICENSE"
     $cache = Join-Path $repo "installer\cache"
     $vddZip = Join-Path $cache "VirtualDisplayDriver-$vddVersion.Driver.Only.zip"
-    $vddControlZip = Join-Path $cache "VDD.Control.$vddVersion.zip"
     $vddExtract = Join-Path $cache "VirtualDisplayDriver-$vddVersion"
-    $vddControlExtract = Join-Path $cache "VDD.Control.$vddVersion"
     New-Item -ItemType Directory -Force -Path $cache | Out-Null
 
     if (-not (Test-Path -LiteralPath $vddZip)) {
         Write-Host "Downloading Virtual Display Driver $vddVersion..."
         Invoke-WebRequest -Uri $vddUrl -OutFile $vddZip
     }
-    if (-not (Test-Path -LiteralPath $vddControlZip)) {
-        Write-Host "Downloading VDD Control $vddVersion for devcon..."
-        Invoke-WebRequest -Uri $vddControlUrl -OutFile $vddControlZip
-    }
 
     Remove-Item -LiteralPath $vddExtract -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -Path $vddZip -DestinationPath $vddExtract -Force
-    Remove-Item -LiteralPath $vddControlExtract -Recurse -Force -ErrorAction SilentlyContinue
-    Expand-Archive -Path $vddControlZip -DestinationPath $vddControlExtract -Force
     $vddSource = Join-Path $vddExtract "VirtualDisplayDriver"
-    $devconSource = Join-Path $vddControlExtract "Dependencies\devcon.exe"
     $vddStage = Join-Path $stage "vdd"
     Remove-Item -LiteralPath $vddStage -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $vddStage | Out-Null
+    # devcon is no longer bundled; the app installs the driver through SetupAPI itself.
     Get-ChildItem -LiteralPath $vddSource -File |
         ForEach-Object { Copy-RuntimeFile $_.FullName (Join-Path "vdd" $_.Name) }
-    Copy-RuntimeFile $devconSource "vdd\devcon.exe"
 
     New-Item -ItemType Directory -Force -Path $licenseStage | Out-Null
     $licenseFile = Join-Path $licenseStage "Virtual-Display-Driver-LICENSE.txt"

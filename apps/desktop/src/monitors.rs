@@ -168,7 +168,9 @@ pub fn ensure_bundled_virtual_display_installed() {
     {
         return;
     }
-    run_bundled_vdd_action("Install", false);
+    if let Err(error) = crate::vdd::request(crate::vdd::VddAction::Install, 1) {
+        crate::logging::append(format!("bundled VDD install failed: {error:#}"));
+    }
 }
 
 pub fn ensure_bundled_virtual_display_ready() -> bool {
@@ -199,7 +201,9 @@ pub fn remove_bundled_virtual_display() {
         crate::logging::append("bundled VDD removal skipped: no display endpoint found");
         return;
     }
-    run_bundled_vdd_action("Remove", true);
+    if let Err(error) = crate::vdd::request(crate::vdd::VddAction::Remove, 1) {
+        crate::logging::append(format!("bundled VDD removal failed: {error:#}"));
+    }
 }
 
 pub fn wait_for_bundled_virtual_display(timeout: std::time::Duration) -> bool {
@@ -228,9 +232,71 @@ pub fn wait_for_bundled_virtual_capture(timeout: std::time::Duration) -> bool {
 }
 
 fn preferred_bundled_virtual_monitor() -> Option<DisplayMonitor> {
-    enumerate_monitors().into_iter().find(|monitor| {
-        monitor.capture_index.is_some() && monitor.bundled_virtual_display && !monitor.primary
-    })
+    bundled_virtual_capture_targets().into_iter().next()
+}
+
+/// Every capturable bundled VDD monitor, in a stable order so receiver N always keeps
+/// the same virtual display across rebuilds.
+pub fn bundled_virtual_capture_targets() -> Vec<DisplayMonitor> {
+    let mut targets: Vec<DisplayMonitor> = enumerate_monitors()
+        .into_iter()
+        .filter(|monitor| {
+            monitor.capture_index.is_some() && monitor.bundled_virtual_display && !monitor.primary
+        })
+        .collect();
+    targets.sort_by(|left, right| left.adapter_name.cmp(&right.adapter_name));
+    targets
+}
+
+/// Grows (or shrinks) the bundled driver to one virtual monitor per receiver and returns the
+/// capture targets that actually materialised.
+pub fn ensure_bundled_virtual_display_count(count: usize) -> Vec<DisplayMonitor> {
+    let count = count.clamp(1, 8);
+    if bundled_virtual_capture_targets().len() == count {
+        return bundled_virtual_capture_targets();
+    }
+
+    if let Err(error) = crate::vdd::request(crate::vdd::VddAction::SetCount, count as u32) {
+        crate::logging::append(format!("virtual display count change failed: {error:#}"));
+        return bundled_virtual_capture_targets();
+    }
+
+    // The driver restart tears the monitors down and brings them back, so wait for the new set.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if bundled_virtual_capture_targets().len() >= count {
+            break;
+        }
+    }
+
+    let targets = bundled_virtual_capture_targets();
+    if targets.len() < count {
+        crate::logging::append(format!(
+            "requested {count} virtual displays but only {} are capture-ready",
+            targets.len()
+        ));
+    }
+    targets
+}
+
+/// Matches one specific virtual display to the receiver that will show it.
+pub fn sync_virtual_display_mode(
+    monitor: &DisplayMonitor,
+    display: Option<&sm_core::discovery::DisplayInfo>,
+) -> anyhow::Result<()> {
+    let Some(display) = display else {
+        return Ok(());
+    };
+    if display.width < 640 || display.height < 480 {
+        return Ok(());
+    }
+    set_display_mode(
+        &monitor.adapter_name,
+        display.width,
+        display.height,
+        display.refresh_hz,
+    )
 }
 
 fn preferred_virtual_monitor() -> Option<DisplayMonitor> {
@@ -263,47 +329,6 @@ impl DisplayMonitor {
             self.bundled_virtual_display,
             self.device_id
         )
-    }
-}
-
-fn run_bundled_vdd_action(action: &str, force: bool) {
-    #[cfg(windows)]
-    {
-        let Some(script) = std::env::current_exe().ok().and_then(|path| {
-            path.parent()
-                .map(|parent| parent.join("install-bundled-vdd.ps1"))
-        }) else {
-            crate::logging::append("failed to resolve bundled VDD script path");
-            return;
-        };
-        if !script.exists() {
-            crate::logging::append(format!(
-                "bundled VDD script not found: {}",
-                script.display()
-            ));
-            return;
-        }
-        let mut command = crate::process::hidden_command("powershell.exe");
-        command
-            .args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-            ])
-            .arg(script)
-            .args(["-Action", action]);
-        if force {
-            command.arg("-Force");
-        }
-        match command.spawn() {
-            Ok(_) => crate::logging::append(format!("requested bundled VDD {action}")),
-            Err(error) => {
-                crate::logging::append(format!("failed to request VDD {action}: {error}"))
-            }
-        }
     }
 }
 

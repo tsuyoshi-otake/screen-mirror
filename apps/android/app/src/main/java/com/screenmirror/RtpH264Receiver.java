@@ -17,8 +17,8 @@ final class RtpH264Receiver {
     interface Listener {
         void onFirstPacket(String host);
 
-        /** Reports the decoded picture size so the view can letterbox instead of stretching. */
-        void onVideoSize(int width, int height);
+        /** Reports visible crop and coded buffer dimensions so the view can letterbox correctly. */
+        void onVideoSize(int width, int height, int codedWidth, int codedHeight);
 
         void onDisconnected();
 
@@ -33,15 +33,19 @@ final class RtpH264Receiver {
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
     private static final int NAL_TYPE_IDR = 5;
     private static final int NAL_TYPE_SPS = 7;
+    private static final int NAL_TYPE_PPS = 8;
     private static final int NAL_TYPE_STAP_A = 24;
     private static final int NAL_TYPE_FU_A = 28;
+    private static final int RTP_HEADER_SIZE = 12;
+    private static final int H264_PAYLOAD_TYPE = 96;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final byte[] receiveBuffer = new byte[2048];
     private final DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
     private final FuState fuState = new FuState();
     private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-    private final DisconnectWatchdog watchdog = new DisconnectWatchdog(DISCONNECT_TIMEOUT_MS);
+    private final DisconnectWatchdog watchdog;
+    private final RtpStreamLock streamLock = new RtpStreamLock();
 
     private volatile Listener listener;
     private volatile DatagramSocket socket;
@@ -56,7 +60,30 @@ final class RtpH264Receiver {
     private boolean awaitingKeyFrame = true;
     private boolean renderedAFrame;
     private boolean warnedAboutMalformedAggregation;
+    private int reportedVideoWidth;
+    private int reportedVideoHeight;
+    private int reportedBufferWidth;
+    private int reportedBufferHeight;
+    // No reordering buffer is intentional: late fragments are discarded rather than increasing
+    // latency or contaminating a decoded access unit.
+    private int expectedSequence = -1;
+    private int lastRtpTimestamp;
+    private boolean hasLastRtpTimestamp;
+    private boolean droppingAccessUnit;
+    private int droppedAccessUnitTimestamp;
     private volatile String lastSenderHost;
+
+    RtpH264Receiver() {
+        this(new DisconnectWatchdog(DISCONNECT_TIMEOUT_MS));
+    }
+
+    // Package-private for deterministic JVM tests of stream takeover timing.
+    RtpH264Receiver(DisconnectWatchdog watchdog) {
+        if (watchdog == null) {
+            throw new IllegalArgumentException("watchdog is required");
+        }
+        this.watchdog = watchdog;
+    }
 
     void setListener(Listener listener) {
         this.listener = listener;
@@ -80,11 +107,13 @@ final class RtpH264Receiver {
             awaitingKeyFrame = true;
             renderedAFrame = false;
             warnedAboutMalformedAggregation = false;
+            clearReportedVideoSizeLocked();
         }
         socket = localSocket;
         lastSenderHost = null;
-        fuState.reset();
+        resetPacketTracking();
         watchdog.reset();
+        streamLock.reset();
         running.set(true);
         thread = new Thread(() -> receiveLoop(localSocket), "rtp-h264-receiver");
         thread.start();
@@ -105,8 +134,9 @@ final class RtpH264Receiver {
 
         releaseDecoder();
         lastSenderHost = null;
-        fuState.reset();
+        resetPacketTracking();
         watchdog.reset();
+        streamLock.reset();
     }
 
     boolean isRunning() {
@@ -141,6 +171,7 @@ final class RtpH264Receiver {
             decoder = null;
             decoderSurface = null;
             awaitingKeyFrame = true;
+            clearReportedVideoSizeLocked();
         }
         if (activeDecoder == null) {
             return;
@@ -210,6 +241,11 @@ final class RtpH264Receiver {
                     receivePacket.setData(receiveBuffer, 0, receiveBuffer.length);
                     localSocket.receive(receivePacket);
                     String senderHost = receivePacket.getAddress().getHostAddress();
+                    RtpHeader header = selectRtpHeader(senderHost, receiveBuffer, receivePacket.getLength());
+                    if (header == null) {
+                        disconnectIfSelectedStreamTimedOut();
+                        continue;
+                    }
                     lastSenderHost = senderHost;
                     if (watchdog.onPacket()) {
                         AppLog.info("video packets started from " + senderHost);
@@ -218,19 +254,12 @@ final class RtpH264Receiver {
                             activeListener.onFirstPacket(senderHost);
                         }
                     }
-                    depacketizeAndQueue(receiveBuffer, receivePacket.getLength());
+                    depacketizeAndQueue(receiveBuffer, header);
                     // Draining unconditionally: skipping it while the input queue is full starves
                     // the codec of buffers and it eventually gives up with a fatal error.
                     drainDecoder();
                 } catch (SocketTimeoutException timeout) {
-                    if (watchdog.isTimedOut()) {
-                        running.set(false);
-                        AppLog.info("video receiver disconnected after packet timeout");
-                        Listener activeListener = listener;
-                        if (activeListener != null) {
-                            activeListener.onDisconnected();
-                        }
-                    }
+                    disconnectIfSelectedStreamTimedOut();
                 } catch (SocketException error) {
                     if (running.get()) {
                         fail(error);
@@ -258,30 +287,149 @@ final class RtpH264Receiver {
         }
     }
 
+    /** Invalid traffic must not suppress the timeout of a stream that had already been selected. */
+    private boolean disconnectIfSelectedStreamTimedOut() {
+        if (!watchdog.isTimedOut()) {
+            return false;
+        }
+        running.set(false);
+        AppLog.info("video receiver disconnected after selected stream timeout");
+        Listener activeListener = listener;
+        if (activeListener != null) {
+            activeListener.onDisconnected();
+        }
+        return true;
+    }
+
     // Visible for testing: depacketization is pure parsing and needs no decoder to be exercised.
     boolean depacketizeAndQueue(byte[] packet, int length) throws Exception {
-        if (length <= 12 || (packet[0] & 0xc0) != 0x80) {
+        RtpHeader header = RtpHeader.parse(packet, length);
+        if (header == null) {
             return false;
         }
+        return depacketizeAndQueue(packet, header);
+    }
 
-        int csrcCount = packet[0] & 0x0f;
-        int payloadOffset = 12 + csrcCount * 4;
-        if (payloadOffset >= length) {
+    /** Visible for testing: admits exactly one valid RTP sender stream per receiver session. */
+    boolean acceptsStreamPacket(String senderHost, byte[] packet, int length) {
+        RtpHeader header = selectRtpHeader(senderHost, packet, length);
+        if (header == null) {
             return false;
         }
+        watchdog.onPacket();
+        return true;
+    }
+
+    /**
+     * Reject packets from every other stream, but do not let that traffic mask a dead selected
+     * stream forever. Once the selected stream has been silent for the normal watchdog interval,
+     * make the current valid candidate the new stream and wait for its SPS/IDR again.
+     */
+    private RtpHeader selectRtpHeader(String senderHost, byte[] packet, int length) {
+        RtpHeader header = RtpHeader.parse(packet, length);
+        if (header == null) {
+            return null;
+        }
+        if (streamLock.accepts(senderHost, header.ssrc)) {
+            return header;
+        }
+        if (watchdog.isTimedOut()) {
+            AppLog.warn("selected RTP video stream timed out; switching from "
+                    + streamLock.description() + " to " + senderHost + "/"
+                    + Integer.toUnsignedString(header.ssrc), null);
+            resyncForStreamTakeover();
+            streamLock.reset();
+            streamLock.accepts(senderHost, header.ssrc);
+            watchdog.reset();
+            return header;
+        }
+        if (streamLock.shouldWarnFor(senderHost, header.ssrc)) {
+            AppLog.warn("ignoring RTP video stream from " + senderHost
+                    + " with SSRC " + Integer.toUnsignedString(header.ssrc)
+                    + "; receiver is locked to " + streamLock.description(), null);
+        }
+        return null;
+    }
+
+    private void resyncForStreamTakeover() {
+        resetPacketTracking();
+        synchronized (decoderLock) {
+            awaitingKeyFrame = true;
+            renderedAFrame = false;
+        }
+    }
+
+    private void resetPacketTracking() {
+        fuState.reset();
+        expectedSequence = -1;
+        hasLastRtpTimestamp = false;
+        droppingAccessUnit = false;
+    }
+
+    /** Marks a sequence gap as damage and prevents the rest of that access unit from rendering. */
+    private void notePacketSequence(RtpHeader header) {
+        if (expectedSequence >= 0 && header.sequence != expectedSequence) {
+            boolean sameAccessUnit = hasLastRtpTimestamp && header.timestamp == lastRtpTimestamp;
+            AppLog.warn("RTP sequence gap: expected " + expectedSequence + ", got " + header.sequence,
+                    null);
+            fuState.reset();
+            synchronized (decoderLock) {
+                awaitingKeyFrame = true;
+            }
+            if (sameAccessUnit) {
+                droppingAccessUnit = true;
+                droppedAccessUnitTimestamp = header.timestamp;
+            }
+        }
+        expectedSequence = (header.sequence + 1) & 0xffff;
+        lastRtpTimestamp = header.timestamp;
+        hasLastRtpTimestamp = true;
+    }
+
+    private boolean shouldDropAccessUnit(int timestamp) {
+        if (!droppingAccessUnit) {
+            return false;
+        }
+        if (timestamp == droppedAccessUnitTimestamp) {
+            return true;
+        }
+        droppingAccessUnit = false;
+        return false;
+    }
+
+    private void discardIncompleteNal(int timestamp) {
+        fuState.reset();
+        discardAccessUnit(timestamp);
+    }
+
+    private void discardAccessUnit(int timestamp) {
+        droppingAccessUnit = true;
+        droppedAccessUnitTimestamp = timestamp;
+        synchronized (decoderLock) {
+            awaitingKeyFrame = true;
+        }
+    }
+
+    private boolean depacketizeAndQueue(byte[] packet, RtpHeader header) throws Exception {
+        notePacketSequence(header);
+        if (shouldDropAccessUnit(header.timestamp)) {
+            return false;
+        }
+        int payloadOffset = header.payloadOffset;
+        int payloadLength = header.payloadLength;
 
         int nalType = packet[payloadOffset] & 0x1f;
         if (nalType >= 1 && nalType <= 23) {
-            queueNal(packet, payloadOffset, length - payloadOffset);
+            queueNal(packet, payloadOffset, payloadLength, header.timestamp);
             return true;
         }
 
         // The sender aggregates its parameter sets, so a stream without STAP-A support never decodes.
         if (nalType == NAL_TYPE_STAP_A) {
-            return queueAggregatedNals(packet, payloadOffset + 1, length - payloadOffset - 1);
+            return queueAggregatedNals(packet, payloadOffset + 1, payloadLength - 1, header.timestamp);
         }
 
-        if (nalType != NAL_TYPE_FU_A || payloadOffset + 2 >= length) {
+        if (nalType != NAL_TYPE_FU_A || payloadLength < 3) {
             return false;
         }
 
@@ -291,24 +439,32 @@ final class RtpH264Receiver {
         boolean end = (fuHeader & 0x40) != 0;
         int reconstructedHeader = (fuIndicator & 0xe0) | (fuHeader & 0x1f);
         int fragmentOffset = payloadOffset + 2;
-        int fragmentLength = length - fragmentOffset;
+        int fragmentLength = payloadLength - 2;
 
         if (start) {
+            if (fuState.active) {
+                // The unfinished NAL is corrupt. Without an access-unit buffer, conservatively
+                // drop this whole timestamp instead of combining an unknown new slice with it.
+                discardIncompleteNal(header.timestamp);
+                return false;
+            }
             fuState.reset();
-            fuState.append((byte) reconstructedHeader);
+            fuState.start((byte) reconstructedHeader, header.timestamp);
         }
-        if (!fuState.active) {
+        if (!fuState.active || fuState.timestamp != header.timestamp
+                || fuState.nalHeader != (byte) reconstructedHeader) {
+            discardIncompleteNal(header.timestamp);
             return false;
         }
         try {
             fuState.append(packet, fragmentOffset, fragmentLength);
         } catch (IllegalArgumentException oversizedNal) {
-            fuState.reset();
+            discardIncompleteNal(header.timestamp);
             AppLog.warn("dropped an oversized fragmented H.264 NAL", oversizedNal);
             return false;
         }
         if (end) {
-            queueNal(fuState.data, 0, fuState.size);
+            queueNal(fuState.data, 0, fuState.size, header.timestamp);
             fuState.reset();
             return true;
         }
@@ -316,7 +472,7 @@ final class RtpH264Receiver {
     }
 
     /** Unpacks a STAP-A packet: a series of 2-byte lengths, each followed by one whole NAL unit. */
-    private boolean queueAggregatedNals(byte[] packet, int offset, int available) {
+    private boolean queueAggregatedNals(byte[] packet, int offset, int available, int timestamp) {
         boolean queued = false;
         int cursor = offset;
         int end = offset + available;
@@ -330,37 +486,40 @@ final class RtpH264Receiver {
                 }
                 break;
             }
-            queueNal(packet, cursor, size);
+            queueNal(packet, cursor, size, timestamp);
             cursor += size;
             queued = true;
         }
         return queued;
     }
 
-    private void queueNal(byte[] source, int offset, int length) {
+    private void queueNal(byte[] source, int offset, int length, int timestamp) {
         if (length <= 0) {
             return;
         }
         int nalType = source[offset] & 0x1f;
 
         synchronized (decoderLock) {
+            // A fresh codec chokes on data that starts mid-picture. Parameter sets are needed
+            // before an IDR, but are not themselves a recovery point after a packet loss.
+            if (awaitingKeyFrame) {
+                if (nalType != NAL_TYPE_SPS && nalType != NAL_TYPE_PPS && nalType != NAL_TYPE_IDR) {
+                    return;
+                }
+                if (nalType == NAL_TYPE_IDR) {
+                    awaitingKeyFrame = false;
+                }
+            }
             MediaCodec activeDecoder = decoder;
             if (activeDecoder == null) {
                 return;
-            }
-            // A fresh codec chokes on data that starts mid-picture, so wait for a parameter set or IDR.
-            if (awaitingKeyFrame) {
-                if (nalType != NAL_TYPE_SPS && nalType != NAL_TYPE_IDR) {
-                    return;
-                }
-                awaitingKeyFrame = false;
             }
 
             try {
                 int index = activeDecoder.dequeueInputBuffer(10_000);
                 if (index < 0) {
                     // Half a picture is worse than none: resync on the next key frame instead.
-                    awaitingKeyFrame = true;
+                    discardAccessUnit(timestamp);
                     return;
                 }
 
@@ -368,6 +527,7 @@ final class RtpH264Receiver {
                 long presentationTimeUs = System.nanoTime() / 1000L;
                 if (input == null || input.capacity() < length + START_CODE.length) {
                     activeDecoder.queueInputBuffer(index, 0, 0, presentationTimeUs, 0);
+                    discardAccessUnit(timestamp);
                     AppLog.warn("video decoder input buffer was too small", null);
                     return;
                 }
@@ -378,7 +538,15 @@ final class RtpH264Receiver {
                 activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, presentationTimeUs, 0);
             } catch (IllegalStateException error) {
                 restartDecoderLocked(error);
+                discardAccessUnit(timestamp);
             }
+        }
+    }
+
+    // Visible for testing: validates recovery state without requiring an Android MediaCodec.
+    boolean isAwaitingKeyFrame() {
+        synchronized (decoderLock) {
+            return awaitingKeyFrame;
         }
     }
 
@@ -387,23 +555,49 @@ final class RtpH264Receiver {
      * crop rectangle is what actually reaches the surface.
      */
     private void reportVideoSize(MediaFormat format) {
-        int width = videoSize(format, MediaFormat.KEY_WIDTH, "crop-left", "crop-right");
-        int height = videoSize(format, MediaFormat.KEY_HEIGHT, "crop-top", "crop-bottom");
+        int codedWidth = format.containsKey(MediaFormat.KEY_WIDTH)
+                ? format.getInteger(MediaFormat.KEY_WIDTH) : 0;
+        int codedHeight = format.containsKey(MediaFormat.KEY_HEIGHT)
+                ? format.getInteger(MediaFormat.KEY_HEIGHT) : 0;
+        int width = videoSize(format, codedWidth, "crop-left", "crop-right");
+        int height = videoSize(format, codedHeight, "crop-top", "crop-bottom");
         if (width <= 0 || height <= 0) {
             return;
         }
-        AppLog.info("video size is " + width + "x" + height);
+        if (codedWidth <= 0) {
+            codedWidth = width;
+        }
+        if (codedHeight <= 0) {
+            codedHeight = height;
+        }
+        if (width == reportedVideoWidth && height == reportedVideoHeight
+                && codedWidth == reportedBufferWidth && codedHeight == reportedBufferHeight) {
+            return;
+        }
+        reportedVideoWidth = width;
+        reportedVideoHeight = height;
+        reportedBufferWidth = codedWidth;
+        reportedBufferHeight = codedHeight;
+        AppLog.info("video size is " + width + "x" + height
+                + " (coded " + codedWidth + "x" + codedHeight + ")");
         Listener activeListener = listener;
         if (activeListener != null) {
-            activeListener.onVideoSize(width, height);
+            activeListener.onVideoSize(width, height, codedWidth, codedHeight);
         }
     }
 
-    private static int videoSize(MediaFormat format, String sizeKey, String startKey, String endKey) {
+    private static int videoSize(MediaFormat format, int defaultSize, String startKey, String endKey) {
         if (format.containsKey(startKey) && format.containsKey(endKey)) {
             return format.getInteger(endKey) - format.getInteger(startKey) + 1;
         }
-        return format.containsKey(sizeKey) ? format.getInteger(sizeKey) : 0;
+        return defaultSize;
+    }
+
+    private void clearReportedVideoSizeLocked() {
+        reportedVideoWidth = 0;
+        reportedVideoHeight = 0;
+        reportedBufferWidth = 0;
+        reportedBufferHeight = 0;
     }
 
     private void drainDecoder() {
@@ -449,10 +643,122 @@ final class RtpH264Receiver {
         }
     }
 
+    /** A session chooses the first valid H.264 RTP stream and never interleaves another one. */
+    private static final class RtpStreamLock {
+        private String host;
+        private int ssrc;
+        private String lastRejected;
+
+        synchronized boolean accepts(String candidateHost, int candidateSsrc) {
+            if (host == null) {
+                host = candidateHost;
+                ssrc = candidateSsrc;
+                lastRejected = null;
+                return true;
+            }
+            return host.equals(candidateHost) && ssrc == candidateSsrc;
+        }
+
+        synchronized boolean shouldWarnFor(String candidateHost, int candidateSsrc) {
+            String candidate = candidateHost + "/" + Integer.toUnsignedString(candidateSsrc);
+            if (candidate.equals(lastRejected)) {
+                return false;
+            }
+            lastRejected = candidate;
+            return true;
+        }
+
+        synchronized String description() {
+            return host + "/" + Integer.toUnsignedString(ssrc);
+        }
+
+        synchronized void reset() {
+            host = null;
+            ssrc = 0;
+            lastRejected = null;
+        }
+    }
+
+    /** Validates the RTP envelope before any packet can select or feed the decoder. */
+    private static final class RtpHeader {
+        final int ssrc;
+        final int sequence;
+        final int timestamp;
+        final int payloadOffset;
+        final int payloadLength;
+
+        RtpHeader(int ssrc, int sequence, int timestamp, int payloadOffset, int payloadLength) {
+            this.ssrc = ssrc;
+            this.sequence = sequence;
+            this.timestamp = timestamp;
+            this.payloadOffset = payloadOffset;
+            this.payloadLength = payloadLength;
+        }
+
+        static RtpHeader parse(byte[] packet, int length) {
+            if (packet == null || length <= RTP_HEADER_SIZE || length > packet.length) {
+                return null;
+            }
+            int first = packet[0] & 0xff;
+            if ((first & 0xc0) != 0x80 || (packet[1] & 0x7f) != H264_PAYLOAD_TYPE) {
+                return null;
+            }
+
+            int payloadEnd = length;
+            if ((first & 0x20) != 0) {
+                int padding = packet[length - 1] & 0xff;
+                if (padding == 0 || padding > length - RTP_HEADER_SIZE) {
+                    return null;
+                }
+                payloadEnd -= padding;
+            }
+
+            int payloadOffset = RTP_HEADER_SIZE + (first & 0x0f) * 4;
+            if (payloadOffset > payloadEnd) {
+                return null;
+            }
+            if ((first & 0x10) != 0) {
+                if (payloadOffset + 4 > payloadEnd) {
+                    return null;
+                }
+                int extensionWords = ((packet[payloadOffset + 2] & 0xff) << 8)
+                        | (packet[payloadOffset + 3] & 0xff);
+                long extensionEnd = (long) payloadOffset + 4L + (long) extensionWords * 4L;
+                if (extensionEnd > payloadEnd) {
+                    return null;
+                }
+                payloadOffset = (int) extensionEnd;
+            }
+            if (payloadOffset >= payloadEnd) {
+                return null;
+            }
+
+            int ssrc = ((packet[8] & 0xff) << 24)
+                    | ((packet[9] & 0xff) << 16)
+                    | ((packet[10] & 0xff) << 8)
+                    | (packet[11] & 0xff);
+            int sequence = ((packet[2] & 0xff) << 8) | (packet[3] & 0xff);
+            int timestamp = ((packet[4] & 0xff) << 24)
+                    | ((packet[5] & 0xff) << 16)
+                    | ((packet[6] & 0xff) << 8)
+                    | (packet[7] & 0xff);
+            return new RtpHeader(ssrc, sequence, timestamp, payloadOffset, payloadEnd - payloadOffset);
+        }
+    }
+
     private static final class FuState {
         byte[] data = new byte[1024 * 1024];
         int size = 0;
         boolean active = false;
+        byte nalHeader;
+        int timestamp;
+
+        void start(byte header, int timestamp) {
+            reset();
+            nalHeader = header;
+            this.timestamp = timestamp;
+            append(header);
+        }
 
         void append(byte value) {
             ensure(1);
@@ -470,6 +776,8 @@ final class RtpH264Receiver {
         void reset() {
             size = 0;
             active = false;
+            nalHeader = 0;
+            timestamp = 0;
         }
 
         void ensure(int length) {

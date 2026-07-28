@@ -7,6 +7,14 @@ use std::fmt;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
+// Let the jitter buffer report missing RTP packets to the depayloader.  The depayloader then
+// discards damaged access units until an IDR frame arrives, rather than passing a corrupted
+// reference frame into the decoder (which can leave visible block noise for many frames).
+// This does not add buffering: the existing jitter latency remains the only wait.
+const VIDEO_RTP_JITTER_LOSS_SIGNAL: &str = "do-lost=true";
+const VIDEO_H264_DEPAY_LOSS_RECOVERY: &str = "wait-for-keyframe=true request-keyframe=true";
+const VIDEO_H264_ACCESS_UNIT_CAPS: &str = "video/x-h264,alignment=au";
+
 #[derive(Args, Clone, Debug)]
 pub struct SendArgs {
     /// Receiver IPs/hosts separated by commas, or "auto" for LAN discovery.
@@ -441,8 +449,9 @@ pub fn build_receiver_video_pipeline(args: &RecvArgs) -> Result<String> {
     let video = format!(
         "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
          ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
-         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
-         ! rtph264depay \
+         ! rtpjitterbuffer latency={} drop-on-latency=true {VIDEO_RTP_JITTER_LOSS_SIGNAL} faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
+         ! rtph264depay {VIDEO_H264_DEPAY_LOSS_RECOVERY} \
+         ! {VIDEO_H264_ACCESS_UNIT_CAPS} \
          ! h264parse disable-passthrough=true \
          ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {decoder} \
@@ -934,5 +943,17 @@ mod tests {
         let caps = video_caps(30, Some(1920), Some(1080), true);
         assert!(caps.contains("memory:D3D11Memory"));
         assert!(!caps.contains("d3d11download"));
+    }
+
+    #[test]
+    fn receiver_h264_loss_recovery_drops_damaged_frames_without_extra_buffering() {
+        assert_eq!(VIDEO_RTP_JITTER_LOSS_SIGNAL, "do-lost=true");
+        assert!(VIDEO_H264_DEPAY_LOSS_RECOVERY.contains("wait-for-keyframe=true"));
+        assert!(VIDEO_H264_DEPAY_LOSS_RECOVERY.contains("request-keyframe=true"));
+        assert!(!VIDEO_H264_DEPAY_LOSS_RECOVERY.contains("latency="));
+
+        // `wait-for-keyframe` applies to access-unit output.  This capsfilter only constrains
+        // negotiation; it does not queue or schedule buffers.
+        assert_eq!(VIDEO_H264_ACCESS_UNIT_CAPS, "video/x-h264,alignment=au");
     }
 }

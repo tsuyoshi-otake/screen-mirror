@@ -7,7 +7,9 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Typeface;
 import android.media.AudioManager;
 import android.media.projection.MediaProjectionManager;
@@ -72,6 +74,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     private boolean senderActive;
     private boolean updatingAudioControls;
     private String receiverPin = Pin.DEFAULT;
+    private VideoPresentation.Orientation receiverOrientation = VideoPresentation.Orientation.UNSPECIFIED;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -95,6 +98,9 @@ public final class MainActivity extends Activity implements ScreenCaptureService
 
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                // A fixed decoder buffer survives surface relayouts; still remeasure the viewport
+                // after a rotation so it remains centred and letterboxed.
+                surfaceView.requestLayout();
             }
 
             @Override
@@ -286,6 +292,16 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     }
 
     @Override
+    public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        if (receiverRequested && surfaceView != null) {
+            // configChanges keeps this Activity alive, so explicitly schedule a layout pass after
+            // the new fullscreen bounds are applied.
+            surfaceView.post(surfaceView::requestLayout);
+        }
+    }
+
+    @Override
     protected void onStop() {
         ScreenCaptureService.clearListener(this);
         super.onStop();
@@ -443,8 +459,14 @@ public final class MainActivity extends Activity implements ScreenCaptureService
             }
 
             @Override
-            public void onVideoSize(int width, int height) {
-                runOnUiThread(() -> surfaceView.setVideoSize(width, height));
+            public void onVideoSize(int width, int height, int codedWidth, int codedHeight) {
+                runOnUiThread(() -> {
+                    if (!receiverRequested) {
+                        return;
+                    }
+                    surfaceView.setVideoSize(width, height, codedWidth, codedHeight);
+                    applyReceiverOrientation(width, height);
+                });
             }
 
             @Override
@@ -624,6 +646,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         receiverRequested = false;
         stopReceiverTransports();
         discovery.stop();
+        resetReceiverPresentation();
         leaveReceiverFullscreen();
         keepReceiverAwake(false);
         ScreenCaptureService.stop(this);
@@ -664,6 +687,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         stopReceiverTransports();
         discovery.stop();
         ScreenCaptureService.stop(this);
+        resetReceiverPresentation();
         leaveReceiverFullscreen();
         keepReceiverAwake(false);
         releaseMulticast();
@@ -674,6 +698,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
         receiverRequested = false;
         stopReceiverTransports();
         discovery.stop();
+        resetReceiverPresentation();
         leaveReceiverFullscreen();
         keepReceiverAwake(false);
         releaseMulticast();
@@ -682,6 +707,37 @@ public final class MainActivity extends Activity implements ScreenCaptureService
     private void stopReceiverTransports() {
         receiver.stop();
         audioReceiver.stop();
+    }
+
+    private void applyReceiverOrientation(int width, int height) {
+        VideoPresentation.Orientation next = VideoPresentation.orientationFor(
+                width, height, receiverOrientation
+        );
+        if (next == receiverOrientation) {
+            return;
+        }
+        receiverOrientation = next;
+        switch (next) {
+            case LANDSCAPE:
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+                break;
+            case PORTRAIT:
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+                break;
+            case UNSPECIFIED:
+                setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+                break;
+        }
+    }
+
+    private void resetReceiverPresentation() {
+        if (surfaceView != null) {
+            surfaceView.clearVideoSize();
+        }
+        if (receiverOrientation != VideoPresentation.Orientation.UNSPECIFIED) {
+            receiverOrientation = VideoPresentation.Orientation.UNSPECIFIED;
+            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+        }
     }
 
     private void replaceSelectedReceivers(List<DiscoveryAgent.Peer> peers) {

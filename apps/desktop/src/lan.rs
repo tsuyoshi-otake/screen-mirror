@@ -3,6 +3,7 @@ use sm_core::{
     diagnostics::DIAGNOSTICS_PORT,
     discovery::{self, DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole},
 };
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -88,7 +89,10 @@ impl SenderSupervisor {
                     .iter()
                     .any(|handle| handle.is_finished())
                 {
-                    stop_video_pipelines(&mut active_video_pipelines, "sender video pipeline stopped");
+                    stop_video_pipelines(
+                        &mut active_video_pipelines,
+                        "sender video pipeline stopped",
+                    );
                     if let Some(handle) = active_audio_pipeline.take() {
                         if let Err(error) = handle.stop() {
                             log_sender(format!(
@@ -404,7 +408,12 @@ impl Drop for Announcer {
 }
 
 pub fn resolve_sender_args(args: SendArgs) -> Result<SendArgs> {
-    let resolved = discover_sender_args(args)?;
+    let mut resolved = discover_sender_args(args)?;
+    (resolved.args.width, resolved.args.height) = effective_video_size(
+        resolved.args.width,
+        resolved.args.height,
+        resolved.target_display.as_ref(),
+    );
     let _ = prepare_sender_environment(&resolved);
     Ok(resolved.args)
 }
@@ -428,7 +437,10 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         });
     }
 
-    let receivers = discover_receivers_with_pin(Duration::from_secs(5), &args.pin)?;
+    let receivers = stable_unique_receivers(discover_receivers_with_pin(
+        Duration::from_secs(5),
+        &args.pin,
+    )?);
     if receivers.is_empty() {
         return Err(anyhow!(
             "no receivers discovered with matching PIN; start receiver mode on another device or set the same four-digit PIN"
@@ -438,13 +450,6 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
     let target_display = receivers
         .iter()
         .find_map(|peer| peer.announcement.display.clone());
-
-    if args.width.is_none() && args.height.is_none() {
-        if let Some(display) = &target_display {
-            args.width = Some(display.width);
-            args.height = Some(display.height);
-        }
-    }
 
     let selected: Vec<ReceiverTarget> = receivers
         .into_iter()
@@ -467,9 +472,45 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
     })
 }
 
+/// Discovery arrival order changes from pass to pass.  Keep receiver-to-display assignment stable
+/// and collapse stale duplicate announcements that point at the same RTP endpoint; otherwise the
+/// sender rebuilds its pipelines and can alternate two desktop streams on one Android UDP socket.
+fn stable_unique_receivers(mut receivers: Vec<DiscoveredPeer>) -> Vec<DiscoveredPeer> {
+    receivers.sort_by(|left, right| {
+        left.announcement
+            .instance_id
+            .cmp(&right.announcement.instance_id)
+            .then_with(|| left.address.cmp(&right.address))
+            .then_with(|| {
+                left.announcement
+                    .stream_port
+                    .cmp(&right.announcement.stream_port)
+            })
+    });
+
+    let mut endpoints = HashSet::new();
+    receivers.retain(|peer| endpoints.insert((peer.address, peer.announcement.stream_port)));
+    receivers
+}
+
+fn effective_video_size(
+    width: Option<u32>,
+    height: Option<u32>,
+    display: Option<&DisplayInfo>,
+) -> (Option<u32>, Option<u32>) {
+    if width.is_some() || height.is_some() {
+        return (width, height);
+    }
+    display
+        .map(|display| (Some(display.width), Some(display.height)))
+        .unwrap_or((None, None))
+}
+
 /// Gives every receiver its own virtual display, so a second phone joining gets a new desktop
 /// instead of a copy of the first one's.
-fn assign_receiver_displays(resolved: &ResolvedSender) -> Vec<Option<crate::monitors::DisplayMonitor>> {
+fn assign_receiver_displays(
+    resolved: &ResolvedSender,
+) -> Vec<Option<crate::monitors::DisplayMonitor>> {
     let receivers = &resolved.receivers;
     if !resolved.args.enable_virtual_display || receivers.is_empty() {
         return receivers.iter().map(|_| None).collect();
@@ -519,6 +560,11 @@ fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Vec<PipelineHand
     for (receiver, target) in resolved.receivers.iter().zip(assignments) {
         let mut receiver_args = resolved.args.clone();
         receiver_args.host = receiver.host.clone();
+        (receiver_args.width, receiver_args.height) = effective_video_size(
+            receiver_args.width,
+            receiver_args.height,
+            receiver.display.as_ref(),
+        );
         match pipeline::build_sender_video_pipeline_for(&receiver_args, target.as_ref()) {
             Ok(description) => pipelines.push(pipeline::spawn_pipeline(description)),
             Err(error) => log_sender(format!(
@@ -579,7 +625,9 @@ fn device_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::SenderPreparationState;
+    use super::{effective_video_size, stable_unique_receivers, SenderPreparationState};
+    use sm_core::discovery::{DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole};
+    use std::net::Ipv4Addr;
 
     #[test]
     fn sender_environment_is_prepared_once_per_receiver_set() {
@@ -592,5 +640,67 @@ mod tests {
 
         state.reset();
         assert!(state.should_prepare("10.0.0.3:5004"));
+    }
+
+    #[test]
+    fn receiver_order_and_endpoint_set_are_stable_across_discovery_passes() {
+        let receiver = |instance: &str, address: [u8; 4], port: u16| DiscoveredPeer {
+            announcement: PeerAnnouncement::new(instance, instance, PeerRole::Receiver, port),
+            address: Ipv4Addr::from(address),
+        };
+        let first = vec![
+            receiver("phone-b", [10, 0, 0, 3], 5004),
+            receiver("phone-a-stale", [10, 0, 0, 2], 5004),
+            receiver("phone-a", [10, 0, 0, 2], 5004),
+        ];
+        let mut second = first.clone();
+        second.reverse();
+
+        let first = stable_unique_receivers(first);
+        let second = stable_unique_receivers(second);
+        let identities = |peers: &[DiscoveredPeer]| {
+            peers
+                .iter()
+                .map(|peer| {
+                    (
+                        peer.announcement.instance_id.clone(),
+                        peer.address,
+                        peer.announcement.stream_port,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(identities(&first), identities(&second));
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].announcement.instance_id, "phone-a");
+        assert_eq!(first[1].announcement.instance_id, "phone-b");
+    }
+
+    #[test]
+    fn each_receiver_gets_its_own_video_size_unless_the_user_overrides_it() {
+        let portrait = DisplayInfo {
+            width: 720,
+            height: 1604,
+            refresh_hz: Some(60),
+        };
+        let landscape = DisplayInfo {
+            width: 1366,
+            height: 768,
+            refresh_hz: Some(60),
+        };
+
+        assert_eq!(
+            effective_video_size(None, None, Some(&portrait)),
+            (Some(720), Some(1604))
+        );
+        assert_eq!(
+            effective_video_size(None, None, Some(&landscape)),
+            (Some(1366), Some(768))
+        );
+        assert_eq!(
+            effective_video_size(Some(1920), Some(1080), Some(&portrait)),
+            (Some(1920), Some(1080))
+        );
     }
 }

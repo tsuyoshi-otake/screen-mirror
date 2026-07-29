@@ -464,19 +464,26 @@ fn capture_adapter(
             .or_else(|| crate::gpu::adapter_for_display_device_name(&target.adapter_name));
     }
 
-    if monitor_index >= 0 {
-        return None;
-    }
+    let monitors = crate::monitors::enumerate_monitors();
+    capture_monitor_for_index(&monitors, monitor_index).and_then(|monitor| {
+        monitor
+            .monitor_handle
+            .and_then(crate::gpu::adapter_for_monitor_handle)
+            .or_else(|| crate::gpu::adapter_for_display_device_name(&monitor.adapter_name))
+    })
+}
 
-    crate::monitors::enumerate_monitors()
-        .into_iter()
-        .find(|monitor| monitor.primary)
-        .and_then(|monitor| {
-            monitor
-                .monitor_handle
-                .and_then(crate::gpu::adapter_for_monitor_handle)
-                .or_else(|| crate::gpu::adapter_for_display_device_name(&monitor.adapter_name))
-        })
+fn capture_monitor_for_index(
+    monitors: &[crate::monitors::DisplayMonitor],
+    monitor_index: i32,
+) -> Option<&crate::monitors::DisplayMonitor> {
+    if monitor_index >= 0 {
+        monitors
+            .iter()
+            .find(|monitor| monitor.capture_index == Some(monitor_index))
+    } else {
+        monitors.iter().find(|monitor| monitor.primary)
+    }
 }
 
 pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
@@ -679,7 +686,8 @@ fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) ->
         )
     } else {
         format!(
-            "d3d11convert ! d3d11download ! videoconvert ! video/x-raw,format=NV12,framerate={fps}/1{size}"
+            "d3d11convert ! video/x-raw(memory:D3D11Memory),format=NV12,framerate={fps}/1{size} \
+             ! d3d11download ! video/x-raw,format=NV12,framerate={fps}/1{size}"
         )
     }
 }
@@ -766,11 +774,11 @@ impl SelectedEncoder {
         match self.family {
             EncoderFamily::Nvidia => nvidia_encoder_chain(element, bitrate, fps, nvidia_tuning),
             EncoderFamily::Amf => format!(
-                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} usage=ultra-low-latency rate-control=cbr aud=false \
+                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} usage=ultra-low-latency preset=speed rate-control=cbr aud=false \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
             EncoderFamily::MediaFoundation => format!(
-                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=100 \
+                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=0 \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
             EncoderFamily::QuickSync => format!(
@@ -1176,6 +1184,61 @@ mod tests {
         let caps = video_caps(30, Some(1920), Some(1080), true);
         assert!(caps.contains("memory:D3D11Memory"));
         assert!(!caps.contains("d3d11download"));
+    }
+
+    #[test]
+    fn system_memory_caps_convert_to_nv12_before_download() {
+        let caps = video_caps(30, Some(1920), Some(1080), false);
+        let gpu_nv12 = caps
+            .find("video/x-raw(memory:D3D11Memory),format=NV12")
+            .expect("GPU NV12 conversion");
+        let download = caps.find("d3d11download").expect("D3D11 download");
+        let system_nv12 = caps
+            .rfind("video/x-raw,format=NV12")
+            .expect("system-memory NV12 caps");
+
+        assert!(gpu_nv12 < download);
+        assert!(download < system_nv12);
+        assert!(!caps.contains("videoconvert"));
+    }
+
+    #[test]
+    fn explicit_capture_index_resolves_its_monitor() {
+        let mut primary = virtual_monitor(Some(10), false);
+        primary.capture_index = Some(0);
+        primary.primary = true;
+        primary.adapter_name = r"\\.\DISPLAY1".to_string();
+
+        let mut selected = virtual_monitor(Some(20), false);
+        selected.capture_index = Some(2);
+        selected.primary = false;
+        selected.adapter_name = r"\\.\DISPLAY3".to_string();
+
+        let monitors = [primary, selected];
+        let monitor = capture_monitor_for_index(&monitors, 2).unwrap();
+
+        assert_eq!(monitor.adapter_name, r"\\.\DISPLAY3");
+    }
+
+    #[test]
+    fn encoder_speed_profiles_are_used_for_live_streaming() {
+        let amf = SelectedEncoder {
+            family: EncoderFamily::Amf,
+            element: "amfh264enc".to_string(),
+            adapter_luid: None,
+        }
+        .chain(8_000, 30, NvidiaTuning::Auto);
+        let media_foundation = SelectedEncoder {
+            family: EncoderFamily::MediaFoundation,
+            element: "mfh264enc".to_string(),
+            adapter_luid: None,
+        }
+        .chain(8_000, 30, NvidiaTuning::Auto);
+
+        assert!(amf.contains("usage=ultra-low-latency"));
+        assert!(amf.contains("preset=speed"));
+        assert!(media_foundation.contains("quality-vs-speed=0"));
+        assert!(!media_foundation.contains("quality-vs-speed=100"));
     }
 
     #[test]

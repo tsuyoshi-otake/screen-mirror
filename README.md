@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.43`.
+The desktop and Android package versions for this release are `0.1.44`.
 
 ## Transport Model
 
@@ -297,6 +297,7 @@ The tray app is launched after install/update and is registered under HKCU Run f
 ## Diagnostics
 
 Use tray menu `Run Diagnostics` to collect a local debug report. The report is saved under `%TEMP%`, opened in Notepad, and copied to the clipboard so it can be pasted into an issue or chat.
+Run it while sender mode is actively mirroring: the `Video Encode` result is sampled live for five seconds, while the AMF and D3D11 results describe the last sender route recorded in the log.
 
 Use tray menu `Run Peer Diagnostics` on a receiver to collect diagnostics from a sender with the same PIN. The sender advertises a diagnostics endpoint while sender mode is active, and the receiver requests the report over TCP `47779`. The received report is saved under `%TEMP%`, opened in Notepad, and copied to the receiver clipboard.
 
@@ -306,6 +307,8 @@ The report includes:
 - Recent Screen Mirror log lines
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
+- Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, and GPU-engine usage
+- GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` engine activity
 - Bundled VDD device status and other virtual display candidates
 - Communication health verdict, Windows network profiles, active UDP/TCP endpoints, and the installed Screen Mirror firewall rule
 - Windows display list, GStreamer probe, receiver discovery, network adapters, and virtual display state
@@ -458,6 +461,8 @@ Android build requirements:
 The desktop sender uses a low-latency RTP/UDP pipeline:
 
 - D3D11 screen capture stays in GPU memory for NVIDIA, Quick Sync, AMF, and D3D11-aware Media Foundation encoders when `zero_copy = true`, and only while the encoder runs on the capture GPU.
+- When an encoder requires system-memory input, color conversion and scaling still run on the capture GPU before downloading compact NV12 frames, avoiding CPU-side BGRA conversion and reducing the downloaded bytes per pixel.
+- AMD AMF uses its ultra-low-latency usage and speed preset. The Media Foundation fallback also selects its fastest live-encoding quality/speed mode.
 - Sender queues are leaky and capped at one frame so old frames are dropped instead of delayed.
 - Audio uses 5 ms Opus frames, short bounded burst queues, two-packet jitter-buffer fast start, Opus packet-loss concealment, and the native WASAPI low-latency mode.
 - RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.

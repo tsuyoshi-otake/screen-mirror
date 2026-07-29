@@ -30,6 +30,10 @@ $updatesPath = Join-Path $env:LOCALAPPDATA "ScreenMirror\Updates"
 $reportPath = Join-Path $env:TEMP ("ScreenMirror-diagnostics-{0}.txt" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 $interestingPorts = @(47776, 47777, 47778, 47779, 5004, 5005)
 $lines = New-Object System.Collections.Generic.List[string]
+$sampledProcessResources = @()
+$sampledGpuMemory = @()
+$sampledGpuEngines = @()
+$gpuEngineSampleSucceeded = $false
 
 function Add-Line([string] $Line = "") {
     $script:lines.Add($Line) | Out-Null
@@ -234,6 +238,172 @@ function Get-VirtualDisplayCandidates {
     })
 }
 
+function Get-GpuAccelerationVerdict {
+    $adapterNames = @()
+    try {
+        $adapterNames = @(Get-CimInstance Win32_VideoController -ErrorAction Stop |
+            ForEach-Object { $_.Name } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    } catch {
+        $adapterNames = @()
+    }
+    $radeonAdapters = @($adapterNames | Where-Object { $_ -match "(?i)\b(AMD|ATI|Radeon)\b" })
+
+    $probe = Invoke-ScreenMirror @("probe")
+    $amfFactory = if ($probe -match "(?im)^amf encode\s+amfh264enc\s+yes\s*$") {
+        "AVAILABLE"
+    } elseif ($probe -match "(?im)^amf encode\s+amfh264enc\s+no\s*$") {
+        "UNAVAILABLE"
+    } else {
+        $amfInspect = Invoke-GstInspect @("amfh264enc")
+        if ($amfInspect -match "(?im)^Factory Details:\s*$") {
+            "AVAILABLE"
+        } elseif ($amfInspect -match "(?i)No such element or plugin") {
+            "UNAVAILABLE"
+        } else {
+            "UNKNOWN - current executable does not report AMF and gst-inspect could not confirm it"
+        }
+    }
+
+    $logLines = if (Test-Path -LiteralPath $logPath) {
+        @(Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue)
+    } else {
+        @()
+    }
+    $routeLine = $logLines |
+        Where-Object { $_ -match "^sender encoder=\S+\s+frame-memory=\S+" } |
+        Select-Object -Last 1
+    $gpuLine = $logLines |
+        Where-Object { $_ -match "^sender GPU selected:" } |
+        Select-Object -Last 1
+    $routeMatch = [regex]::Match([string] $routeLine, "sender encoder=(\S+)\s+frame-memory=(\S+)")
+    $encoder = if ($routeMatch.Success) { $routeMatch.Groups[1].Value } else { "UNKNOWN" }
+    $frameMemory = if ($routeMatch.Success) { $routeMatch.Groups[2].Value } else { "UNKNOWN" }
+
+    $amfStatus = if ($radeonAdapters.Count -eq 0) {
+        "NOT APPLICABLE - no Radeon adapter detected"
+    } elseif ($encoder -match "(?i)^amfh264") {
+        "OK - active in the last sender route"
+    } elseif ($encoder -ne "UNKNOWN") {
+        "NOT ACTIVE - last sender encoder was $encoder"
+    } elseif ($amfFactory -eq "AVAILABLE") {
+        "AVAILABLE - no sender route was found in the log"
+    } else {
+        "NOT ACTIVE - AMF factory is $amfFactory"
+    }
+
+    $zeroCopyStatus = switch ($frameMemory.ToUpperInvariant()) {
+        "D3D11" { "OK - D3D11 zero-copy active in the last sender route" }
+        "SYSTEM" { "FALLBACK - last sender route downloaded frames to system memory" }
+        default { "UNKNOWN - no sender route was found in the log" }
+    }
+
+    $videoEncodeRows = @($script:sampledGpuEngines |
+        Where-Object { $_.Engine -match "(?i)(engtype_)?video[_ ]?encode" })
+    $running = @(Get-Process screen-mirror -ErrorAction SilentlyContinue).Count -gt 0
+    if ($videoEncodeRows.Count -gt 0) {
+        $maxVideoEncode = ($videoEncodeRows | Measure-Object MaxPercent -Maximum).Maximum
+        $videoEncodeStatus = "OBSERVED - maximum ${maxVideoEncode}% during the sample"
+    } elseif ($script:gpuEngineSampleSucceeded) {
+        $videoEncodeStatus = "NOT OBSERVED - run diagnostics while the sender is actively mirroring; a light workload can also read near zero"
+    } elseif ($running) {
+        $videoEncodeStatus = "UNAVAILABLE - GPU engine counters could not be sampled"
+    } else {
+        $videoEncodeStatus = "NOT SAMPLED - screen-mirror.exe was not running"
+    }
+
+    $fallbackLine = if ($frameMemory -eq "system") {
+        $logLines |
+            Where-Object { $_ -match "^sender encoder=.*falling back to system-memory frames$" } |
+            Select-Object -Last 1
+    } else {
+        $null
+    }
+
+    [pscustomobject]@{
+        RadeonAdapter = if ($radeonAdapters.Count -gt 0) { $radeonAdapters -join "; " } else { "NOT DETECTED" }
+        AmfFactory = $amfFactory
+        RadeonAmf = $amfStatus
+        D3D11ZeroCopy = $zeroCopyStatus
+        VideoEncodeEngine = $videoEncodeStatus
+        LastSenderGpu = if ($gpuLine) { $gpuLine } else { "(not recorded; auto selection may be in use)" }
+        LastSenderRoute = if ($routeLine) { $routeLine } else { "(not recorded)" }
+        LatestFallbackReason = if ($fallbackLine) {
+            $fallbackLine
+        } elseif ($frameMemory -eq "system") {
+            "(not found in the log tail)"
+        } else {
+            "(not applicable to the last route)"
+        }
+    }
+}
+
+function Get-ScreenMirrorResourceSummary {
+    $resourceRows = @($script:sampledProcessResources)
+    $gpuMemoryRows = @($script:sampledGpuMemory)
+    $gpuEngineRows = @($script:sampledGpuEngines)
+    $videoEncodeRows = @($gpuEngineRows |
+        Where-Object { $_.Engine -match "(?i)(engtype_)?video[_ ]?encode" })
+
+    if ($resourceRows.Count -eq 0) {
+        return [pscustomobject]@{
+            Status = "NOT SAMPLED - screen-mirror.exe was not running"
+            ProcessCount = 0
+            CpuPercentTotal = "N/A"
+            WorkingSetMiB = "N/A"
+            PrivateMiB = "N/A"
+            GpuDedicatedMiB = "N/A"
+            GpuSharedMiB = "N/A"
+            GpuEnginePeakPercent = "N/A"
+            VideoEncodePeakPercent = "N/A"
+        }
+    }
+
+    $cpuTotal = ($resourceRows | Measure-Object CpuPercent -Sum).Sum
+    $workingSetTotal = ($resourceRows | Measure-Object WorkingSetMiB -Sum).Sum
+    $privateTotal = ($resourceRows | Measure-Object PrivateMiB -Sum).Sum
+    $gpuDedicated = if ($gpuMemoryRows.Count -gt 0) {
+        [math]::Round(($gpuMemoryRows | Measure-Object GpuDedicatedMiB -Sum).Sum, 1)
+    } else {
+        "UNAVAILABLE"
+    }
+    $gpuShared = if ($gpuMemoryRows.Count -gt 0) {
+        [math]::Round(($gpuMemoryRows | Measure-Object GpuSharedMiB -Sum).Sum, 1)
+    } else {
+        "UNAVAILABLE"
+    }
+    $gpuPeak = if ($script:gpuEngineSampleSucceeded) {
+        if ($gpuEngineRows.Count -gt 0) {
+            [math]::Round(($gpuEngineRows | Measure-Object MaxPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+    $videoEncodePeak = if ($script:gpuEngineSampleSucceeded) {
+        if ($videoEncodeRows.Count -gt 0) {
+            [math]::Round(($videoEncodeRows | Measure-Object MaxPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+
+    [pscustomobject]@{
+        Status = "SAMPLED - CPU over 1 second; GPU engines over 5 seconds per process"
+        ProcessCount = $resourceRows.Count
+        CpuPercentTotal = [math]::Round($cpuTotal, 2)
+        WorkingSetMiB = [math]::Round($workingSetTotal, 1)
+        PrivateMiB = [math]::Round($privateTotal, 1)
+        GpuDedicatedMiB = $gpuDedicated
+        GpuSharedMiB = $gpuShared
+        GpuEnginePeakPercent = $gpuPeak
+        VideoEncodePeakPercent = $videoEncodePeak
+    }
+}
+
 $pin = Read-Pin
 
 Add-Line "Screen Mirror Diagnostics"
@@ -266,6 +436,12 @@ Add-CommandOutput "Running Processes" {
         Format-Table -AutoSize
 }
 
+Add-CommandOutput "Display Adapters" {
+    Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+        Select-Object Name, DriverVersion, AdapterRAM, VideoProcessor, Status |
+        Format-Table -AutoSize
+}
+
 Add-CommandOutput "CPU, Memory, and GPU Usage" {
     $processes = @(Get-Process screen-mirror -ErrorAction SilentlyContinue)
     if ($processes.Count -eq 0) {
@@ -294,6 +470,7 @@ Add-CommandOutput "CPU, Memory, and GPU Usage" {
             Threads = $current.Threads.Count
         }
     }
+    $script:sampledProcessResources = @($resourceRows)
     $resourceRows | Format-Table -AutoSize
 
     if (-not (Get-Command Get-Counter -ErrorAction SilentlyContinue)) {
@@ -311,17 +488,20 @@ Add-CommandOutput "CPU, Memory, and GPU Usage" {
                 Measure-Object CookedValue -Sum).Sum
             $shared = @($memory.CounterSamples | Where-Object Path -Like "*\Shared Usage" |
                 Measure-Object CookedValue -Sum).Sum
-            [pscustomobject]@{
+            $gpuMemoryRow = [pscustomobject]@{
                 Id = $process.Id
                 GpuDedicatedMiB = [math]::Round($dedicated / 1MB, 1)
                 GpuSharedMiB = [math]::Round($shared / 1MB, 1)
-            } | Format-Table -AutoSize
+            }
+            $script:sampledGpuMemory += $gpuMemoryRow
+            $gpuMemoryRow | Format-Table -AutoSize
 
             $engines = Get-Counter -Counter `
                 "\GPU Engine(pid_$($process.Id)*)\Utilization Percentage" `
                 -SampleInterval 1 `
-                -MaxSamples 2 `
+                -MaxSamples 5 `
                 -ErrorAction Stop
+            $script:gpuEngineSampleSucceeded = $true
             $engineRows = @($engines.CounterSamples |
                 Where-Object CookedValue -GT 0.01 |
                 Group-Object InstanceName |
@@ -334,6 +514,7 @@ Add-CommandOutput "CPU, Memory, and GPU Usage" {
                     }
                 } |
                 Sort-Object MaxPercent -Descending)
+            $script:sampledGpuEngines += $engineRows
             if ($engineRows.Count -eq 0) {
                 "No active GPU engine was observed for PID $($process.Id) during the sample."
             } else {
@@ -343,6 +524,14 @@ Add-CommandOutput "CPU, Memory, and GPU Usage" {
             "GPU counters unavailable for PID $($process.Id): $($_.Exception.Message)"
         }
     }
+}
+
+Add-CommandOutput "Screen Mirror Resource Summary" {
+    Get-ScreenMirrorResourceSummary | Format-List
+}
+
+Add-CommandOutput "GPU Acceleration Verdict" {
+    Get-GpuAccelerationVerdict | Format-List
 }
 
 Add-CommandOutput "Communication Health" {

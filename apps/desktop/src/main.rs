@@ -5,6 +5,7 @@ mod config;
 mod console;
 mod control;
 mod diagnostics;
+mod gpu;
 mod lan;
 mod logging;
 mod monitors;
@@ -46,6 +47,8 @@ enum Command {
     Discover(DiscoverArgs),
     /// List Windows displays and likely VDD/SuperDisplay-style virtual monitors.
     Monitors,
+    /// List the GPUs that can be selected for sending and receiving.
+    Gpus,
     /// Print the generated GStreamer pipeline without running it.
     Print(PrintArgs),
     /// Run an explicit gst-launch-style pipeline.
@@ -151,6 +154,10 @@ fn main() -> Result<()> {
         }
         Command::Monitors => {
             monitors::print_monitors();
+            Ok(())
+        }
+        Command::Gpus => {
+            gpu::print_adapters();
             Ok(())
         }
         Command::Print(args) => {

@@ -89,6 +89,10 @@ pub struct SendArgs {
     #[arg(long, value_enum, default_value_t = Encoder::Auto)]
     pub encoder: Encoder,
 
+    /// GPU to encode on: "auto", a DXGI adapter index, or part of the adapter name.
+    #[arg(long, default_value = crate::gpu::AUTO)]
+    pub gpu: String,
+
     /// Capture API. dxgi is lowest overhead; wgc can behave better with modern Windows/window capture.
     #[arg(long, value_enum, default_value_t = CaptureApi::Dxgi)]
     pub capture_api: CaptureApi,
@@ -167,12 +171,17 @@ pub struct RecvArgs {
     /// Video sink to use. auto prefers D3D11 GPU rendering.
     #[arg(long, value_enum, default_value_t = Sink::Auto)]
     pub sink: Sink,
+
+    /// GPU to decode and render on: "auto", a DXGI adapter index, or part of the adapter name.
+    #[arg(long, default_value = crate::gpu::AUTO)]
+    pub gpu: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Encoder {
     Auto,
     Nvidia,
+    Amf,
     MediaFoundation,
     QuickSync,
     X264,
@@ -299,11 +308,19 @@ pub fn build_sender_video_pipeline_for(
         ));
     }
 
-    let encoder = select_encoder(args.encoder, args.allow_software_encoder)?;
+    let gpu = crate::gpu::resolve(&args.gpu);
+    if let Some(gpu) = gpu.as_ref() {
+        crate::logging::append(format!("sender GPU selected: {}", gpu.summary()));
+    }
+    let encoder = select_encoder(args.encoder, args.allow_software_encoder, gpu.as_ref())?;
     let clients = multi_udp_clients(&args.host, args.port)?;
     let show_cursor = if args.no_cursor { "false" } else { "true" };
+    let mut capture_target: Option<crate::monitors::DisplayMonitor> = target.cloned();
     let source = if let Some(target) = target {
-        crate::logging::append(format!("sender assigned capture target: {}", target.summary()));
+        crate::logging::append(format!(
+            "sender assigned capture target: {}",
+            target.summary()
+        ));
         capture_source_for_target(args.capture_api, show_cursor, target)?
     } else if args.prefer_virtual_display && args.monitor_index < 0 {
         match crate::monitors::preferred_virtual_capture_target() {
@@ -324,7 +341,9 @@ pub fn build_sender_video_pipeline_for(
                         args.capture_api, target.adapter_name
                     ));
                 }
-                capture_source_for_target(args.capture_api, show_cursor, &target)?
+                let source = capture_source_for_target(args.capture_api, show_cursor, &target)?;
+                capture_target = Some(target);
+                source
             }
             None => {
                 crate::logging::append("sender preferred virtual display: not found");
@@ -346,10 +365,24 @@ pub fn build_sender_video_pipeline_for(
     };
     crate::logging::append(format!("sender pipeline source: {source}"));
     let encoder_accepts_d3d11 = encoder.supports_d3d11_input();
-    let use_d3d11_memory = args.zero_copy && encoder_accepts_d3d11;
+    // Frames captured on one GPU cannot stay in D3D11 memory while another GPU encodes them, so
+    // that combination goes through system memory and lets the encoder upload on its own device.
+    let same_gpu_as_capture = match encoder.adapter_luid {
+        Some(encoder_luid) => {
+            capture_adapter(capture_target.as_ref(), args.monitor_index).map(|adapter| adapter.luid)
+                == Some(encoder_luid)
+        }
+        None => true,
+    };
+    let use_d3d11_memory = args.zero_copy && encoder_accepts_d3d11 && same_gpu_as_capture;
     if args.zero_copy && !encoder_accepts_d3d11 {
         crate::logging::append(format!(
             "sender encoder={} does not advertise D3D11 input; falling back to system-memory frames",
+            encoder.name()
+        ));
+    } else if args.zero_copy && !same_gpu_as_capture {
+        crate::logging::append(format!(
+            "sender encoder={} does not run on the capture GPU; falling back to system-memory frames",
             encoder.name()
         ));
     }
@@ -418,6 +451,34 @@ fn capture_source_for_target(
     ))
 }
 
+/// The GPU DXGI desktop duplication captures on, which is always the GPU that drives the captured
+/// monitor. `None` when the capture target cannot be tied to a monitor.
+fn capture_adapter(
+    target: Option<&crate::monitors::DisplayMonitor>,
+    monitor_index: i32,
+) -> Option<crate::gpu::GpuAdapter> {
+    if let Some(target) = target {
+        return target
+            .monitor_handle
+            .and_then(crate::gpu::adapter_for_monitor_handle)
+            .or_else(|| crate::gpu::adapter_for_display_device_name(&target.adapter_name));
+    }
+
+    if monitor_index >= 0 {
+        return None;
+    }
+
+    crate::monitors::enumerate_monitors()
+        .into_iter()
+        .find(|monitor| monitor.primary)
+        .and_then(|monitor| {
+            monitor
+                .monitor_handle
+                .and_then(crate::gpu::adapter_for_monitor_handle)
+                .or_else(|| crate::gpu::adapter_for_display_device_name(&monitor.adapter_name))
+        })
+}
+
 pub fn build_receiver_pipeline(args: &RecvArgs) -> Result<String> {
     let video = build_receiver_video_pipeline(args)?;
     if !args.audio_enabled {
@@ -435,8 +496,13 @@ pub fn build_receiver_video_pipeline(args: &RecvArgs) -> Result<String> {
     ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
     ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
 
-    let decoder = select_decoder(args.decoder)?;
-    let sink = select_sink(args.sink, args.fullscreen)?;
+    let gpu = crate::gpu::resolve(&args.gpu);
+    if let Some(gpu) = gpu.as_ref() {
+        crate::logging::append(format!("receiver GPU selected: {}", gpu.summary()));
+    }
+    let decoder = select_decoder(args.decoder, gpu.as_ref())?;
+    let sink = select_sink(args.sink, args.fullscreen, gpu.as_ref())?;
+    crate::logging::append(format!("receiver decoder={decoder} sink={sink}"));
 
     let video = format!(
         "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
@@ -619,55 +685,107 @@ fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) ->
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SelectedEncoder {
+enum EncoderFamily {
     Nvidia,
+    Amf,
     MediaFoundation,
     QuickSync,
     X264,
 }
 
-impl SelectedEncoder {
-    fn supports_d3d11_input(self) -> bool {
-        if self == Self::X264 {
-            return false;
-        }
-        let d3d11_caps = gst::Caps::builder("video/x-raw")
-            .features(["memory:D3D11Memory"])
-            .field("format", "NV12")
-            .build();
-        gst::ElementFactory::find(self.name())
-            .is_some_and(|factory| factory.can_sink_any_caps(&d3d11_caps))
-    }
-
-    fn name(self) -> &'static str {
+impl EncoderFamily {
+    /// Base element of the family. GStreamer registers one variant per GPU, named by inserting
+    /// `deviceN` before the trailing role, so the base element is the device-0 variant.
+    fn base_element(self) -> &'static str {
         match self {
             Self::Nvidia => "nvd3d11h264enc",
+            Self::Amf => "amfh264enc",
             Self::MediaFoundation => "mfh264enc",
             Self::QuickSync => "qsvh264enc",
             Self::X264 => "x264enc",
         }
     }
 
-    fn chain(self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {
-        match self {
-            Self::Nvidia => nvidia_encoder_chain(bitrate, fps, nvidia_tuning),
-            Self::MediaFoundation => format!(
-                "mfh264enc bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=100 \
+    /// Whether an element factory belongs to this family, including its per-GPU variants such as
+    /// `nvd3d11h264device1enc`, `qsvh264device1enc` and `amfh264device1enc`.
+    fn owns_element(self, name: &str) -> bool {
+        let prefix = match self {
+            Self::Nvidia => "nvd3d11",
+            Self::Amf => "amf",
+            Self::MediaFoundation => "mf",
+            Self::QuickSync => "qsv",
+            // x264enc is a CPU encoder with no per-GPU variants.
+            Self::X264 => return name == "x264enc",
+        };
+        name.starts_with(prefix) && name.contains("h264") && name.ends_with("enc")
+    }
+
+    /// Hardware families in the order they should be tried for one GPU vendor.
+    fn preferred_for(vendor: crate::gpu::GpuVendor) -> &'static [Self] {
+        match vendor {
+            crate::gpu::GpuVendor::Nvidia => &[Self::Nvidia, Self::MediaFoundation],
+            crate::gpu::GpuVendor::Amd => &[Self::Amf, Self::MediaFoundation],
+            crate::gpu::GpuVendor::Intel => &[Self::QuickSync, Self::MediaFoundation],
+            crate::gpu::GpuVendor::Other => &[
+                Self::Nvidia,
+                Self::QuickSync,
+                Self::Amf,
+                Self::MediaFoundation,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectedEncoder {
+    family: EncoderFamily,
+    element: String,
+    /// GPU the element is bound to, when it advertises one.
+    adapter_luid: Option<i64>,
+}
+
+impl SelectedEncoder {
+    fn supports_d3d11_input(&self) -> bool {
+        if self.family == EncoderFamily::X264 {
+            return false;
+        }
+        let d3d11_caps = gst::Caps::builder("video/x-raw")
+            .features(["memory:D3D11Memory"])
+            .field("format", "NV12")
+            .build();
+        gst::ElementFactory::find(&self.element)
+            .is_some_and(|factory| factory.can_sink_any_caps(&d3d11_caps))
+    }
+
+    fn name(&self) -> &str {
+        &self.element
+    }
+
+    fn chain(&self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {
+        let element = &self.element;
+        match self.family {
+            EncoderFamily::Nvidia => nvidia_encoder_chain(element, bitrate, fps, nvidia_tuning),
+            EncoderFamily::Amf => format!(
+                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} usage=ultra-low-latency rate-control=cbr aud=false \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
-            Self::QuickSync => format!(
-                "qsvh264enc bitrate={bitrate} gop-size={fps} b-frames=0 rc-lookahead=0 rate-control=cbr \
+            EncoderFamily::MediaFoundation => format!(
+                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=100 \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
-            Self::X264 => format!(
-                "x264enc bitrate={bitrate} speed-preset=ultrafast tune=zerolatency key-int-max={fps} bframes=0 sliced-threads=true byte-stream=true \
+            EncoderFamily::QuickSync => format!(
+                "{element} bitrate={bitrate} gop-size={fps} b-frames=0 rc-lookahead=0 rate-control=cbr \
+                 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
+            ),
+            EncoderFamily::X264 => format!(
+                "{element} bitrate={bitrate} speed-preset=ultrafast tune=zerolatency key-int-max={fps} bframes=0 sliced-threads=true byte-stream=true \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
         }
     }
 }
 
-fn nvidia_encoder_chain(bitrate: u32, fps: u32, tuning: NvidiaTuning) -> String {
+fn nvidia_encoder_chain(element: &str, bitrate: u32, fps: u32, tuning: NvidiaTuning) -> String {
     let tuning = resolve_nvidia_tuning(tuning);
     let vbv_buffer_size = (bitrate / fps.max(1)).max(128);
     let extra = match tuning {
@@ -676,7 +794,7 @@ fn nvidia_encoder_chain(bitrate: u32, fps: u32, tuning: NvidiaTuning) -> String 
     };
 
     format!(
-        "nvd3d11h264enc bitrate={bitrate} max-bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} \
+        "{element} bitrate={bitrate} max-bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} \
          gop-size={fps} bframes=0 rc-lookahead=0 zerolatency=true strict-gop=true aud=false repeat-sequence-header=true{extra} \
          ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
     )
@@ -700,31 +818,52 @@ fn resolve_nvidia_tuning(tuning: NvidiaTuning) -> NvidiaTuning {
     }
 }
 
-fn select_encoder(requested: Encoder, allow_software_encoder: bool) -> Result<SelectedEncoder> {
-    match requested {
-        Encoder::Auto => first_available_encoder(allow_software_encoder),
-        Encoder::Nvidia => require_element("nvd3d11h264enc", SelectedEncoder::Nvidia),
-        Encoder::MediaFoundation => require_element("mfh264enc", SelectedEncoder::MediaFoundation),
-        Encoder::QuickSync => require_element("qsvh264enc", SelectedEncoder::QuickSync),
-        Encoder::X264 => require_element("x264enc", SelectedEncoder::X264),
-    }
+fn select_encoder(
+    requested: Encoder,
+    allow_software_encoder: bool,
+    gpu: Option<&crate::gpu::GpuAdapter>,
+) -> Result<SelectedEncoder> {
+    let family = match requested {
+        Encoder::Auto => return first_available_encoder(allow_software_encoder, gpu),
+        Encoder::Nvidia => EncoderFamily::Nvidia,
+        Encoder::Amf => EncoderFamily::Amf,
+        Encoder::MediaFoundation => EncoderFamily::MediaFoundation,
+        Encoder::QuickSync => EncoderFamily::QuickSync,
+        Encoder::X264 => EncoderFamily::X264,
+    };
+
+    encoder_on_gpu(family, gpu).ok_or_else(|| {
+        anyhow!(
+            "required GStreamer element not found: {}",
+            family.base_element()
+        )
+    })
 }
 
-fn first_available_encoder(allow_software_encoder: bool) -> Result<SelectedEncoder> {
-    let hardware_encoder = [
-        ("nvd3d11h264enc", SelectedEncoder::Nvidia),
-        ("qsvh264enc", SelectedEncoder::QuickSync),
-        ("mfh264enc", SelectedEncoder::MediaFoundation),
-    ]
-    .into_iter()
-    .find_map(|(name, encoder)| has_element(name).then_some(encoder));
+fn first_available_encoder(
+    allow_software_encoder: bool,
+    gpu: Option<&crate::gpu::GpuAdapter>,
+) -> Result<SelectedEncoder> {
+    let families: &[EncoderFamily] = match gpu {
+        Some(gpu) => EncoderFamily::preferred_for(gpu.vendor()),
+        None => &[
+            EncoderFamily::Nvidia,
+            EncoderFamily::QuickSync,
+            EncoderFamily::Amf,
+            EncoderFamily::MediaFoundation,
+        ],
+    };
 
-    if let Some(encoder) = hardware_encoder {
+    if let Some(encoder) = families
+        .iter()
+        .find_map(|family| encoder_on_gpu(*family, gpu))
+    {
         return Ok(encoder);
     }
 
     if allow_software_encoder {
-        return require_element("x264enc", SelectedEncoder::X264);
+        return encoder_on_gpu(EncoderFamily::X264, None)
+            .ok_or_else(|| anyhow!("required GStreamer element not found: x264enc"));
     }
 
     Err(anyhow!(
@@ -732,32 +871,134 @@ fn first_available_encoder(allow_software_encoder: bool) -> Result<SelectedEncod
     ))
 }
 
-fn select_decoder(requested: Decoder) -> Result<&'static str> {
+/// Picks the family variant bound to the requested GPU, falling back to the family's default
+/// variant when nothing advertises that GPU.
+fn encoder_on_gpu(
+    family: EncoderFamily,
+    gpu: Option<&crate::gpu::GpuAdapter>,
+) -> Option<SelectedEncoder> {
+    let elements = family_elements(gst::ElementFactoryType::VIDEO_ENCODER, |name| {
+        family.owns_element(name)
+    });
+    if elements.is_empty() {
+        return None;
+    }
+
+    if let Some(gpu) = gpu {
+        if let Some(element) = elements
+            .iter()
+            .find(|element| element_adapter_luid(element) == Some(gpu.luid))
+        {
+            return Some(SelectedEncoder {
+                family,
+                element: element.clone(),
+                adapter_luid: Some(gpu.luid),
+            });
+        }
+        crate::logging::append(format!(
+            "no {} variant is bound to GPU {}; using {}",
+            family.base_element(),
+            gpu.description,
+            elements[0]
+        ));
+    }
+
+    let element = elements[0].clone();
+    Some(SelectedEncoder {
+        adapter_luid: element_adapter_luid(&element),
+        family,
+        element,
+    })
+}
+
+fn select_decoder(requested: Decoder, gpu: Option<&crate::gpu::GpuAdapter>) -> Result<String> {
     match requested {
-        Decoder::Auto => require_element("decodebin", "decodebin"),
-        Decoder::D3d11 => require_element("d3d11h264dec", "d3d11h264dec"),
-        Decoder::Avdec => require_element("avdec_h264", "avdec_h264"),
+        Decoder::Auto | Decoder::D3d11 => {
+            if let Some(decoder) = gpu.and_then(d3d11_decoder_on_gpu) {
+                return Ok(decoder);
+            }
+            match requested {
+                Decoder::D3d11 => require_element("d3d11h264dec", "d3d11h264dec".to_string()),
+                _ => require_element("decodebin", "decodebin".to_string()),
+            }
+        }
+        Decoder::Avdec => require_element("avdec_h264", "avdec_h264".to_string()),
     }
 }
 
-fn select_sink(requested: Sink, fullscreen: bool) -> Result<String> {
+fn d3d11_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<String> {
+    let decoder = family_elements(gst::ElementFactoryType::DECODER, |name| {
+        name.starts_with("d3d11") && name.contains("h264") && name.ends_with("dec")
+    })
+    .into_iter()
+    .find(|element| element_adapter_luid(element) == Some(gpu.luid));
+
+    if decoder.is_none() {
+        crate::logging::append(format!(
+            "no d3d11 H.264 decoder is bound to GPU {}; using the default decoder",
+            gpu.description
+        ));
+    }
+    decoder
+}
+
+fn select_sink(
+    requested: Sink,
+    fullscreen: bool,
+    gpu: Option<&crate::gpu::GpuAdapter>,
+) -> Result<String> {
+    let adapter = match gpu {
+        Some(gpu) => format!(" adapter={}", gpu.index),
+        None => String::new(),
+    };
     let d3d11_sink = if fullscreen {
-        "d3d11videosink sync=false qos=true fullscreen-toggle-mode=property fullscreen=true"
+        format!(
+            "d3d11videosink{adapter} sync=false qos=true fullscreen-toggle-mode=property fullscreen=true"
+        )
     } else {
-        "d3d11videosink sync=false qos=true"
+        format!("d3d11videosink{adapter} sync=false qos=true")
     };
 
     match requested {
         Sink::Auto => {
             if has_element("d3d11videosink") {
-                Ok(d3d11_sink.to_string())
+                Ok(d3d11_sink)
             } else {
                 Ok("autovideosink sync=false".to_string())
             }
         }
-        Sink::D3d11 => require_element("d3d11videosink", d3d11_sink.to_string()),
+        Sink::D3d11 => require_element("d3d11videosink", d3d11_sink),
         Sink::AutoVideo => Ok("autovideosink sync=false".to_string()),
     }
+}
+
+/// Registered element factory names matching a predicate, shortest name first so the family's
+/// base (device-0) element wins ties.
+fn family_elements(
+    factory_type: gst::ElementFactoryType,
+    predicate: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut names: Vec<String> =
+        gst::ElementFactory::factories_with_type(factory_type, gst::Rank::MARGINAL)
+            .iter()
+            .map(|factory| factory.name().to_string())
+            .filter(|name| predicate(name))
+            .collect();
+    names.sort_by(|left, right| left.len().cmp(&right.len()).then_with(|| left.cmp(right)));
+    names
+}
+
+/// The GPU an element is bound to, read from the `adapter-luid` property the d3d11, nvcodec, qsv
+/// and amf elements expose. `None` means the element does not advertise a GPU.
+fn element_adapter_luid(name: &str) -> Option<i64> {
+    use gst::glib;
+
+    let element = gst::ElementFactory::make(name).build().ok()?;
+    let property = element.find_property("adapter-luid")?;
+    if property.value_type() != glib::Type::I64 {
+        return None;
+    }
+    Some(element.property::<i64>("adapter-luid"))
 }
 
 fn require_element<T>(name: &str, value: T) -> Result<T> {
@@ -776,6 +1017,7 @@ pub fn probe_elements() {
     let elements = [
         ("capture", "d3d11screencapturesrc"),
         ("gpu encode", "nvd3d11h264enc"),
+        ("amf encode", "amfh264enc"),
         ("mf encode", "mfh264enc"),
         ("qsv encode", "qsvh264enc"),
         ("cpu encode", "x264enc"),
@@ -942,5 +1184,4 @@ mod tests {
         assert!(!caps.contains("width="));
         assert!(!caps.contains("height="));
     }
-
 }

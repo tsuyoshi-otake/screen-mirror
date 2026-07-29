@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.41`.
+The desktop and Android package versions for this release are `0.1.42`.
 
 ## Transport Model
 
@@ -55,6 +55,7 @@ Tray actions:
 - `Run Peer Diagnostics`: discovers a sender with the same PIN, requests its debug report, copies it to the clipboard, and opens it in Notepad
 - `Install/Repair Virtual Display Driver`: installs the bundled VDD driver without creating duplicates when it already exists
 - `Show/Enable/Disable/Remove All Bundled Virtual Displays`: manages bundled MTT VDD display devices and monitors. Install/Enable does not request Windows extended desktop; sender mode requests it only after a matching receiver is found.
+- `Sender GPU` / `Receiver GPU`: pins encoding (sender) and decoding/rendering (receiver) to one GPU. Only shown when the machine has more than one GPU.
 - `Open Display Settings`: opens Windows display settings
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`
 
@@ -107,6 +108,7 @@ prefer_virtual_display = true
 enable_virtual_display = true
 sync_virtual_display_resolution = true
 monitor_index = -1
+gpu = "auto"
 fps = 30
 bitrate = 8000
 mtu = 1200
@@ -117,6 +119,7 @@ nvidia_tuning = "auto"
 zero_copy = true
 
 [recv]
+gpu = "auto"
 audio_enabled = false
 audio_port = 5005
 audio_jitter_ms = 10
@@ -196,11 +199,43 @@ The sender uses D3D11 screen capture and prefers hardware encoders:
 
 1. `nvd3d11h264enc` for NVIDIA GeForce GTX/RTX
 2. `qsvh264enc` for Intel Quick Sync
-3. `mfh264enc` for Windows Media Foundation hardware encoders
+3. `amfh264enc` for AMD Radeon
+4. `mfh264enc` for Windows Media Foundation hardware encoders
 
 By default `allow_software_encoder = false`, so `auto` will not silently fall back to CPU `x264enc`. Set it to `true` only if software fallback is acceptable.
 
-Balanced sender defaults are `30 fps`, `8000 kbit/s`, and a `1 MiB` UDP buffer. `zero_copy = true` keeps D3D11 capture textures in GPU memory through NVIDIA, Quick Sync, and D3D11-aware Media Foundation encoders, avoiding a full-frame GPU-to-RAM copy. The app checks the installed encoder caps and automatically falls back to system-memory frames when that runtime cannot accept D3D11 textures. Set `zero_copy = false` only to diagnose an older driver or cross-adapter negotiation failure. Use `60 fps` as an explicit quality/latency tradeoff; it roughly doubles capture and encode work.
+### Choosing a GPU
+
+On a machine with more than one GPU - for example a GeForce RTX 4060 Ti next to Radeon Graphics - the sender and the receiver each pick their own GPU. The sender setting pins the encoder, the receiver setting pins the H.264 decoder and the video sink.
+
+List the selectable GPUs:
+
+```powershell
+screen-mirror.exe gpus
+```
+
+Set them from the tray menu (`Sender GPU` / `Receiver GPU`), from `config.toml`, or per CLI run:
+
+```toml
+[send]
+gpu = "NVIDIA GeForce RTX 4060 Ti"
+
+[recv]
+gpu = "AMD Radeon Graphics"
+```
+
+```powershell
+screen-mirror.exe send --gpu "NVIDIA GeForce RTX 4060 Ti" --host 192.168.1.20
+screen-mirror.exe recv --gpu 0
+```
+
+The value is `auto` (default), an adapter description, a case-insensitive substring of it such as `4060`, or a DXGI adapter index. A description that no longer matches an installed adapter falls back to `auto` and is logged. Machines with a single GPU do not show the tray submenus and do not need the keys at all.
+
+The chosen GPU is applied by selecting the per-device element GStreamer registers for that adapter (`nvd3d11h264device1enc`, `qsvh264device1enc`, `amfh264device1enc`, `d3d11h264device1dec`, and the `adapter` property of `d3d11videosink`). If the requested vendor has no encoder on that GPU, the sender logs the mismatch and keeps the automatic choice. `mfh264enc` has no adapter property, so it is never GPU-pinned.
+
+Desktop duplication always captures on the GPU that owns the captured monitor. When the selected encoder GPU is not that GPU, the sender drops out of the zero-copy path for that session and hands the encoder system-memory frames, because D3D11 textures cannot cross adapters.
+
+Balanced sender defaults are `30 fps`, `8000 kbit/s`, and a `1 MiB` UDP buffer. `zero_copy = true` keeps D3D11 capture textures in GPU memory through NVIDIA, Quick Sync, AMF, and D3D11-aware Media Foundation encoders, avoiding a full-frame GPU-to-RAM copy. The app checks the installed encoder caps and automatically falls back to system-memory frames when that runtime cannot accept D3D11 textures. Set `zero_copy = false` only to diagnose an older driver or cross-adapter negotiation failure. Use `60 fps` as an explicit quality/latency tradeoff; it roughly doubles capture and encode work.
 
 When a pre-v2 config still contains the old unchanged defaults (`60 fps`, `12000 kbit/s`, `4 MiB` buffers), it is migrated once to the balanced values. Nondefault user-tuned values are preserved.
 
@@ -422,7 +457,7 @@ Android build requirements:
 
 The desktop sender uses a low-latency RTP/UDP pipeline:
 
-- D3D11 screen capture stays in GPU memory for NVIDIA, Quick Sync, and D3D11-aware Media Foundation encoders when `zero_copy = true`.
+- D3D11 screen capture stays in GPU memory for NVIDIA, Quick Sync, AMF, and D3D11-aware Media Foundation encoders when `zero_copy = true`, and only while the encoder runs on the capture GPU.
 - Sender queues are leaky and capped at one frame so old frames are dropped instead of delayed.
 - Audio uses 5 ms Opus frames, short bounded burst queues, two-packet jitter-buffer fast start, Opus packet-loss concealment, and the native WASAPI low-latency mode.
 - RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.

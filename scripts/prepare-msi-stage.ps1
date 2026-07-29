@@ -81,6 +81,7 @@ Get-ChildItem -LiteralPath (Join-Path $GStreamerRoot "bin") -File |
     ForEach-Object { Copy-RuntimeFile $_.FullName $_.Name }
 
 $pluginAllowList = @(
+    'gstamfcodec.dll',
     'gstautodetect.dll',
     'gstcoreelements.dll',
     'gstaudioconvert.dll',

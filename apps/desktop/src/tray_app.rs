@@ -3,7 +3,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::autostart;
@@ -14,6 +14,8 @@ const ID_START_SENDER: &str = "start-sender";
 const ID_START_RECEIVER: &str = "start-receiver";
 const ID_STOP: &str = "stop";
 const ID_TOGGLE_AUDIO: &str = "toggle-audio";
+const ID_GPU_SEND_PREFIX: &str = "gpu-send:";
+const ID_GPU_RECV_PREFIX: &str = "gpu-recv:";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
@@ -43,6 +45,21 @@ enum ActiveMode {
     Idle,
     Sender,
     Receiver,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum GpuSide {
+    Sender,
+    Receiver,
+}
+
+impl GpuSide {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sender => "sender",
+            Self::Receiver => "receiver",
+        }
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -120,6 +137,15 @@ struct TrayItems {
     stop: MenuItem,
     audio: MenuItem,
     autostart: MenuItem,
+    /// Empty when this machine has at most one GPU, so no GPU menu is shown at all.
+    gpu_send: Vec<GpuMenuChoice>,
+    gpu_recv: Vec<GpuMenuChoice>,
+}
+
+struct GpuMenuChoice {
+    /// Value written to config: "auto" or the adapter name.
+    selection: String,
+    item: CheckMenuItem,
 }
 
 impl TrayApp {
@@ -160,7 +186,7 @@ impl TrayApp {
             return Ok(());
         }
 
-        let items = TrayItems::new(self.config.autostart)?;
+        let items = TrayItems::new(&self.config)?;
         let menu = Menu::new();
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
@@ -205,6 +231,11 @@ impl TrayApp {
         menu.append(&items.start_receiver)?;
         menu.append(&items.stop)?;
         menu.append(&items.audio)?;
+        if !items.gpu_send.is_empty() {
+            menu.append(&PredefinedMenuItem::separator())?;
+            menu.append(&gpu_submenu("Sender GPU", &items.gpu_send)?)?;
+            menu.append(&gpu_submenu("Receiver GPU", &items.gpu_recv)?)?;
+        }
         menu.append(&sep2)?;
         menu.append(&items.autostart)?;
         menu.append(&check_update)?;
@@ -283,6 +314,8 @@ impl TrayApp {
                 self.save_config();
             }
             ID_TOGGLE_AUDIO => self.toggle_audio(),
+            id if id.starts_with(ID_GPU_SEND_PREFIX) => self.select_gpu(GpuSide::Sender, id),
+            id if id.starts_with(ID_GPU_RECV_PREFIX) => self.select_gpu(GpuSide::Receiver, id),
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
             ID_RUN_DIAGNOSTICS => self.run_diagnostics(),
@@ -621,6 +654,50 @@ impl TrayApp {
         }
     }
 
+    /// Applies a GPU pick from the tray menu, then restarts the running session on that side so
+    /// the new GPU is actually used.
+    fn select_gpu(&mut self, side: GpuSide, id: &str) {
+        let selection = {
+            let Some(items) = self.items.as_ref() else {
+                return;
+            };
+            let choices = match side {
+                GpuSide::Sender => &items.gpu_send,
+                GpuSide::Receiver => &items.gpu_recv,
+            };
+            match choices
+                .iter()
+                .find(|choice| choice.item.id().as_ref() == id)
+            {
+                Some(choice) => choice.selection.clone(),
+                None => return,
+            }
+        };
+
+        let current = match side {
+            GpuSide::Sender => &self.config.send.gpu,
+            GpuSide::Receiver => &self.config.recv.gpu,
+        };
+        if gpu_choice_is_active(current, &selection) {
+            self.sync_menu();
+            return;
+        }
+
+        match side {
+            GpuSide::Sender => self.config.send.gpu = selection.clone(),
+            GpuSide::Receiver => self.config.recv.gpu = selection.clone(),
+        }
+        self.save_config();
+        crate::logging::append(format!("{} GPU set to {selection}", side.label()));
+        self.sync_menu();
+
+        match (side, self.active_mode) {
+            (GpuSide::Sender, ActiveMode::Sender) => self.start_sender(),
+            (GpuSide::Receiver, ActiveMode::Receiver) => self.start_receiver(),
+            _ => {}
+        }
+    }
+
     fn toggle_autostart(&mut self) {
         let next = !self.config.autostart;
         match autostart::set_enabled(next) {
@@ -807,7 +884,10 @@ impl TrayApp {
         }
         report.push(String::new());
         let targets = crate::monitors::bundled_virtual_capture_targets();
-        report.push(format!("Bundled virtual displays ready to capture: {}", targets.len()));
+        report.push(format!(
+            "Bundled virtual displays ready to capture: {}",
+            targets.len()
+        ));
         for target in &targets {
             report.push(format!("  {}", target.adapter_name));
         }
@@ -914,6 +994,18 @@ impl TrayApp {
                 "Enable System Audio Transfer"
             },
         );
+        for choice in &items.gpu_send {
+            choice.item.set_checked(gpu_choice_is_active(
+                &self.config.send.gpu,
+                &choice.selection,
+            ));
+        }
+        for choice in &items.gpu_recv {
+            choice.item.set_checked(gpu_choice_is_active(
+                &self.config.recv.gpu,
+                &choice.selection,
+            ));
+        }
         items.autostart.set_text(if self.config.autostart {
             "Disable Autostart"
         } else {
@@ -950,7 +1042,8 @@ impl TrayApp {
 }
 
 impl TrayItems {
-    fn new(autostart_enabled: bool) -> Result<Self> {
+    fn new(config: &AppConfig) -> Result<Self> {
+        let autostart_enabled = config.autostart;
         let status = MenuItem::with_id("status", "Status: stopped", false, None);
         let start_sender = MenuItem::with_id(ID_START_SENDER, "Start as Sender", true, None);
         let start_receiver = MenuItem::with_id(ID_START_RECEIVER, "Start as Receiver", true, None);
@@ -967,6 +1060,17 @@ impl TrayItems {
             None,
         );
 
+        // A single-GPU machine has nothing to choose, so it gets no GPU menu.
+        let adapters = crate::gpu::adapters();
+        let (gpu_send, gpu_recv) = if adapters.len() > 1 {
+            (
+                gpu_choices(ID_GPU_SEND_PREFIX, &adapters, &config.send.gpu),
+                gpu_choices(ID_GPU_RECV_PREFIX, &adapters, &config.recv.gpu),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         Ok(Self {
             status,
             start_sender,
@@ -974,8 +1078,78 @@ impl TrayItems {
             stop,
             audio,
             autostart,
+            gpu_send,
+            gpu_recv,
         })
     }
+}
+
+fn gpu_submenu(title: &str, choices: &[GpuMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new(title, true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn gpu_choices(
+    id_prefix: &str,
+    adapters: &[crate::gpu::GpuAdapter],
+    configured: &str,
+) -> Vec<GpuMenuChoice> {
+    let mut choices = vec![GpuMenuChoice {
+        item: CheckMenuItem::with_id(
+            format!("{id_prefix}{}", crate::gpu::AUTO),
+            "Automatic",
+            true,
+            gpu_choice_is_active(configured, crate::gpu::AUTO),
+            None,
+        ),
+        selection: crate::gpu::AUTO.to_string(),
+    }];
+
+    for adapter in adapters {
+        let (selection, label) = gpu_choice_selection_and_label(adapters, adapter);
+        choices.push(GpuMenuChoice {
+            item: CheckMenuItem::with_id(
+                format!("{id_prefix}{}", adapter.index),
+                &label,
+                true,
+                gpu_choice_is_active(configured, &selection),
+                None,
+            ),
+            selection,
+        });
+    }
+    choices
+}
+
+/// Two adapters can report the same description, and then the name identifies neither of them;
+/// those fall back to the DXGI index, which at least stays unambiguous.
+fn gpu_choice_selection_and_label(
+    adapters: &[crate::gpu::GpuAdapter],
+    adapter: &crate::gpu::GpuAdapter,
+) -> (String, String) {
+    let ambiguous_name = adapters
+        .iter()
+        .filter(|other| other.description.eq_ignore_ascii_case(&adapter.description))
+        .count()
+        > 1;
+    if ambiguous_name {
+        (
+            adapter.index.to_string(),
+            format!("{} (GPU {})", adapter.description, adapter.index),
+        )
+    } else {
+        (adapter.selection(), adapter.description.clone())
+    }
+}
+
+fn gpu_choice_is_active(configured: &str, selection: &str) -> bool {
+    if crate::gpu::is_auto(selection) {
+        return crate::gpu::is_auto(configured);
+    }
+    !crate::gpu::is_auto(configured) && configured.eq_ignore_ascii_case(selection)
 }
 
 fn audio_status(enabled: bool) -> &'static str {
@@ -1026,4 +1200,54 @@ fn app_icon() -> Result<Icon> {
         }
     }
     Icon::from_rgba(rgba, size as u32, size as u32).context("failed to create tray icon image")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::GpuAdapter;
+
+    fn adapter(index: u32, description: &str) -> GpuAdapter {
+        GpuAdapter {
+            index,
+            luid: index as i64 + 1,
+            vendor_id: 0x10DE,
+            description: description.to_string(),
+        }
+    }
+
+    #[test]
+    fn distinct_gpu_names_are_stored_by_name() {
+        let adapters = vec![
+            adapter(0, "NVIDIA GeForce RTX 4060 Ti"),
+            adapter(1, "AMD Radeon Graphics"),
+        ];
+        let (selection, label) = gpu_choice_selection_and_label(&adapters, &adapters[1]);
+        assert_eq!(selection, "AMD Radeon Graphics");
+        assert_eq!(label, "AMD Radeon Graphics");
+    }
+
+    #[test]
+    fn repeated_gpu_names_fall_back_to_the_adapter_index() {
+        let adapters = vec![
+            adapter(0, "Intel(R) HD Graphics"),
+            adapter(1, "Intel(R) HD Graphics"),
+        ];
+        let (selection, label) = gpu_choice_selection_and_label(&adapters, &adapters[1]);
+        assert_eq!(selection, "1");
+        assert_eq!(label, "Intel(R) HD Graphics (GPU 1)");
+    }
+
+    #[test]
+    fn only_the_configured_gpu_choice_is_checked() {
+        assert!(gpu_choice_is_active("auto", crate::gpu::AUTO));
+        assert!(gpu_choice_is_active("", crate::gpu::AUTO));
+        assert!(!gpu_choice_is_active("1", crate::gpu::AUTO));
+        assert!(gpu_choice_is_active(
+            "amd radeon graphics",
+            "AMD Radeon Graphics"
+        ));
+        assert!(!gpu_choice_is_active("auto", "AMD Radeon Graphics"));
+        assert!(!gpu_choice_is_active("0", "1"));
+    }
 }

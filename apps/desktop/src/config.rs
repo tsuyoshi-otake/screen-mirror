@@ -77,6 +77,9 @@ pub struct SendConfig {
     #[serde(default)]
     pub nvidia_tuning: ConfigNvidiaTuning,
     pub encoder: ConfigEncoder,
+    /// GPU to encode on: "auto", a DXGI adapter index, or part of the adapter name.
+    #[serde(default = "default_gpu")]
+    pub gpu: String,
     pub capture_api: ConfigCaptureApi,
     #[serde(default = "default_zero_copy")]
     pub zero_copy: bool,
@@ -115,6 +118,10 @@ fn default_zero_copy() -> bool {
 
 fn default_qos_dscp() -> i32 {
     -1
+}
+
+fn default_gpu() -> String {
+    crate::gpu::AUTO.to_string()
 }
 
 fn default_pin() -> String {
@@ -177,6 +184,9 @@ pub struct RecvConfig {
     pub fullscreen: bool,
     pub decoder: ConfigDecoder,
     pub sink: ConfigSink,
+    /// GPU to decode and render on: "auto", a DXGI adapter index, or part of the adapter name.
+    #[serde(default = "default_gpu")]
+    pub gpu: String,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
@@ -184,6 +194,7 @@ pub struct RecvConfig {
 pub enum ConfigEncoder {
     Auto,
     Nvidia,
+    Amf,
     MediaFoundation,
     QuickSync,
     X264,
@@ -263,6 +274,7 @@ impl Default for SendConfig {
             allow_software_encoder: false,
             nvidia_tuning: ConfigNvidiaTuning::Auto,
             encoder: ConfigEncoder::Auto,
+            gpu: default_gpu(),
             capture_api: ConfigCaptureApi::Dxgi,
             zero_copy: true,
             show_cursor: true,
@@ -288,6 +300,7 @@ impl Default for RecvConfig {
             fullscreen: true,
             decoder: ConfigDecoder::Auto,
             sink: ConfigSink::Auto,
+            gpu: default_gpu(),
         }
     }
 }
@@ -363,6 +376,7 @@ impl From<SendConfig> for SendArgs {
             allow_software_encoder: config.allow_software_encoder,
             nvidia_tuning: config.nvidia_tuning.into(),
             encoder: config.encoder.into(),
+            gpu: config.gpu,
             capture_api: config.capture_api.into(),
             zero_copy: config.zero_copy,
             no_cursor: !config.show_cursor,
@@ -389,6 +403,7 @@ impl From<RecvConfig> for RecvArgs {
             fullscreen: config.fullscreen,
             decoder: config.decoder.into(),
             sink: config.sink.into(),
+            gpu: config.gpu,
         }
     }
 }
@@ -398,6 +413,7 @@ impl From<ConfigEncoder> for Encoder {
         match value {
             ConfigEncoder::Auto => Self::Auto,
             ConfigEncoder::Nvidia => Self::Nvidia,
+            ConfigEncoder::Amf => Self::Amf,
             ConfigEncoder::MediaFoundation => Self::MediaFoundation,
             ConfigEncoder::QuickSync => Self::QuickSync,
             ConfigEncoder::X264 => Self::X264,

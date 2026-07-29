@@ -238,6 +238,17 @@ function Get-VirtualDisplayCandidates {
     })
 }
 
+function Test-VideoEncodeGpuEngine([string] $Engine) {
+    if ([string]::IsNullOrWhiteSpace($Engine)) {
+        return $false
+    }
+
+    # NVIDIA and Intel expose encode engines as "Video Encode". AMD's
+    # performance counters expose the same AMF workload as "Video Codec".
+    # Keep accepting both formats, including the engtype_ counter prefix.
+    return $Engine -match "(?i)(?:engtype_)?video[_ ]?(?:encode|codec)(?:[_ ]|$)"
+}
+
 function Get-GpuAccelerationVerdict {
     $adapterNames = @()
     try {
@@ -299,7 +310,7 @@ function Get-GpuAccelerationVerdict {
     }
 
     $videoEncodeRows = @($script:sampledGpuEngines |
-        Where-Object { $_.Engine -match "(?i)(engtype_)?video[_ ]?encode" })
+        Where-Object { Test-VideoEncodeGpuEngine $_.Engine })
     $running = @(Get-Process screen-mirror -ErrorAction SilentlyContinue).Count -gt 0
     if ($videoEncodeRows.Count -gt 0) {
         $maxVideoEncode = ($videoEncodeRows | Measure-Object MaxPercent -Maximum).Maximum
@@ -343,7 +354,7 @@ function Get-ScreenMirrorResourceSummary {
     $gpuMemoryRows = @($script:sampledGpuMemory)
     $gpuEngineRows = @($script:sampledGpuEngines)
     $videoEncodeRows = @($gpuEngineRows |
-        Where-Object { $_.Engine -match "(?i)(engtype_)?video[_ ]?encode" })
+        Where-Object { Test-VideoEncodeGpuEngine $_.Engine })
 
     if ($resourceRows.Count -eq 0) {
         return [pscustomobject]@{

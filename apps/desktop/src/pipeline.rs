@@ -6,6 +6,11 @@ use sm_core::discovery::DEFAULT_PIN;
 use std::fmt;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+const SENDER_VIDEO_ENCODER_NAME: &str = "sender_video_encoder";
+const SENDER_RTP_PAY_NAME: &str = "sender_rtp_pay";
+const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Args, Clone, Debug)]
 pub struct SendArgs {
@@ -230,6 +235,90 @@ pub struct PipelineHandle {
     thread: Option<JoinHandle<Result<()>>>,
 }
 
+struct SenderKeyUnitRequester {
+    request_src: gst::Pad,
+    schedule: KeyUnitSchedule,
+    last_accepted: Option<bool>,
+}
+
+struct KeyUnitSchedule {
+    next_request: Instant,
+    count: u32,
+}
+
+impl KeyUnitSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_request: now,
+            count: 0,
+        }
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<u32> {
+        if now < self.next_request {
+            return None;
+        }
+
+        let count = self.count;
+        self.count = self.count.wrapping_add(1);
+        self.next_request = now + FORCE_KEY_UNIT_INTERVAL;
+        Some(count)
+    }
+}
+
+impl SenderKeyUnitRequester {
+    fn attach(pipeline: &gst::Pipeline) -> Option<Self> {
+        let payloader = pipeline.by_name(SENDER_RTP_PAY_NAME)?;
+        let Some(request_src) = payloader.static_pad("src") else {
+            crate::logging::append(
+                "sender force-key-unit requests disabled: RTP payloader has no static src pad",
+            );
+            return None;
+        };
+
+        Some(Self {
+            request_src,
+            schedule: KeyUnitSchedule::new(Instant::now()),
+            last_accepted: None,
+        })
+    }
+
+    fn request_if_due(&mut self, now: Instant) -> bool {
+        let Some(count) = self.schedule.take_due(now) else {
+            return false;
+        };
+
+        let accepted = self
+            .request_src
+            .send_event(upstream_force_key_unit_event(count));
+        if self.last_accepted != Some(accepted) {
+            crate::logging::append(if accepted {
+                format!(
+                    "sender force-key-unit requests active: interval={}ms all-headers=true",
+                    FORCE_KEY_UNIT_INTERVAL.as_millis()
+                )
+            } else {
+                "sender force-key-unit request rejected upstream; retrying".to_string()
+            });
+        }
+        self.last_accepted = Some(accepted);
+        true
+    }
+}
+
+/// Builds the stable `GstForceKeyUnit` custom event without adding a link-time dependency on
+/// gstvideo. This mirrors `gst_video_event_new_upstream_force_key_unit()` with
+/// `GST_CLOCK_TIME_NONE`, so an immediate keyframe with all headers is requested.
+fn upstream_force_key_unit_event(count: u32) -> gst::Event {
+    gst::event::CustomUpstream::new(
+        gst::Structure::builder("GstForceKeyUnit")
+            .field("running-time", gst::ClockTime::NONE)
+            .field("all-headers", true)
+            .field("count", count)
+            .build(),
+    )
+}
+
 impl PipelineHandle {
     pub fn is_finished(&self) -> bool {
         self.thread
@@ -402,7 +491,7 @@ pub fn build_sender_video_pipeline_for(
          ! {caps} \
          ! {encoder_chain} \
          ! h264parse config-interval=-1 \
-         ! rtph264pay pt=96 mtu={} config-interval=-1 aggregate-mode=zero-latency \
+         ! rtph264pay name={SENDER_RTP_PAY_NAME} pt=96 mtu={} config-interval=-1 aggregate-mode=zero-latency \
          ! multiudpsink clients={} sync=false async=false buffer-size={} qos-dscp={} send-duplicates=false ttl=1",
         args.mtu,
         gst_string_literal(&clients),
@@ -601,10 +690,15 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
     pipeline
         .set_state(gst::State::Playing)
         .context("failed to set pipeline to Playing")?;
+    let mut key_unit_requester = SenderKeyUnitRequester::attach(&pipeline);
 
     let result = loop {
         if stop_rx.try_recv().is_ok() {
             break Ok(());
+        }
+
+        if let Some(requester) = key_unit_requester.as_mut() {
+            requester.request_if_due(Instant::now());
         }
 
         if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
@@ -774,19 +868,19 @@ impl SelectedEncoder {
         match self.family {
             EncoderFamily::Nvidia => nvidia_encoder_chain(element, bitrate, fps, nvidia_tuning),
             EncoderFamily::Amf => format!(
-                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} usage=ultra-low-latency preset=speed rate-control=cbr aud=false \
+                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} usage=ultra-low-latency preset=speed rate-control=cbr aud=false \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
             EncoderFamily::MediaFoundation => format!(
-                "{element} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=0 \
+                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=0 \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
             EncoderFamily::QuickSync => format!(
-                "{element} bitrate={bitrate} gop-size={fps} b-frames=0 rc-lookahead=0 rate-control=cbr \
+                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} gop-size={fps} b-frames=0 rc-lookahead=0 rate-control=cbr \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
             EncoderFamily::X264 => format!(
-                "{element} bitrate={bitrate} speed-preset=ultrafast tune=zerolatency key-int-max={fps} bframes=0 sliced-threads=true byte-stream=true \
+                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} speed-preset=ultrafast tune=zerolatency key-int-max={fps} bframes=0 sliced-threads=true byte-stream=true \
                  ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
             ),
         }
@@ -802,7 +896,7 @@ fn nvidia_encoder_chain(element: &str, bitrate: u32, fps: u32, tuning: NvidiaTun
     };
 
     format!(
-        "{element} bitrate={bitrate} max-bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} \
+        "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} max-bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} \
          gop-size={fps} bframes=0 rc-lookahead=0 zerolatency=true strict-gop=true aud=false repeat-sequence-header=true{extra} \
          ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
     )
@@ -1137,6 +1231,53 @@ fn gst_string_literal(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn h264_nal_types_from_rtp(packet: &[u8]) -> Vec<u8> {
+        if packet.len() < 12 || packet[0] >> 6 != 2 {
+            return Vec::new();
+        }
+
+        let mut payload_offset = 12 + usize::from(packet[0] & 0x0f) * 4;
+        if packet[0] & 0x10 != 0 {
+            if payload_offset + 4 > packet.len() {
+                return Vec::new();
+            }
+            let extension_words =
+                u16::from_be_bytes([packet[payload_offset + 2], packet[payload_offset + 3]]);
+            payload_offset += 4 + usize::from(extension_words) * 4;
+        }
+        let padding = if packet[0] & 0x20 != 0 {
+            usize::from(*packet.last().unwrap_or(&0))
+        } else {
+            0
+        };
+        if payload_offset >= packet.len() || padding > packet.len() - payload_offset {
+            return Vec::new();
+        }
+
+        let payload = &packet[payload_offset..packet.len() - padding];
+        let packet_type = payload[0] & 0x1f;
+        match packet_type {
+            1..=23 => vec![packet_type],
+            24 => {
+                let mut types = Vec::new();
+                let mut offset = 1;
+                while offset + 2 <= payload.len() {
+                    let nal_size =
+                        usize::from(u16::from_be_bytes([payload[offset], payload[offset + 1]]));
+                    offset += 2;
+                    if nal_size == 0 || offset + nal_size > payload.len() {
+                        break;
+                    }
+                    types.push(payload[offset] & 0x1f);
+                    offset += nal_size;
+                }
+                types
+            }
+            28 if payload.len() >= 2 && payload[1] & 0x80 != 0 => vec![payload[1] & 0x1f],
+            _ => Vec::new(),
+        }
+    }
+
     fn virtual_monitor(handle: Option<u64>, bundled: bool) -> crate::monitors::DisplayMonitor {
         crate::monitors::DisplayMonitor {
             capture_index: Some(2),
@@ -1239,6 +1380,224 @@ mod tests {
         assert!(amf.contains("preset=speed"));
         assert!(media_foundation.contains("quality-vs-speed=0"));
         assert!(!media_foundation.contains("quality-vs-speed=100"));
+    }
+
+    #[test]
+    fn every_encoder_chain_exposes_the_force_key_unit_target() {
+        for family in [
+            EncoderFamily::Nvidia,
+            EncoderFamily::Amf,
+            EncoderFamily::MediaFoundation,
+            EncoderFamily::QuickSync,
+            EncoderFamily::X264,
+        ] {
+            let chain = SelectedEncoder {
+                family,
+                element: family.base_element().to_string(),
+                adapter_luid: None,
+            }
+            .chain(8_000, 30, NvidiaTuning::Auto);
+
+            assert!(
+                chain.contains(&format!("name={SENDER_VIDEO_ENCODER_NAME}")),
+                "{family:?} chain did not name its encoder: {chain}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_key_unit_schedule_requests_immediately_and_once_per_second() {
+        let start = Instant::now();
+        let mut schedule = KeyUnitSchedule::new(start);
+
+        assert_eq!(schedule.take_due(start), Some(0));
+        assert_eq!(
+            schedule.take_due(start + FORCE_KEY_UNIT_INTERVAL - Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(schedule.take_due(start + FORCE_KEY_UNIT_INTERVAL), Some(1));
+    }
+
+    #[test]
+    fn force_key_unit_event_requests_immediate_idr_with_headers() {
+        gst::init().expect("GStreamer initialization");
+        let event = upstream_force_key_unit_event(7);
+        let structure = event.structure().expect("force-key-unit structure");
+
+        assert_eq!(event.type_(), gst::EventType::CustomUpstream);
+        assert_eq!(structure.name(), "GstForceKeyUnit");
+        assert_eq!(
+            structure
+                .get::<Option<gst::ClockTime>>("running-time")
+                .expect("running-time"),
+            None
+        );
+        assert!(structure.get::<bool>("all-headers").expect("all-headers"));
+        assert_eq!(structure.get::<u32>("count").expect("count"), 7);
+    }
+
+    #[test]
+    fn force_key_unit_event_reaches_an_encoder_and_produces_a_new_keyframe() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        gst::init().expect("GStreamer initialization");
+        if [
+            "videotestsrc",
+            "x264enc",
+            "h264parse",
+            "rtph264pay",
+            "fakesink",
+        ]
+        .iter()
+        .any(|name| gst::ElementFactory::find(name).is_none())
+        {
+            eprintln!("skipping force-key-unit integration test: GStreamer test elements missing");
+            return;
+        }
+
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true \
+             ! video/x-raw,width=160,height=90,framerate=30/1 \
+             ! x264enc name=sender_video_encoder tune=zerolatency speed-preset=ultrafast \
+               key-int-max=300 bframes=0 byte-stream=true \
+             ! h264parse config-interval=-1 \
+             ! rtph264pay name=sender_rtp_pay config-interval=-1 aggregate-mode=zero-latency \
+             ! fakesink sync=false",
+        )
+        .expect("force-key-unit test pipeline")
+        .downcast::<gst::Pipeline>()
+        .expect("GStreamer pipeline");
+
+        let frames = Arc::new(AtomicUsize::new(0));
+        let keyframes = Arc::new(AtomicUsize::new(0));
+        let sps = Arc::new(AtomicUsize::new(0));
+        let pps = Arc::new(AtomicUsize::new(0));
+        let idr = Arc::new(AtomicUsize::new(0));
+        let frames_for_probe = Arc::clone(&frames);
+        let keyframes_for_probe = Arc::clone(&keyframes);
+        pipeline
+            .by_name(SENDER_VIDEO_ENCODER_NAME)
+            .expect("named encoder")
+            .static_pad("src")
+            .expect("encoder src pad")
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                if let Some(buffer) = info.buffer() {
+                    frames_for_probe.fetch_add(1, Ordering::Relaxed);
+                    if !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                        keyframes_for_probe.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+        let sps_for_probe = Arc::clone(&sps);
+        let pps_for_probe = Arc::clone(&pps);
+        let idr_for_probe = Arc::clone(&idr);
+        pipeline
+            .by_name(SENDER_RTP_PAY_NAME)
+            .expect("named RTP payloader")
+            .static_pad("src")
+            .expect("payloader src pad")
+            .add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_pad, info| {
+                    let observe_packet = |buffer: &gst::BufferRef| {
+                        if let Ok(map) = buffer.map_readable() {
+                            for nal_type in h264_nal_types_from_rtp(map.as_slice()) {
+                                match nal_type {
+                                    5 => {
+                                        idr_for_probe.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    7 => {
+                                        sps_for_probe.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    8 => {
+                                        pps_for_probe.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    };
+
+                    if let Some(buffer) = info.buffer() {
+                        observe_packet(buffer.as_ref());
+                    }
+                    if let Some(buffer_list) = info.buffer_list() {
+                        for buffer in buffer_list.iter() {
+                            observe_packet(buffer);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("start force-key-unit test pipeline");
+        let wait_until = |predicate: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if predicate() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            predicate()
+        };
+        let started = wait_until(&|| {
+            frames.load(Ordering::Relaxed) >= 5
+                && keyframes.load(Ordering::Relaxed) >= 1
+                && sps.load(Ordering::Relaxed) >= 1
+                && pps.load(Ordering::Relaxed) >= 1
+                && idr.load(Ordering::Relaxed) >= 1
+        });
+        let headers_before = (
+            sps.load(Ordering::Relaxed),
+            pps.load(Ordering::Relaxed),
+            idr.load(Ordering::Relaxed),
+        );
+
+        let mut requester = SenderKeyUnitRequester::attach(&pipeline).expect("named RTP payloader");
+        let requested = requester.request_if_due(Instant::now());
+        let accepted = requester.last_accepted;
+        let forced = wait_until(&|| {
+            keyframes.load(Ordering::Relaxed) >= 2
+                && sps.load(Ordering::Relaxed) > headers_before.0
+                && pps.load(Ordering::Relaxed) > headers_before.1
+                && idr.load(Ordering::Relaxed) > headers_before.2
+        });
+
+        pipeline
+            .set_state(gst::State::Null)
+            .expect("stop force-key-unit test pipeline");
+        assert!(
+            started,
+            "test pipeline did not produce its initial keyframe: frames={} keyframes={} sps={} pps={} idr={}",
+            frames.load(Ordering::Relaxed),
+            keyframes.load(Ordering::Relaxed),
+            sps.load(Ordering::Relaxed),
+            pps.load(Ordering::Relaxed),
+            idr.load(Ordering::Relaxed)
+        );
+        assert!(
+            requested,
+            "initial force-key-unit request was not scheduled"
+        );
+        assert_eq!(
+            accepted,
+            Some(true),
+            "encoder rejected force-key-unit event"
+        );
+        assert!(
+            forced,
+            "forced keyframe did not include SPS/PPS/IDR within 3s: before={headers_before:?} after=({},{},{})",
+            sps.load(Ordering::Relaxed),
+            pps.load(Ordering::Relaxed),
+            idr.load(Ordering::Relaxed)
+        );
     }
 
     #[test]

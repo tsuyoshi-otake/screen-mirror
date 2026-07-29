@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.44`.
+The desktop and Android package versions for this release are `0.1.45`.
 
 ## Transport Model
 
@@ -308,7 +308,7 @@ The report includes:
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
 - Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, and GPU-engine usage
-- GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` engine activity
+- GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` / AMD `Video Codec` engine activity
 - Bundled VDD device status and other virtual display candidates
 - Communication health verdict, Windows network profiles, active UDP/TCP endpoints, and the installed Screen Mirror firewall rule
 - Windows display list, GStreamer probe, receiver discovery, network adapters, and virtual display state
@@ -466,6 +466,7 @@ The desktop sender uses a low-latency RTP/UDP pipeline:
 - Sender queues are leaky and capped at one frame so old frames are dropped instead of delayed.
 - Audio uses 5 ms Opus frames, short bounded burst queues, two-packet jitter-buffer fast start, Opus packet-loss concealment, and the native WASAPI low-latency mode.
 - RTP/H.264 uses `aggregate-mode=zero-latency` and a configurable MTU.
+- The sender requests an immediate H.264 keyframe with headers and repeats that request every second, so a receiver can start or recover without waiting for an encoder-specific GOP implementation.
 - UDP send/receive buffers default to `1 MiB`.
 - Receiver `udpsrc` disables sender-address metadata collection to avoid unnecessary per-packet work.
 - `Run Diagnostics` records process working set/private memory, handle/thread counts, GPU process memory, and per-engine utilization samples.

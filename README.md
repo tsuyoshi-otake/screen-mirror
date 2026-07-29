@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.45`.
+The desktop and Android package versions for this release are `0.1.46`.
 
 ## Transport Model
 
@@ -233,6 +233,8 @@ The value is `auto` (default), an adapter description, a case-insensitive substr
 
 The chosen GPU is applied by selecting the per-device element GStreamer registers for that adapter (`nvd3d11h264device1enc`, `qsvh264device1enc`, `amfh264device1enc`, `d3d11h264device1dec`, and the `adapter` property of `d3d11videosink`). If the requested vendor has no encoder on that GPU, the sender logs the mismatch and keeps the automatic choice. `mfh264enc` has no adapter property, so it is never GPU-pinned.
 
+For receivers, `auto` follows the GPU that owns the primary attached display. NVIDIA, Radeon, Intel, and other adapters all prefer the matching per-device D3D11/DXVA H.264 decoder and the same-adapter D3D11 sink. NVIDIA can fall back to NVDEC and Intel can fall back to Quick Sync when a matching D3D11 decoder is unavailable; Radeon uses the Windows D3D11/DXVA decode path because the GStreamer AMF plugin is encoder-only. An explicit `gpu`, `decoder`, or `sink` setting still overrides its corresponding automatic choice.
+
 Desktop duplication always captures on the GPU that owns the captured monitor. When the selected encoder GPU is not that GPU, the sender drops out of the zero-copy path for that session and hands the encoder system-memory frames, because D3D11 textures cannot cross adapters.
 
 Balanced sender defaults are `30 fps`, `8000 kbit/s`, and a `1 MiB` UDP buffer. `zero_copy = true` keeps D3D11 capture textures in GPU memory through NVIDIA, Quick Sync, AMF, and D3D11-aware Media Foundation encoders, avoiding a full-frame GPU-to-RAM copy. The app checks the installed encoder caps and automatically falls back to system-memory frames when that runtime cannot accept D3D11 textures. Set `zero_copy = false` only to diagnose an older driver or cross-adapter negotiation failure. Use `60 fps` as an explicit quality/latency tradeoff; it roughly doubles capture and encode work.
@@ -307,8 +309,9 @@ The report includes:
 - Recent Screen Mirror log lines
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
-- Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, and GPU-engine usage
+- Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, GPU-engine usage, and `Video Decode` / Radeon `Video Codec` peak/current activity when Windows exposes those counters; negotiated D3D11 memory is reported separately when an older driver returns zero
 - GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` / AMD `Video Codec` engine activity
+- Latest receiver playback route: selected hardware profile, adapter, decoder, inferred memory path, and video sink
 - Bundled VDD device status and other virtual display candidates
 - Communication health verdict, Windows network profiles, active UDP/TCP endpoints, and the installed Screen Mirror firewall rule
 - Windows display list, GStreamer probe, receiver discovery, network adapters, and virtual display state
@@ -469,7 +472,7 @@ The desktop sender uses a low-latency RTP/UDP pipeline:
 - The sender requests an immediate H.264 keyframe with headers and repeats that request every second, so a receiver can start or recover without waiting for an encoder-specific GOP implementation.
 - UDP send/receive buffers default to `1 MiB`.
 - Receiver `udpsrc` disables sender-address metadata collection to avoid unnecessary per-packet work.
-- `Run Diagnostics` records process working set/private memory, handle/thread counts, GPU process memory, and per-engine utilization samples.
+- `Run Diagnostics` records process CPU, working set/private memory, handle/thread counts, GPU process memory, per-engine utilization samples, and `Video Decode` / Radeon `Video Codec` peak/current usage when available. GPU counter support varies by Windows driver; unavailable counters do not prevent the report from being generated.
 
 ## Third-Party Licensing
 

@@ -87,6 +87,40 @@ pub fn resolve(selection: &str) -> Option<GpuAdapter> {
     found.cloned()
 }
 
+/// Resolves the GPU used to render a receiver session. Explicit choices retain the normal
+/// resolution rules, while `auto` follows the primary attached Windows display so decoding and
+/// presentation prefer the GPU that owns the visible output.
+pub fn resolve_receiver(selection: &str) -> Option<GpuAdapter> {
+    if !is_auto(selection) {
+        return resolve(selection);
+    }
+
+    let monitors = crate::monitors::enumerate_monitors();
+    let target = monitors
+        .iter()
+        .find(|monitor| monitor.attached && monitor.primary)
+        .or_else(|| monitors.iter().find(|monitor| monitor.attached));
+    let gpu = target.and_then(|monitor| {
+        monitor
+            .monitor_handle
+            .and_then(adapter_for_monitor_handle)
+            .or_else(|| adapter_for_display_device_name(&monitor.adapter_name))
+    });
+
+    if let Some(gpu) = gpu.as_ref() {
+        crate::logging::append(format!(
+            "receiver automatic GPU selected from display: {}",
+            gpu.summary()
+        ));
+    } else {
+        crate::logging::append(
+            "receiver automatic GPU could not be resolved from an attached display; using GStreamer default",
+        );
+    }
+
+    gpu
+}
+
 pub fn print_adapters() {
     let adapters = adapters();
     if adapters.is_empty() {

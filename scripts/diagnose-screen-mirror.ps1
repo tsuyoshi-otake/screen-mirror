@@ -243,10 +243,140 @@ function Test-VideoEncodeGpuEngine([string] $Engine) {
         return $false
     }
 
-    # NVIDIA and Intel expose encode engines as "Video Encode". AMD's
-    # performance counters expose the same AMF workload as "Video Codec".
-    # Keep accepting both formats, including the engtype_ counter prefix.
-    return $Engine -match "(?i)(?:engtype_)?video[_ ]?(?:encode|codec)(?:[_ ]|$)"
+    return $Engine -match "(?i)(?:engtype_)?video[_ ]?encode(?:[_ ]|$)"
+}
+
+function Test-VideoCodecGpuEngine([string] $Engine) {
+    if ([string]::IsNullOrWhiteSpace($Engine)) {
+        return $false
+    }
+
+    # Some Radeon drivers expose a combined codec engine rather than separate
+    # encode/decode counters. Keep it separate so receiver work is not labelled
+    # as encoding (or sender work as decoding).
+    return $Engine -match "(?i)(?:engtype_)?video[_ ]?codec(?:[_ ]|$)"
+}
+
+function Test-VideoDecodeGpuEngine([string] $Engine) {
+    if ([string]::IsNullOrWhiteSpace($Engine)) {
+        return $false
+    }
+
+    # Intel and NVIDIA expose the hardware decoder as "Video Decode".  Do not
+    # treat AMD's combined "Video Codec" counter as decode here: it can contain
+    # either AMF encode or decode work, so reporting it as decode would mislead.
+    return $Engine -match "(?i)(?:engtype_)?video[_ ]?decode(?:[_ ]|$)"
+}
+
+function Get-ReceiverPlaybackRoute {
+    $logLines = if (Test-Path -LiteralPath $logPath) {
+        @(Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue)
+    } else {
+        @()
+    }
+    $adapterLine = $logLines |
+        Where-Object { $_ -match "^receiver GPU selected:" } |
+        Select-Object -Last 1
+    $routeLine = $logLines |
+        Where-Object {
+            $_ -match "^receiver profile=\S+\s+adapter=.*\s+decoder=\S+\s+memory=\S+\s+sink=" -or
+            $_ -match "^receiver decoder=\S+\s+sink="
+        } |
+        Select-Object -Last 1
+    $runtimeLine = $logLines |
+        Where-Object { $_ -match "^receiver runtime decoder=\S+\s+memory=.*\s+caps=.*\s+sink=\S+$" } |
+        Select-Object -Last 1
+    $pipelineLine = $logLines |
+        Where-Object { $_ -match "^receiver video pipeline:" } |
+        Select-Object -Last 1
+    # Regex.Match rejects a null input.  A missing route is normal on a fresh
+    # install or after log rotation, so turn it into an empty string first.
+    $routeText = if ($null -eq $routeLine) { "" } else { $routeLine.ToString() }
+    $plannedMatch = [regex]::Match(
+        $routeText,
+        "^receiver profile=(\S+)\s+adapter=(.*?)\s+decoder=(\S+)\s+memory=(\S+)\s+sink=(.+)$"
+    )
+    $legacyMatch = [regex]::Match($routeText, "^receiver decoder=(\S+)\s+sink=(.+)$")
+    $runtimeText = if ($null -eq $runtimeLine) { "" } else { $runtimeLine.ToString() }
+    $runtimeMatch = [regex]::Match(
+        $runtimeText,
+        "^receiver runtime decoder=(\S+)\s+memory=(.*?)\s+caps=(.*?)\s+sink=(\S+)$"
+    )
+
+    $profile = if ($plannedMatch.Success) { $plannedMatch.Groups[1].Value } else { "UNKNOWN" }
+    $adapter = if ($plannedMatch.Success) {
+        $plannedMatch.Groups[2].Value
+    } elseif ($adapterLine) {
+        $adapterLine -replace "^receiver GPU selected:\s*", ""
+    } else {
+        "(not recorded; auto selection may be in use)"
+    }
+    $configuredDecoder = if ($plannedMatch.Success) {
+        $plannedMatch.Groups[3].Value
+    } elseif ($legacyMatch.Success) {
+        $legacyMatch.Groups[1].Value
+    } else {
+        "UNKNOWN"
+    }
+    $decoder = if ($runtimeMatch.Success) {
+        $runtimeMatch.Groups[1].Value
+    } else {
+        $configuredDecoder
+    }
+    $configuredMemory = if ($plannedMatch.Success) {
+        $plannedMatch.Groups[4].Value
+    } else {
+        "UNKNOWN"
+    }
+    $memoryPath = if ($runtimeMatch.Success) {
+        $runtimeMatch.Groups[2].Value
+    } elseif ($configuredMemory -ne "UNKNOWN") {
+        "$configuredMemory (planned; no negotiated caps were logged)"
+    } elseif ($decoder -match "^d3d11" -and $routeText -match "sink=d3d11videosink") {
+        "D3D11Memory expected between hardware decoder and D3D11 sink"
+    } else {
+        "UNKNOWN - no negotiated decoder caps were found in the log"
+    }
+    $negotiatedCaps = if ($runtimeMatch.Success) {
+        $runtimeMatch.Groups[3].Value
+    } else {
+        "(not recorded; run diagnostics while video is being received)"
+    }
+    $sink = if ($runtimeMatch.Success) {
+        $runtimeMatch.Groups[4].Value
+    } elseif ($plannedMatch.Success) {
+        $plannedMatch.Groups[5].Value
+    } elseif ($legacyMatch.Success) {
+        $legacyMatch.Groups[2].Value
+    } else {
+        "UNKNOWN"
+    }
+
+    $hardwareProfile = if ($profile -ne "UNKNOWN") {
+        $profile
+    } elseif ($decoder -match "^d3d11.*h264.*dec$") {
+        "D3D11/DXVA H.264 hardware decode requested"
+    } elseif ($decoder -eq "decodebin") {
+        "Autoplug decode (hardware decoder selection is not recorded)"
+    } elseif ($decoder -match "^avdec") {
+        "Software H.264 decode requested"
+    } elseif ($decoder -eq "UNKNOWN") {
+        "UNKNOWN - no receiver route was found in the log"
+    } else {
+        "Decoder requested: $decoder"
+    }
+
+    [pscustomobject]@{
+        HardwareProfile = $hardwareProfile
+        Adapter = $adapter
+        ConfiguredDecoder = $configuredDecoder
+        ActualDecoder = $decoder
+        MemoryPath = $memoryPath
+        NegotiatedCaps = $negotiatedCaps
+        Sink = $sink
+        LastRuntimeRoute = if ($runtimeLine) { $runtimeLine } else { "(not recorded)" }
+        LastPipeline = if ($pipelineLine) { $pipelineLine } else { "(not recorded)" }
+    }
 }
 
 function Get-GpuAccelerationVerdict {
@@ -311,6 +441,10 @@ function Get-GpuAccelerationVerdict {
 
     $videoEncodeRows = @($script:sampledGpuEngines |
         Where-Object { Test-VideoEncodeGpuEngine $_.Engine })
+    if ($encoder -match "(?i)^amfh264") {
+        $videoEncodeRows += @($script:sampledGpuEngines |
+            Where-Object { Test-VideoCodecGpuEngine $_.Engine })
+    }
     $running = @(Get-Process screen-mirror -ErrorAction SilentlyContinue).Count -gt 0
     if ($videoEncodeRows.Count -gt 0) {
         $maxVideoEncode = ($videoEncodeRows | Measure-Object MaxPercent -Maximum).Maximum
@@ -355,6 +489,10 @@ function Get-ScreenMirrorResourceSummary {
     $gpuEngineRows = @($script:sampledGpuEngines)
     $videoEncodeRows = @($gpuEngineRows |
         Where-Object { Test-VideoEncodeGpuEngine $_.Engine })
+    $videoDecodeRows = @($gpuEngineRows |
+        Where-Object { Test-VideoDecodeGpuEngine $_.Engine })
+    $videoCodecRows = @($gpuEngineRows |
+        Where-Object { Test-VideoCodecGpuEngine $_.Engine })
 
     if ($resourceRows.Count -eq 0) {
         return [pscustomobject]@{
@@ -366,7 +504,13 @@ function Get-ScreenMirrorResourceSummary {
             GpuDedicatedMiB = "N/A"
             GpuSharedMiB = "N/A"
             GpuEnginePeakPercent = "N/A"
+            GpuEngineCurrentPercent = "N/A"
             VideoEncodePeakPercent = "N/A"
+            VideoDecodePeakPercent = "N/A"
+            VideoDecodeCurrentPercent = "N/A"
+            VideoCodecPeakPercent = "N/A"
+            VideoCodecCurrentPercent = "N/A"
+            GpuCounterInterpretation = "N/A"
         }
     }
 
@@ -401,6 +545,69 @@ function Get-ScreenMirrorResourceSummary {
     } else {
         "UNAVAILABLE"
     }
+    $gpuCurrent = if ($script:gpuEngineSampleSucceeded) {
+        if ($gpuEngineRows.Count -gt 0) {
+            [math]::Round(($gpuEngineRows | Measure-Object CurrentPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+    $videoDecodePeak = if ($script:gpuEngineSampleSucceeded) {
+        if ($videoDecodeRows.Count -gt 0) {
+            [math]::Round(($videoDecodeRows | Measure-Object MaxPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+    $videoDecodeCurrent = if ($script:gpuEngineSampleSucceeded) {
+        if ($videoDecodeRows.Count -gt 0) {
+            [math]::Round(($videoDecodeRows | Measure-Object CurrentPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+    $videoCodecPeak = if ($script:gpuEngineSampleSucceeded) {
+        if ($videoCodecRows.Count -gt 0) {
+            [math]::Round(($videoCodecRows | Measure-Object MaxPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+    $videoCodecCurrent = if ($script:gpuEngineSampleSucceeded) {
+        if ($videoCodecRows.Count -gt 0) {
+            [math]::Round(($videoCodecRows | Measure-Object CurrentPercent -Maximum).Maximum, 2)
+        } else {
+            0
+        }
+    } else {
+        "UNAVAILABLE"
+    }
+    $latestRuntimeRoute = if (Test-Path -LiteralPath $logPath) {
+        Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match "^receiver runtime decoder=" } |
+            Select-Object -Last 1
+    } else {
+        $null
+    }
+    $gpuCounterInterpretation = if (
+        $script:gpuEngineSampleSucceeded -and
+        $gpuPeak -eq 0 -and
+        $latestRuntimeRoute -match "^receiver runtime decoder=(?:d3d11|nvh264|qsvh264|mfh264)\S*\s+memory=D3D11Memory\s"
+    ) {
+        "D3D11 hardware decode and GPU-memory caps were confirmed; this Windows/driver counter set reported 0%."
+    } elseif (-not $script:gpuEngineSampleSucceeded) {
+        "Windows GPU performance counters were unavailable; use Receiver Playback Route to confirm hardware decode."
+    } else {
+        "GPU percentages are Windows performance-counter samples; Receiver Playback Route reports the negotiated decoder memory path."
+    }
 
     [pscustomobject]@{
         Status = "SAMPLED - CPU over 1 second; GPU engines over 5 seconds per process"
@@ -411,7 +618,13 @@ function Get-ScreenMirrorResourceSummary {
         GpuDedicatedMiB = $gpuDedicated
         GpuSharedMiB = $gpuShared
         GpuEnginePeakPercent = $gpuPeak
+        GpuEngineCurrentPercent = $gpuCurrent
         VideoEncodePeakPercent = $videoEncodePeak
+        VideoDecodePeakPercent = $videoDecodePeak
+        VideoDecodeCurrentPercent = $videoDecodeCurrent
+        VideoCodecPeakPercent = $videoCodecPeak
+        VideoCodecCurrentPercent = $videoCodecCurrent
+        GpuCounterInterpretation = $gpuCounterInterpretation
     }
 }
 
@@ -514,22 +727,24 @@ Add-CommandOutput "CPU, Memory, and GPU Usage" {
                 -ErrorAction Stop
             $script:gpuEngineSampleSucceeded = $true
             $engineRows = @($engines.CounterSamples |
-                Where-Object CookedValue -GT 0.01 |
                 Group-Object InstanceName |
                 ForEach-Object {
+                    $samples = @($_.Group)
                     [pscustomobject]@{
                         Id = $process.Id
                         Engine = $_.Name
-                        MaxPercent = [math]::Round((($_.Group | Measure-Object CookedValue -Maximum).Maximum), 2)
-                        AveragePercent = [math]::Round((($_.Group | Measure-Object CookedValue -Average).Average), 2)
+                        MaxPercent = [math]::Round((($samples | Measure-Object CookedValue -Maximum).Maximum), 2)
+                        AveragePercent = [math]::Round((($samples | Measure-Object CookedValue -Average).Average), 2)
+                        CurrentPercent = [math]::Round(($samples | Select-Object -Last 1).CookedValue, 2)
                     }
                 } |
                 Sort-Object MaxPercent -Descending)
             $script:sampledGpuEngines += $engineRows
-            if ($engineRows.Count -eq 0) {
+            $activeEngineRows = @($engineRows | Where-Object MaxPercent -GT 0.01)
+            if ($activeEngineRows.Count -eq 0) {
                 "No active GPU engine was observed for PID $($process.Id) during the sample."
             } else {
-                $engineRows | Format-Table -AutoSize
+                $activeEngineRows | Format-Table -AutoSize
             }
         } catch {
             "GPU counters unavailable for PID $($process.Id): $($_.Exception.Message)"
@@ -543,6 +758,10 @@ Add-CommandOutput "Screen Mirror Resource Summary" {
 
 Add-CommandOutput "GPU Acceleration Verdict" {
     Get-GpuAccelerationVerdict | Format-List
+}
+
+Add-CommandOutput "Receiver Playback Route" {
+    Get-ReceiverPlaybackRoute | Format-List
 }
 
 Add-CommandOutput "Communication Health" {

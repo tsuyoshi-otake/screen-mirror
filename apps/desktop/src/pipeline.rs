@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 const SENDER_VIDEO_ENCODER_NAME: &str = "sender_video_encoder";
 const SENDER_RTP_PAY_NAME: &str = "sender_rtp_pay";
 const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(1);
+const RECEIVER_VIDEO_DECODER_NAME: &str = "receiver_video_decoder";
+const RECEIVER_VIDEO_SINK_NAME: &str = "receiver_video_sink";
 
 #[derive(Args, Clone, Debug)]
 pub struct SendArgs {
@@ -592,22 +594,34 @@ pub fn build_receiver_video_pipeline(args: &RecvArgs) -> Result<String> {
     ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
     ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
 
-    let gpu = crate::gpu::resolve(&args.gpu);
+    let gpu = crate::gpu::resolve_receiver(&args.gpu);
     if let Some(gpu) = gpu.as_ref() {
         crate::logging::append(format!("receiver GPU selected: {}", gpu.summary()));
     }
     let decoder = select_decoder(args.decoder, gpu.as_ref())?;
     let sink = select_sink(args.sink, args.fullscreen, gpu.as_ref())?;
-    crate::logging::append(format!("receiver decoder={decoder} sink={sink}"));
+    // `autovideosink` can select a non-D3D sink. Do not force D3D11Memory caps in that explicit
+    // compatibility mode; let GStreamer negotiate a converter or a system-memory path instead.
+    let use_d3d11_memory = decoder.d3d11_memory && sink.starts_with("d3d11videosink");
+    let profile = receiver_gpu_profile(gpu.as_ref());
+    crate::logging::append(format!(
+        "receiver profile={} adapter={} decoder={} memory={} sink={}",
+        profile.label(),
+        gpu.as_ref()
+            .map(crate::gpu::GpuAdapter::summary)
+            .unwrap_or_else(|| "GStreamer default".to_string()),
+        decoder.factory,
+        decoder.memory_label_for(use_d3d11_memory),
+        sink
+    ));
 
     let video = format!(
         "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
-         ! queue max-size-buffers=32 max-size-time=0 max-size-bytes=0 leaky=downstream \
-         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=false faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
-         ! rtph264depay \
+         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=true faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
+         ! rtph264depay wait-for-keyframe=true \
          ! h264parse disable-passthrough=true \
-         ! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream \
-         ! {decoder} \
+         ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 \
+         ! {}{} \
          ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {sink}",
         args.port,
@@ -616,7 +630,9 @@ pub fn build_receiver_video_pipeline(args: &RecvArgs) -> Result<String> {
         args.jitter_ms,
         args.jitter_faststart_packets,
         args.jitter_max_dropout_ms,
-        args.jitter_max_misorder_ms
+        args.jitter_max_misorder_ms,
+        decoder.pipeline_element(),
+        decoder.output_caps_for(use_d3d11_memory),
     );
 
     Ok(video)
@@ -691,6 +707,10 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
         .set_state(gst::State::Playing)
         .context("failed to set pipeline to Playing")?;
     let mut key_unit_requester = SenderKeyUnitRequester::attach(&pipeline);
+    let mut receiver_runtime_logged = pipeline
+        .by_name(RECEIVER_VIDEO_DECODER_NAME)
+        .is_some()
+        .then_some(false);
 
     let result = loop {
         if stop_rx.try_recv().is_ok() {
@@ -699,6 +719,12 @@ fn run_pipeline_until_stop(description: &str, stop_rx: mpsc::Receiver<()>) -> Re
 
         if let Some(requester) = key_unit_requester.as_mut() {
             requester.request_if_due(Instant::now());
+        }
+
+        if let Some(logged) = receiver_runtime_logged.as_mut() {
+            if !*logged {
+                *logged = log_receiver_runtime_path(&pipeline);
+            }
         }
 
         if let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
@@ -766,6 +792,49 @@ fn arm_receiver_timeout_after_first_packet(pipeline: &gst::Pipeline) {
         crate::logging::append("receiver video packets started; disconnect timeout armed");
         gst::PadProbeReturn::Remove
     });
+}
+
+/// Waits until decoding has negotiated caps, then records the element GStreamer actually chose.
+/// This is especially important for `decodebin`, whose configured name is not its final decoder.
+fn log_receiver_runtime_path(pipeline: &gst::Pipeline) -> bool {
+    let decoder = pipeline
+        .iterate_recurse()
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|element| {
+            element.factory().is_some_and(|factory| {
+                let name = factory.name();
+                name.contains("h264") && (name.ends_with("dec") || name == "avdec_h264")
+            })
+        });
+    let Some(decoder) = decoder else {
+        return false;
+    };
+    let Some(src_pad) = decoder.static_pad("src") else {
+        return false;
+    };
+    let Some(caps) = src_pad.current_caps() else {
+        return false;
+    };
+    let decoder_factory = decoder
+        .factory()
+        .map(|factory| factory.name().to_string())
+        .unwrap_or_else(|| decoder.name().to_string());
+    let sink = pipeline
+        .by_name(RECEIVER_VIDEO_SINK_NAME)
+        .and_then(|sink| sink.factory().map(|factory| factory.name().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let caps = caps.to_string();
+    let memory = if caps.contains("memory:D3D11Memory") {
+        "D3D11Memory"
+    } else {
+        "system/other memory"
+    };
+
+    crate::logging::append(format!(
+        "receiver runtime decoder={decoder_factory} memory={memory} caps={caps} sink={sink}"
+    ));
+    true
 }
 
 fn video_caps(fps: u32, width: Option<u32>, height: Option<u32>, d3d11: bool) -> String {
@@ -1013,31 +1082,250 @@ fn encoder_on_gpu(
     })
 }
 
-fn select_decoder(requested: Decoder, gpu: Option<&crate::gpu::GpuAdapter>) -> Result<String> {
-    match requested {
-        Decoder::Auto | Decoder::D3d11 => {
-            if let Some(decoder) = gpu.and_then(d3d11_decoder_on_gpu) {
-                return Ok(decoder);
-            }
-            match requested {
-                Decoder::D3d11 => require_element("d3d11h264dec", "d3d11h264dec".to_string()),
-                _ => require_element("decodebin", "decodebin".to_string()),
-            }
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ReceiverGpuProfile {
+    Nvidia,
+    Amd,
+    Intel,
+    Other,
+}
+
+impl ReceiverGpuProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Amd => "amd",
+            Self::Intel => "intel",
+            Self::Other => "other",
         }
-        Decoder::Avdec => require_element("avdec_h264", "avdec_h264".to_string()),
     }
 }
 
-fn d3d11_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<String> {
-    let decoder = family_elements(gst::ElementFactoryType::DECODER, |name| {
-        name.starts_with("d3d11") && name.contains("h264") && name.ends_with("dec")
+fn receiver_gpu_profile(gpu: Option<&crate::gpu::GpuAdapter>) -> ReceiverGpuProfile {
+    match gpu.map(crate::gpu::GpuAdapter::vendor) {
+        Some(crate::gpu::GpuVendor::Nvidia) => ReceiverGpuProfile::Nvidia,
+        Some(crate::gpu::GpuVendor::Amd) => ReceiverGpuProfile::Amd,
+        Some(crate::gpu::GpuVendor::Intel) => ReceiverGpuProfile::Intel,
+        Some(crate::gpu::GpuVendor::Other) | None => ReceiverGpuProfile::Other,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReceiverDecoder {
+    factory: String,
+    d3d11_memory: bool,
+    force_system_memory: bool,
+    properties: String,
+}
+
+impl ReceiverDecoder {
+    fn new(factory: impl Into<String>, d3d11_memory: bool) -> Self {
+        Self {
+            factory: factory.into(),
+            d3d11_memory,
+            force_system_memory: false,
+            properties: String::new(),
+        }
+    }
+
+    fn with_system_memory(mut self) -> Self {
+        self.d3d11_memory = false;
+        self.force_system_memory = true;
+        self
+    }
+
+    fn with_property(mut self, name: &str, value: impl std::fmt::Display) -> Self {
+        self.properties.push_str(&format!(" {name}={value}"));
+        self
+    }
+
+    fn pipeline_element(&self) -> String {
+        format!(
+            "{} name={RECEIVER_VIDEO_DECODER_NAME}{}",
+            self.factory, self.properties
+        )
+    }
+
+    fn output_caps_for(&self, use_d3d11_memory: bool) -> &'static str {
+        if self.force_system_memory {
+            " ! video/x-raw"
+        } else if self.d3d11_memory && use_d3d11_memory {
+            " ! video/x-raw(memory:D3D11Memory),format=NV12"
+        } else {
+            ""
+        }
+    }
+
+    fn memory_label_for(&self, use_d3d11_memory: bool) -> &'static str {
+        if self.force_system_memory {
+            "system-memory"
+        } else if self.d3d11_memory && use_d3d11_memory {
+            "D3D11Memory/NV12"
+        } else {
+            "negotiated"
+        }
+    }
+}
+
+fn select_decoder(
+    requested: Decoder,
+    gpu: Option<&crate::gpu::GpuAdapter>,
+) -> Result<ReceiverDecoder> {
+    match requested {
+        Decoder::D3d11 => {
+            if let Some(gpu) = gpu {
+                if let Some(decoder) = d3d11_decoder_on_gpu(gpu) {
+                    return Ok(decoder);
+                }
+                if selected_is_only_adapter(gpu, &crate::gpu::adapters()) {
+                    crate::logging::append(format!(
+                        "selected GPU {} is the only DXGI adapter; using the base D3D11 H.264 decoder",
+                        gpu.description
+                    ));
+                    return require_element(
+                        "d3d11h264dec",
+                        ReceiverDecoder::new("d3d11h264dec", true),
+                    );
+                }
+                return Err(anyhow!(
+                    "no D3D11 H.264 decoder is bound to selected GPU {}; refusing a cross-adapter decoder because decoder=d3d11 was explicitly requested",
+                    gpu.description
+                ));
+            }
+            require_element("d3d11h264dec", ReceiverDecoder::new("d3d11h264dec", true))
+        }
+        Decoder::Avdec => require_element("avdec_h264", ReceiverDecoder::new("avdec_h264", false)),
+        Decoder::Auto => {
+            if let Some(decoder) = gpu.and_then(d3d11_decoder_on_gpu) {
+                return Ok(decoder);
+            }
+            if let Some(gpu) = gpu.filter(|gpu| {
+                selected_is_only_adapter(gpu, &crate::gpu::adapters())
+                    && has_element("d3d11h264dec")
+            }) {
+                crate::logging::append(format!(
+                    "receiver GPU {} is the only DXGI adapter; using the base D3D11 H.264 decoder",
+                    gpu.description
+                ));
+                return Ok(ReceiverDecoder::new("d3d11h264dec", true));
+            }
+            if gpu.is_none() && has_element("d3d11h264dec") {
+                crate::logging::append(
+                    "receiver automatic GPU is unavailable; using the primary D3D11 H.264 decoder",
+                );
+                return Ok(ReceiverDecoder::new("d3d11h264dec", true));
+            }
+
+            let profile = receiver_gpu_profile(gpu);
+            let fallback = match profile {
+                ReceiverGpuProfile::Nvidia => gpu.and_then(nvidia_decoder_on_gpu),
+                ReceiverGpuProfile::Intel => gpu.and_then(qsv_decoder_on_gpu),
+                ReceiverGpuProfile::Amd | ReceiverGpuProfile::Other => None,
+            };
+            if let Some(decoder) = fallback {
+                crate::logging::append(format!(
+                    "receiver {} GPU has no matching D3D11 H.264 decoder; using {}",
+                    profile.label(),
+                    decoder.factory
+                ));
+                return Ok(decoder);
+            }
+
+            crate::logging::append(format!(
+                "receiver {} GPU has no matching hardware H.264 decoder; using decodebin with system-memory output to avoid cross-adapter textures",
+                profile.label()
+            ));
+            require_element(
+                "decodebin",
+                ReceiverDecoder::new("decodebin", false).with_system_memory(),
+            )
+        }
+    }
+}
+
+fn nvidia_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<ReceiverDecoder> {
+    family_decoder_on_gpu(gpu, |name| {
+        name.starts_with("nvh264") && name.ends_with("dec")
     })
-    .into_iter()
-    .find(|element| element_adapter_luid(element) == Some(gpu.luid));
+    .or_else(|| {
+        if selected_is_only_vendor_adapter(gpu, &crate::gpu::adapters()) {
+            nvidia_decoder("nvh264dec")
+        } else {
+            None
+        }
+    })
+}
+
+fn qsv_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<ReceiverDecoder> {
+    family_decoder_on_gpu(gpu, |name| {
+        name.starts_with("qsvh264") && name.ends_with("dec")
+    })
+    .or_else(|| {
+        if selected_is_only_vendor_adapter(gpu, &crate::gpu::adapters()) {
+            preferred_d3d11_memory_decoder("qsvh264dec")
+        } else {
+            None
+        }
+    })
+}
+
+fn nvidia_decoder(factory: &str) -> Option<ReceiverDecoder> {
+    if !has_element(factory) {
+        return None;
+    }
+    let mut decoder = ReceiverDecoder::new(factory, true);
+    if element_has_property(factory, "max-display-delay") {
+        decoder = decoder.with_property("max-display-delay", 0);
+    }
+    Some(decoder)
+}
+
+fn preferred_d3d11_memory_decoder(factory: &str) -> Option<ReceiverDecoder> {
+    has_element(factory).then(|| ReceiverDecoder::new(factory, true))
+}
+
+fn family_decoder_on_gpu(
+    gpu: &crate::gpu::GpuAdapter,
+    predicate: impl Fn(&str) -> bool,
+) -> Option<ReceiverDecoder> {
+    family_elements(gst::ElementFactoryType::DECODER, predicate)
+        .into_iter()
+        .find(|element| element_adapter_luid(element) == Some(gpu.luid))
+        .and_then(|factory| {
+            if factory.starts_with("nvh264") {
+                nvidia_decoder(&factory)
+            } else {
+                preferred_d3d11_memory_decoder(&factory)
+            }
+        })
+}
+
+fn selected_is_only_adapter(
+    selected: &crate::gpu::GpuAdapter,
+    adapters: &[crate::gpu::GpuAdapter],
+) -> bool {
+    adapters.len() == 1 && adapters[0].luid == selected.luid
+}
+
+fn selected_is_only_vendor_adapter(
+    selected: &crate::gpu::GpuAdapter,
+    adapters: &[crate::gpu::GpuAdapter],
+) -> bool {
+    let matches: Vec<&crate::gpu::GpuAdapter> = adapters
+        .iter()
+        .filter(|adapter| adapter.vendor() == selected.vendor())
+        .collect();
+    matches.len() == 1 && matches[0].luid == selected.luid
+}
+
+fn d3d11_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<ReceiverDecoder> {
+    let decoder = family_decoder_on_gpu(gpu, |name| {
+        name.starts_with("d3d11") && name.contains("h264") && name.ends_with("dec")
+    });
 
     if decoder.is_none() {
         crate::logging::append(format!(
-            "no d3d11 H.264 decoder is bound to GPU {}; using the default decoder",
+            "no d3d11 H.264 decoder is bound to GPU {}",
             gpu.description
         ));
     }
@@ -1055,10 +1343,10 @@ fn select_sink(
     };
     let d3d11_sink = if fullscreen {
         format!(
-            "d3d11videosink{adapter} sync=false qos=true fullscreen-toggle-mode=property fullscreen=true"
+            "d3d11videosink name={RECEIVER_VIDEO_SINK_NAME}{adapter} sync=false async=false qos=true enable-last-sample=false fullscreen-toggle-mode=property fullscreen=true"
         )
     } else {
-        format!("d3d11videosink{adapter} sync=false qos=true")
+        format!("d3d11videosink name={RECEIVER_VIDEO_SINK_NAME}{adapter} sync=false async=false qos=true enable-last-sample=false")
     };
 
     match requested {
@@ -1066,11 +1354,15 @@ fn select_sink(
             if has_element("d3d11videosink") {
                 Ok(d3d11_sink)
             } else {
-                Ok("autovideosink sync=false".to_string())
+                Ok(format!(
+                    "autovideosink name={RECEIVER_VIDEO_SINK_NAME} sync=false async=false"
+                ))
             }
         }
         Sink::D3d11 => require_element("d3d11videosink", d3d11_sink),
-        Sink::AutoVideo => Ok("autovideosink sync=false".to_string()),
+        Sink::AutoVideo => Ok(format!(
+            "autovideosink name={RECEIVER_VIDEO_SINK_NAME} sync=false async=false"
+        )),
     }
 }
 
@@ -1101,6 +1393,13 @@ fn element_adapter_luid(name: &str) -> Option<i64> {
         return None;
     }
     Some(element.property::<i64>("adapter-luid"))
+}
+
+fn element_has_property(name: &str, property: &str) -> bool {
+    gst::ElementFactory::make(name)
+        .build()
+        .ok()
+        .is_some_and(|element| element.find_property(property).is_some())
 }
 
 fn require_element<T>(name: &str, value: T) -> Result<T> {
@@ -1341,6 +1640,104 @@ mod tests {
         assert!(gpu_nv12 < download);
         assert!(download < system_nv12);
         assert!(!caps.contains("videoconvert"));
+    }
+
+    #[test]
+    fn receiver_gpu_profiles_follow_vendor_ids() {
+        let adapter = |vendor_id| crate::gpu::GpuAdapter {
+            index: 0,
+            luid: 1,
+            vendor_id,
+            description: "test".to_string(),
+        };
+
+        assert_eq!(
+            receiver_gpu_profile(Some(&adapter(0x10DE))),
+            ReceiverGpuProfile::Nvidia
+        );
+        assert_eq!(
+            receiver_gpu_profile(Some(&adapter(0x1002))),
+            ReceiverGpuProfile::Amd
+        );
+        assert_eq!(
+            receiver_gpu_profile(Some(&adapter(0x8086))),
+            ReceiverGpuProfile::Intel
+        );
+        assert_eq!(receiver_gpu_profile(None), ReceiverGpuProfile::Other);
+    }
+
+    #[test]
+    fn d3d11_receiver_decoder_requires_gpu_memory_caps() {
+        let decoder = ReceiverDecoder::new("d3d11h264dec", true);
+
+        assert!(decoder
+            .pipeline_element()
+            .contains("name=receiver_video_decoder"));
+        assert_eq!(
+            decoder.output_caps_for(true),
+            " ! video/x-raw(memory:D3D11Memory),format=NV12"
+        );
+        assert_eq!(decoder.memory_label_for(true), "D3D11Memory/NV12");
+        assert_eq!(decoder.output_caps_for(false), "");
+    }
+
+    #[test]
+    fn explicit_auto_video_sink_keeps_d3d11_memory_negotiated() {
+        let decoder = ReceiverDecoder::new("d3d11h264dec", true);
+
+        assert_eq!(decoder.output_caps_for(false), "");
+        assert_eq!(decoder.memory_label_for(false), "negotiated");
+    }
+
+    #[test]
+    fn software_or_vendor_fallback_decoder_leaves_memory_negotiated() {
+        let decoder = ReceiverDecoder::new("decodebin", false);
+
+        assert_eq!(decoder.output_caps_for(true), "");
+        assert_eq!(decoder.memory_label_for(true), "negotiated");
+    }
+
+    #[test]
+    fn cross_adapter_fallback_forces_system_memory() {
+        let decoder = ReceiverDecoder::new("decodebin", false).with_system_memory();
+
+        assert_eq!(decoder.output_caps_for(true), " ! video/x-raw");
+        assert_eq!(decoder.memory_label_for(true), "system-memory");
+    }
+
+    #[test]
+    fn vendor_base_decoder_is_safe_only_with_one_matching_vendor_adapter() {
+        let selected = crate::gpu::GpuAdapter {
+            index: 1,
+            luid: 2,
+            vendor_id: 0x10DE,
+            description: "selected".to_string(),
+        };
+        let intel = crate::gpu::GpuAdapter {
+            index: 0,
+            luid: 1,
+            vendor_id: 0x8086,
+            description: "integrated".to_string(),
+        };
+        let second_nvidia = crate::gpu::GpuAdapter {
+            index: 2,
+            luid: 3,
+            vendor_id: 0x10DE,
+            description: "second".to_string(),
+        };
+
+        assert!(selected_is_only_vendor_adapter(
+            &selected,
+            &[intel.clone(), selected.clone()]
+        ));
+        assert!(!selected_is_only_vendor_adapter(
+            &selected,
+            &[intel, selected.clone(), second_nvidia]
+        ));
+        assert!(!selected_is_only_adapter(
+            &selected,
+            &[selected.clone(), selected.clone()]
+        ));
     }
 
     #[test]

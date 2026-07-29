@@ -15,8 +15,6 @@ mod process;
 mod receiver_window;
 mod single_instance;
 mod tray_app;
-#[cfg(windows)]
-mod tray_menu_owner;
 mod updater;
 mod vdd;
 

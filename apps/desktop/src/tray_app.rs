@@ -122,9 +122,6 @@ struct TrayApp {
     update_status_tx: Sender<String>,
     update_status_rx: Receiver<String>,
     tray: Option<TrayIcon>,
-    menu: Option<Menu>,
-    #[cfg(windows)]
-    menu_owner: Option<crate::tray_menu_owner::TrayMenuOwner>,
     pending_tray_right_click: Option<Instant>,
     last_tray_menu_closed: Option<Instant>,
     items: Option<TrayItems>,
@@ -171,9 +168,6 @@ impl TrayApp {
             update_status_tx,
             update_status_rx,
             tray: None,
-            menu: None,
-            #[cfg(windows)]
-            menu_owner: None,
             pending_tray_right_click: None,
             last_tray_menu_closed: None,
             items: None,
@@ -255,6 +249,7 @@ impl TrayApp {
         menu.append(&quit)?;
 
         let tray_builder = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
             .with_tooltip(app_tooltip())
             .with_icon(app_icon()?)
             .with_menu_on_left_click(false);
@@ -267,17 +262,11 @@ impl TrayApp {
 
         #[cfg(not(windows))]
         let tray = tray_builder
-            .with_menu(Box::new(menu.clone()))
             .with_menu_on_right_click(true)
             .build()
             .context("failed to create tray icon")?;
 
         self.items = Some(items);
-        self.menu = Some(menu);
-        #[cfg(windows)]
-        {
-            self.menu_owner = Some(crate::tray_menu_owner::TrayMenuOwner::new()?);
-        }
         self.tray = Some(tray);
         self.sync_menu();
         crate::updater::start_background_update_checks(self.update_status_tx.clone());
@@ -384,8 +373,8 @@ impl TrayApp {
 
         crate::logging::append(format!("tray right click received: trigger={trigger}"));
         #[cfg(windows)]
-        if let (Some(menu), Some(owner)) = (self.menu.as_ref(), self.menu_owner.as_ref()) {
-            owner.show(menu);
+        if let Some(tray) = self.tray.as_ref() {
+            tray.show_menu();
             self.last_tray_menu_closed = Some(Instant::now());
         }
     }

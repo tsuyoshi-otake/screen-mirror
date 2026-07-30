@@ -232,6 +232,8 @@ impl SenderSupervisor {
                     }
                 }
 
+                crate::updater::set_stream_active(!active_video_pipelines.is_empty());
+
                 for _ in 0..50 {
                     match command_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(message) => {
@@ -250,6 +252,7 @@ impl SenderSupervisor {
                 }
             }
 
+            crate::updater::set_stream_active(false);
             if let Some(handle) = active_audio_pipeline {
                 let _ = handle.stop();
             }

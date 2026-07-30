@@ -993,7 +993,9 @@ impl TrayApp {
     }
 
     fn sync_menu(&self) {
-        crate::updater::set_session_active(self.active_mode != ActiveMode::Idle);
+        // A sender's own busy state comes from its supervisor, which knows whether any pipeline is
+        // actually running; the tray only knows which mode was selected.
+        crate::updater::set_session_active(self.active_mode == ActiveMode::Receiver);
         let Some(items) = self.items.as_ref() else {
             return;
         };

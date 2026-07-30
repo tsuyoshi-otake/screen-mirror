@@ -600,17 +600,38 @@ function Get-GpuAccelerationVerdict {
     } else {
         @()
     }
-    $routeLine = $logLines |
-        Where-Object { $_ -match "^sender encoder=\S+\s+frame-memory=\S+" } |
-        Select-Object -Last 1
+    # A capture-GPU mismatch belongs to one pipeline start, so it is only reported when it was
+    # logged for the newest route; an older mismatch would otherwise keep flagging a route that
+    # has since been fixed.
+    $routeIndex = -1
+    $previousRouteIndex = -1
+    $mismatchIndex = -1
+    for ($index = 0; $index -lt $logLines.Count; $index++) {
+        $line = $logLines[$index]
+        if ($line -match "^sender encoder=\S+\s+frame-memory=\S+") {
+            $previousRouteIndex = $routeIndex
+            $routeIndex = $index
+        } elseif ($line -match "^sender encoder=.*does not run on the capture GPU") {
+            $mismatchIndex = $index
+        }
+    }
+    $routeLine = if ($routeIndex -ge 0) { $logLines[$routeIndex] } else { $null }
+    $captureGpuMismatchLine = if ($mismatchIndex -gt $previousRouteIndex -and $mismatchIndex -ge 0) {
+        $logLines[$mismatchIndex]
+    } else {
+        $null
+    }
     $gpuLine = $logLines |
         Where-Object { $_ -match "^sender GPU selected:" } |
         Select-Object -Last 1
     $autoGpuLine = $logLines |
         Where-Object { $_ -match "^sender automatic GPU selected from the capture display:" } |
         Select-Object -Last 1
-    $captureGpuMismatchLine = $logLines |
-        Where-Object { $_ -match "^sender encoder=.*does not run on the capture GPU" } |
+    $pipelineFailureLine = $logLines |
+        Where-Object { $_ -match "^sender video pipeline stopped:" } |
+        Select-Object -Last 1
+    $droppedSettingsLine = $logLines |
+        Where-Object { $_ -match "^encoder \S+ does not expose " } |
         Select-Object -Last 1
     $routeMatch = [regex]::Match([string] $routeLine, "sender encoder=(\S+)\s+frame-memory=(\S+)")
     $encoder = if ($routeMatch.Success) { $routeMatch.Groups[1].Value } else { "UNKNOWN" }
@@ -676,6 +697,8 @@ function Get-GpuAccelerationVerdict {
             "UNKNOWN - no capture-GPU mismatch was recorded in the log tail"
         }
         LastSenderRoute = if ($routeLine) { $routeLine } else { "(not recorded)" }
+        LastPipelineFailure = if ($pipelineFailureLine) { $pipelineFailureLine } else { "(none in the log tail)" }
+        DroppedEncoderSettings = if ($droppedSettingsLine) { $droppedSettingsLine } else { "(none in the log tail)" }
         LatestFallbackReason = if ($fallbackLine) {
             $fallbackLine
         } elseif ($frameMemory -eq "system") {

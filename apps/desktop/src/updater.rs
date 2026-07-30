@@ -21,14 +21,22 @@ const MSI_HEADER: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 static START: Once = Once::new();
 static UPDATE_STARTED: AtomicBool = AtomicBool::new(false);
 static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Installing restarts the app, so the background check only does it while nothing is streaming.
 pub fn set_session_active(active: bool) {
     SESSION_ACTIVE.store(active, Ordering::SeqCst);
 }
 
+/// Sender mode alone is not a session: a sender with no receiver in range waits indefinitely, and
+/// treating that as busy would mean an unattended sender never updates itself. The supervisor
+/// reports whether it currently has live pipelines instead.
+pub fn set_stream_active(active: bool) {
+    STREAM_ACTIVE.store(active, Ordering::SeqCst);
+}
+
 fn session_active() -> bool {
-    SESSION_ACTIVE.load(Ordering::SeqCst)
+    SESSION_ACTIVE.load(Ordering::SeqCst) || STREAM_ACTIVE.load(Ordering::SeqCst)
 }
 
 #[derive(Debug)]

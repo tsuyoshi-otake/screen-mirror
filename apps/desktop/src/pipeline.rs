@@ -1159,41 +1159,108 @@ impl SelectedEncoder {
 
     fn chain(&self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {
         let element = &self.element;
-        match self.family {
-            EncoderFamily::Nvidia => nvidia_encoder_chain(element, bitrate, fps, nvidia_tuning),
-            EncoderFamily::Amf => format!(
-                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} usage=ultra-low-latency preset=speed rate-control=cbr aud=false \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
-            ),
-            EncoderFamily::MediaFoundation => format!(
-                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} max-bitrate={bitrate} gop-size={fps} bframes=0 low-latency=true rc-mode=cbr quality-vs-speed=0 \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
-            ),
-            EncoderFamily::QuickSync => format!(
-                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} gop-size={fps} b-frames=0 rc-lookahead=0 rate-control=cbr \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
-            ),
-            EncoderFamily::X264 => format!(
-                "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} speed-preset=ultrafast tune=zerolatency key-int-max={fps} bframes=0 sliced-threads=true byte-stream=true \
-                 ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
-            ),
-        }
+        let properties = match self.family {
+            EncoderFamily::Nvidia => nvidia_encoder_properties(bitrate, fps, nvidia_tuning),
+            EncoderFamily::Amf => vec![
+                format!("bitrate={bitrate}"),
+                format!("max-bitrate={bitrate}"),
+                format!("gop-size={fps}"),
+                "usage=ultra-low-latency".to_string(),
+                "preset=speed".to_string(),
+                "rate-control=cbr".to_string(),
+                "aud=false".to_string(),
+            ],
+            EncoderFamily::MediaFoundation => vec![
+                format!("bitrate={bitrate}"),
+                format!("max-bitrate={bitrate}"),
+                format!("gop-size={fps}"),
+                "bframes=0".to_string(),
+                "low-latency=true".to_string(),
+                "rc-mode=cbr".to_string(),
+                "quality-vs-speed=0".to_string(),
+            ],
+            EncoderFamily::QuickSync => vec![
+                format!("bitrate={bitrate}"),
+                format!("gop-size={fps}"),
+                "b-frames=0".to_string(),
+                "rc-lookahead=0".to_string(),
+                "rate-control=cbr".to_string(),
+            ],
+            EncoderFamily::X264 => vec![
+                format!("bitrate={bitrate}"),
+                "speed-preset=ultrafast".to_string(),
+                "tune=zerolatency".to_string(),
+                format!("key-int-max={fps}"),
+                "bframes=0".to_string(),
+                "sliced-threads=true".to_string(),
+                "byte-stream=true".to_string(),
+            ],
+        };
+        let properties = supported_properties(element, &properties);
+
+        format!(
+            "{element} name={SENDER_VIDEO_ENCODER_NAME}{properties} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
+        )
     }
 }
 
-fn nvidia_encoder_chain(element: &str, bitrate: u32, fps: u32, tuning: NvidiaTuning) -> String {
+/// Keeps only the tuning knobs the element actually exposes, prefixed with a space each.
+///
+/// Media Foundation registers per-MFT property sets, so `mfh264enc` on one machine has `bframes`
+/// and on the next it does not; naming a property the element lacks fails the whole pipeline parse
+/// and leaves the sender with no stream at all. A missing knob costs some latency tuning, which is
+/// a far better outcome, so it is dropped with a log line instead.
+fn supported_properties(element: &str, properties: &[String]) -> String {
+    let mut kept = String::new();
+    let mut dropped = Vec::new();
+    // An element that cannot be created at all tells us nothing about its properties, so the
+    // settings are kept as written and the pipeline reports the missing element itself.
+    let instance = gst::ElementFactory::make(element).build().ok();
+    for property in properties {
+        let name = property.split('=').next().unwrap_or_default();
+        let supported = instance
+            .as_ref()
+            .is_none_or(|instance| instance.find_property(name).is_some());
+        if supported {
+            kept.push(' ');
+            kept.push_str(property);
+        } else {
+            dropped.push(name.to_string());
+        }
+    }
+    if !dropped.is_empty() {
+        crate::logging::append(format!(
+            "encoder {element} does not expose {}; those settings were dropped",
+            dropped.join(", ")
+        ));
+    }
+    kept
+}
+
+fn nvidia_encoder_properties(bitrate: u32, fps: u32, tuning: NvidiaTuning) -> Vec<String> {
     let tuning = resolve_nvidia_tuning(tuning);
     let vbv_buffer_size = (bitrate / fps.max(1)).max(128);
-    let extra = match tuning {
-        NvidiaTuning::Rtx => " spatial-aq=true temporal-aq=true aq-strength=8",
-        NvidiaTuning::Gtx | NvidiaTuning::LowLatency | NvidiaTuning::Auto => "",
-    };
-
-    format!(
-        "{element} name={SENDER_VIDEO_ENCODER_NAME} bitrate={bitrate} max-bitrate={bitrate} vbv-buffer-size={vbv_buffer_size} \
-         gop-size={fps} bframes=0 rc-lookahead=0 zerolatency=true strict-gop=true aud=false repeat-sequence-header=true{extra} \
-         ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
-    )
+    let mut properties = vec![
+        format!("bitrate={bitrate}"),
+        format!("max-bitrate={bitrate}"),
+        format!("vbv-buffer-size={vbv_buffer_size}"),
+        format!("gop-size={fps}"),
+        "bframes=0".to_string(),
+        "rc-lookahead=0".to_string(),
+        "zerolatency=true".to_string(),
+        "strict-gop=true".to_string(),
+        "aud=false".to_string(),
+        "repeat-sequence-header=true".to_string(),
+    ];
+    if tuning == NvidiaTuning::Rtx {
+        properties.extend([
+            "spatial-aq=true".to_string(),
+            "temporal-aq=true".to_string(),
+            "aq-strength=8".to_string(),
+        ]);
+    }
+    properties
 }
 
 fn resolve_nvidia_tuning(tuning: NvidiaTuning) -> NvidiaTuning {
@@ -1740,8 +1807,12 @@ fn family_elements(
     factory_type: gst::ElementFactoryType,
     predicate: impl Fn(&str) -> bool,
 ) -> Vec<String> {
+    // Rank is an autoplugging hint, and hardware encoders are commonly registered below MARGINAL
+    // so decodebin does not pick them on its own: NVENC's D3D11 elements are rank NONE. The
+    // predicate already names the family we want, so every rank has to be enumerated or a present
+    // encoder looks missing and the sender silently drops to a weaker family.
     let mut names: Vec<String> =
-        gst::ElementFactory::factories_with_type(factory_type, gst::Rank::MARGINAL)
+        gst::ElementFactory::factories_with_type(factory_type, gst::Rank::NONE)
             .iter()
             .map(|factory| factory.name().to_string())
             .filter(|name| predicate(name))
@@ -2311,6 +2382,7 @@ mod tests {
 
     #[test]
     fn encoder_speed_profiles_are_used_for_live_streaming() {
+        gst::init().expect("GStreamer initialization");
         let amf = SelectedEncoder {
             family: EncoderFamily::Amf,
             element: "amfh264enc".to_string(),
@@ -2332,6 +2404,7 @@ mod tests {
 
     #[test]
     fn every_encoder_chain_exposes_the_force_key_unit_target() {
+        gst::init().expect("GStreamer initialization");
         for family in [
             EncoderFamily::Nvidia,
             EncoderFamily::Amf,
@@ -2350,6 +2423,30 @@ mod tests {
                 chain.contains(&format!("name={SENDER_VIDEO_ENCODER_NAME}")),
                 "{family:?} chain did not name its encoder: {chain}"
             );
+        }
+    }
+
+    #[test]
+    fn every_installed_encoder_chain_parses_on_this_machine() {
+        gst::init().expect("GStreamer initialization");
+        for family in [
+            EncoderFamily::Nvidia,
+            EncoderFamily::Amf,
+            EncoderFamily::MediaFoundation,
+            EncoderFamily::QuickSync,
+            EncoderFamily::X264,
+        ] {
+            let Some(encoder) = encoder_on_gpu(family, None) else {
+                continue;
+            };
+            let chain = encoder.chain(8_000, 30, NvidiaTuning::Auto);
+            // Only the element and its properties: the caps filter that follows uses commas, which
+            // `bin.( ... )` reads as its own property separators.
+            let element = chain.split(" ! ").next().expect("encoder element");
+
+            if let Err(error) = gst::parse::bin_from_description(element, true) {
+                panic!("{family:?} encoder does not accept its settings: {element}\n{error}");
+            }
         }
     }
 
@@ -2553,5 +2650,33 @@ mod tests {
         let caps = video_caps(30, None, None, true);
         assert!(!caps.contains("width="));
         assert!(!caps.contains("height="));
+    }
+}
+
+#[cfg(test)]
+mod scratch_probe {
+    use super::*;
+
+    #[test]
+    fn scratch_report_element_creation() {
+        gst::init().unwrap();
+        for name in [
+            "qsvh264enc",
+            "amfh264enc",
+            "nvd3d11h264enc",
+            "mfh264enc",
+            "x264enc",
+        ] {
+            let found = gst::ElementFactory::find(name).is_some();
+            let built = gst::ElementFactory::make(name).build();
+            let has_bitrate = built
+                .as_ref()
+                .ok()
+                .map(|element| element.find_property("bitrate").is_some());
+            println!(
+                "{name}: find={found} built={:?} bitrate={has_bitrate:?}",
+                built.as_ref().map(|_| ()).map_err(|e| e.to_string())
+            );
+        }
     }
 }

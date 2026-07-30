@@ -606,6 +606,8 @@ function Get-GpuAccelerationVerdict {
     $routeIndex = -1
     $previousRouteIndex = -1
     $mismatchIndex = -1
+    $failureIndex = -1
+    $droppedIndex = -1
     for ($index = 0; $index -lt $logLines.Count; $index++) {
         $line = $logLines[$index]
         if ($line -match "^sender encoder=\S+\s+frame-memory=\S+") {
@@ -613,6 +615,10 @@ function Get-GpuAccelerationVerdict {
             $routeIndex = $index
         } elseif ($line -match "^sender encoder=.*does not run on the capture GPU") {
             $mismatchIndex = $index
+        } elseif ($line -match "^sender video pipeline stopped:") {
+            $failureIndex = $index
+        } elseif ($line -match "^encoder \S+ does not expose ") {
+            $droppedIndex = $index
         }
     }
     $routeLine = if ($routeIndex -ge 0) { $logLines[$routeIndex] } else { $null }
@@ -627,12 +633,15 @@ function Get-GpuAccelerationVerdict {
     $autoGpuLine = $logLines |
         Where-Object { $_ -match "^sender automatic GPU selected from the capture display:" } |
         Select-Object -Last 1
-    $pipelineFailureLine = $logLines |
-        Where-Object { $_ -match "^sender video pipeline stopped:" } |
-        Select-Object -Last 1
-    $droppedSettingsLine = $logLines |
-        Where-Object { $_ -match "^encoder \S+ does not expose " } |
-        Select-Object -Last 1
+    # A pipeline failure and any dropped encoder settings belong to the route that logged them, so
+    # both are reported only while the newest route is still the one that failed. An update or a
+    # config change that fixed the route otherwise keeps showing its last failure forever.
+    $pipelineFailureLine = if ($failureIndex -gt $routeIndex) { $logLines[$failureIndex] } else { $null }
+    $droppedSettingsLine = if ($droppedIndex -gt $previousRouteIndex -and $droppedIndex -ge 0) {
+        $logLines[$droppedIndex]
+    } else {
+        $null
+    }
     $routeMatch = [regex]::Match([string] $routeLine, "sender encoder=(\S+)\s+frame-memory=(\S+)")
     $encoder = if ($routeMatch.Success) { $routeMatch.Groups[1].Value } else { "UNKNOWN" }
     $frameMemory = if ($routeMatch.Success) { $routeMatch.Groups[2].Value } else { "UNKNOWN" }

@@ -12,6 +12,8 @@ use crate::pipeline::{self, PipelineHandle, SendArgs};
 
 const AUTO_HOST: &str = "auto";
 const RECEIVER_LOSS_GRACE: Duration = Duration::from_secs(75);
+/// Consecutive failed sender starts before the tray stops claiming the session is fine.
+const PREPARE_FAILURES_BEFORE_ALERT: u32 = 3;
 
 pub struct Announcer {
     stop: Sender<()>,
@@ -59,11 +61,12 @@ impl SenderPreparationState {
 }
 
 impl SenderSupervisor {
-    pub fn start(args: SendArgs) -> Self {
+    pub fn start(args: SendArgs, status: Sender<String>) -> Self {
         let (command, command_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
             log_sender("sender supervisor started; waiting for matching receivers");
             let mut args = args;
+            let mut failed_starts = 0_u32;
             let mut active_hosts = String::new();
             let mut active_receiver_key = String::new();
             let mut active_video_pipelines: Vec<PipelineHandle> = Vec::new();
@@ -149,6 +152,7 @@ impl SenderSupervisor {
 
                             match start_result {
                                 Ok(pipelines) => {
+                                    failed_starts = 0;
                                     log_sender(format!(
                                         "sender targets updated: {} ({} display stream(s))",
                                         resolved.args.host,
@@ -168,9 +172,20 @@ impl SenderSupervisor {
                                     // Preparation is committed only for a complete receiver route.
                                     // Any count, mode or pipeline build failure must retry it.
                                     preparation.reset();
+                                    failed_starts += 1;
                                     log_sender(format!(
-                                        "sender environment not ready; transmission deferred and will retry: {error:#}"
+                                        "sender environment not ready; transmission deferred and will retry ({failed_starts}): {error:#}"
                                     ));
+                                    // Retrying forever behind a "sending" tray label looks
+                                    // identical to a working session, so escalate once the
+                                    // environment has clearly not recovered on its own.
+                                    if failed_starts == PREPARE_FAILURES_BEFORE_ALERT {
+                                        crate::monitors::log_monitor_inventory(
+                                            "sender environment still not ready",
+                                        );
+                                        let _ = status
+                                            .send(format!("Error: sender cannot start: {error:#}"));
+                                    }
                                 }
                             }
                         } else {
@@ -430,7 +445,12 @@ impl Drop for Announcer {
     }
 }
 
-pub fn resolve_sender_args(args: SendArgs) -> Result<SendArgs> {
+/// Resolves the single-pipeline (CLI and manual-host) path, returning the capture target the
+/// caller must use. Handing the assignment back keeps that path from re-running the whole
+/// virtual-display setup a second time inside the pipeline builder.
+pub fn resolve_sender_args(
+    args: SendArgs,
+) -> Result<(SendArgs, Option<crate::monitors::DisplayMonitor>)> {
     let mut resolved = discover_sender_args(args)?;
     (resolved.args.width, resolved.args.height) = effective_video_size(
         resolved.args.width,
@@ -440,8 +460,8 @@ pub fn resolve_sender_args(args: SendArgs) -> Result<SendArgs> {
     prepare_sender_environment(&resolved)?;
     // The direct CLI/manual-host path builds its pipeline outside SenderSupervisor, so perform
     // the same exact-count and per-receiver mode checks before returning control to the caller.
-    assign_receiver_displays(&resolved)?;
-    Ok(resolved.args)
+    let target = assign_receiver_displays(&resolved)?.into_iter().next();
+    Ok((resolved.args, target.flatten()))
 }
 
 fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
@@ -473,9 +493,16 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         ));
     }
 
+    // The bundled driver tops out at MAX_BUNDLED_VIRTUAL_DISPLAYS monitors, and every receiver
+    // needs its own. Taking more receivers than that would fail the exact-count check forever.
+    let receiver_limit = if args.enable_virtual_display {
+        (args.max_receivers as usize).min(crate::monitors::MAX_BUNDLED_VIRTUAL_DISPLAYS)
+    } else {
+        args.max_receivers as usize
+    };
     let selected: Vec<ReceiverTarget> = receivers
         .into_iter()
-        .take(args.max_receivers as usize)
+        .take(receiver_limit)
         .map(|peer| ReceiverTarget {
             host: format!("{}:{}", peer.address, peer.announcement.stream_port),
             display: peer.announcement.display.clone(),
@@ -564,13 +591,7 @@ fn assign_receiver_displays(
     let mut assignments = Vec::with_capacity(receivers.len());
     for (receiver, target) in receivers.iter().zip(targets) {
         if resolved.args.sync_virtual_display_resolution {
-            crate::monitors::sync_virtual_display_mode(&target, receiver.display.as_ref())
-                .with_context(|| {
-                    format!(
-                        "failed to sync virtual display for receiver {}",
-                        receiver.host
-                    )
-                })?;
+            crate::monitors::sync_virtual_display_mode(&target, receiver.display.as_ref());
         }
         log_sender(format!(
             "receiver {} captures {}",

@@ -117,9 +117,9 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Tray) {
         Command::Tray => tray_app::run(),
         Command::Send(args) => {
-            let args = lan::resolve_sender_args(args)?;
+            let (args, capture_target) = lan::resolve_sender_args(args)?;
             let _control = control::ControlServer::start(&args.pin)?;
-            let pipeline = pipeline::build_sender_pipeline(&args)?;
+            let pipeline = pipeline::build_sender_pipeline_for(&args, capture_target.as_ref())?;
             eprintln!("pipeline: {pipeline}");
             run_pipeline(&pipeline)
         }

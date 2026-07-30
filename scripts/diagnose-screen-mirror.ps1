@@ -174,7 +174,10 @@ function Get-SenderVirtualDisplayVerdict {
         @{ Name = "sender blocked physical-display fallback because its VDD target was missing"; Pattern = 'refusing physical-display fallback|no capture-ready virtual target was found' },
         @{ Name = "VDD capture-target count did not match the receiver count"; Pattern = 'requested \d+ virtual displays but (?:only )?\d+ are capture-ready' },
         @{ Name = "receiver mode sync failed"; Pattern = 'virtual display (?:resolution )?sync .*failed:|failed to sync virtual display|did not apply .* within \d+ms' },
-        @{ Name = "receiver mode is unsupported by the VDD"; Pattern = 'virtual display .* does not support .*(?:keeping current mode|DISP_CHANGE_BADMODE)' }
+        @{ Name = "receiver mode is unsupported by the VDD"; Pattern = 'virtual display .* does not support .*(?:keeping current mode|DISP_CHANGE_BADMODE)|virtual display .* kept its current mode:' },
+        @{ Name = "a detached VDD endpoint could not be attached to the desktop"; Pattern = 'bundled VDD .* attach failed:|bundled VDD attach commit failed:' },
+        @{ Name = "VDD stayed detached after both extend and direct attach"; Pattern = 'bundled VDD is still not capture-ready' },
+        @{ Name = "sender start failed repeatedly and was reported to the tray"; Pattern = 'sender environment still not ready' }
     )
     $recentIssues = New-Object System.Collections.Generic.List[string]
     foreach ($issue in $issuePatterns) {
@@ -208,6 +211,17 @@ function Get-SenderVirtualDisplayVerdict {
     })
     $vddDevices = @(Get-BundledVddDevices)
     $vddMonitors = @(Get-BundledVddMonitors)
+    # A bundled endpoint Windows left off the desktop is the state direct attach exists to repair,
+    # so report it separately from "no endpoint at all".
+    $detachedLines = @($bundledLines | Where-Object { $_ -match 'attached=false' -or $_ -match '\sdetached(?:\s|$)' })
+    $attachLine = $senderLogLines |
+        Where-Object { $_ -match '^bundled VDD .* (?:attached at x=|attach failed:|attach skipped:)' } |
+        Select-Object -Last 1
+    $prepareFailures = @($senderLogLines |
+        Where-Object { $_ -match '^sender environment not ready;' }).Count
+    $lastPrepareFailure = $senderLogLines |
+        Where-Object { $_ -match '^sender environment not ready;' } |
+        Select-Object -Last 1
 
     $verdict = if (-not $vddEnabled) {
         "NOT CONFIGURED - sender virtual-display setup is disabled."
@@ -215,6 +229,8 @@ function Get-SenderVirtualDisplayVerdict {
         "FAIL - configured sender VDD fallback or readiness issue was recorded in the recent log."
     } elseif (-not $monitorQueryAvailable) {
         "UNKNOWN - current VDD capture targets could not be queried."
+    } elseif ($captureReadyLines.Count -eq 0 -and $detachedLines.Count -gt 0) {
+        "FAIL - a bundled virtual display exists but is detached from the desktop; the next sender start attaches it directly, and Win+P Extend does the same by hand."
     } elseif ($captureReadyLines.Count -eq 0) {
         "FAIL - sender VDD is configured, but no bundled virtual display is currently capture-ready."
     } else {
@@ -230,6 +246,10 @@ function Get-SenderVirtualDisplayVerdict {
         CurrentCaptureReadyTargets = if ($monitorQueryAvailable) { $captureReadyLines.Count } else { "UNKNOWN" }
         BundledVddDeviceNodes = $vddDevices.Count
         BundledVddMonitorNodes = $vddMonitors.Count
+        DetachedBundledVddTargets = if ($monitorQueryAvailable) { $detachedLines.Count } else { "UNKNOWN" }
+        LastDesktopAttachAttempt = if ($attachLine) { $attachLine } else { "(none in latest sender session)" }
+        SenderStartFailures = $prepareFailures
+        LastSenderStartFailure = if ($lastPrepareFailure) { $lastPrepareFailure } else { "(none in latest sender session)" }
         LastSenderCaptureSource = if ($lastSenderSource) { $lastSenderSource } else { "(not recorded)" }
         RecentVddWarnings = if ($recentIssues.Count -gt 0) { $recentIssues -join "; " } else { "(none in latest sender session / last 1000 log lines)" }
     }
@@ -586,6 +606,12 @@ function Get-GpuAccelerationVerdict {
     $gpuLine = $logLines |
         Where-Object { $_ -match "^sender GPU selected:" } |
         Select-Object -Last 1
+    $autoGpuLine = $logLines |
+        Where-Object { $_ -match "^sender automatic GPU selected from the capture display:" } |
+        Select-Object -Last 1
+    $captureGpuMismatchLine = $logLines |
+        Where-Object { $_ -match "^sender encoder=.*does not run on the capture GPU" } |
+        Select-Object -Last 1
     $routeMatch = [regex]::Match([string] $routeLine, "sender encoder=(\S+)\s+frame-memory=(\S+)")
     $encoder = if ($routeMatch.Success) { $routeMatch.Groups[1].Value } else { "UNKNOWN" }
     $frameMemory = if ($routeMatch.Success) { $routeMatch.Groups[2].Value } else { "UNKNOWN" }
@@ -641,6 +667,14 @@ function Get-GpuAccelerationVerdict {
         D3D11ZeroCopy = $zeroCopyStatus
         VideoEncodeEngine = $videoEncodeStatus
         LastSenderGpu = if ($gpuLine) { $gpuLine } else { "(not recorded; auto selection may be in use)" }
+        AutomaticGpuFromCaptureDisplay = if ($autoGpuLine) { $autoGpuLine } else { "(not recorded; an explicit gpu= may be configured)" }
+        EncoderOnCaptureGpu = if ($captureGpuMismatchLine) {
+            "MISMATCH - $captureGpuMismatchLine"
+        } elseif ($frameMemory -eq "D3D11") {
+            "OK - encoder and capture share one adapter"
+        } else {
+            "UNKNOWN - no capture-GPU mismatch was recorded in the log tail"
+        }
         LastSenderRoute = if ($routeLine) { $routeLine } else { "(not recorded)" }
         LatestFallbackReason = if ($fallbackLine) {
             $fallbackLine
@@ -1056,6 +1090,21 @@ if (Test-Path -LiteralPath $logPath) {
 }
 
 Add-CommandOutput "Update State" {
+    # Background checks only install while the app is idle, so a machine that streams around the
+    # clock can sit on an old build. Show what the updater actually decided.
+    $updaterLines = if (Test-Path -LiteralPath $logPath) {
+        @(Get-Content -LiteralPath $logPath -Tail 2000 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^(?:background|manual) update' })
+    } else {
+        @()
+    }
+    "---- updater log ----"
+    if ($updaterLines.Count -eq 0) {
+        "No update check has been recorded in the log tail."
+    } else {
+        $updaterLines | Select-Object -Last 10
+    }
+
     if (-not (Test-Path -LiteralPath $updatesPath)) {
         "Update directory not found."
         return

@@ -22,6 +22,7 @@ const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
 const ID_RUN_PEER_DIAGNOSTICS: &str = "run-peer-diagnostics";
 const ID_INSTALL_VDD: &str = "install-vdd";
 const ID_LIST_VDD: &str = "list-vdd";
+const ID_ATTACH_VDD: &str = "attach-vdd";
 const ID_ENABLE_VDD: &str = "enable-vdd";
 const ID_DISABLE_VDD: &str = "disable-vdd";
 const ID_REMOVE_VDD: &str = "remove-vdd";
@@ -101,7 +102,7 @@ pub fn run() -> Result<()> {
         }
 
         app.poll_tray_menu_fallback();
-        app.poll_update_status();
+        app.poll_status_messages();
         app.reap_finished_pipeline();
         app.reap_finished_audio_pipeline();
     });
@@ -119,8 +120,8 @@ struct TrayApp {
     announcer: Option<crate::lan::Announcer>,
     sleep_guard: Option<crate::power::SleepGuard>,
     render_window: Option<crate::receiver_window::RenderWindowGuard>,
-    update_status_tx: Sender<String>,
-    update_status_rx: Receiver<String>,
+    status_tx: Sender<String>,
+    status_rx: Receiver<String>,
     tray: Option<TrayIcon>,
     pending_tray_right_click: Option<Instant>,
     last_tray_menu_closed: Option<Instant>,
@@ -151,7 +152,7 @@ impl TrayApp {
         if let Ok(enabled) = autostart::is_enabled() {
             config.autostart = enabled;
         }
-        let (update_status_tx, update_status_rx) = mpsc::channel();
+        let (status_tx, status_rx) = mpsc::channel();
 
         Ok(Self {
             config,
@@ -165,8 +166,8 @@ impl TrayApp {
             announcer: None,
             sleep_guard: None,
             render_window: None,
-            update_status_tx,
-            update_status_rx,
+            status_tx,
+            status_rx,
             tray: None,
             pending_tray_right_click: None,
             last_tray_menu_closed: None,
@@ -197,6 +198,12 @@ impl TrayApp {
             None,
         );
         let list_vdd = MenuItem::with_id(ID_LIST_VDD, "Show Virtual Display Status", true, None);
+        let attach_vdd = MenuItem::with_id(
+            ID_ATTACH_VDD,
+            "Attach Virtual Displays to Desktop",
+            true,
+            None,
+        );
         let enable_vdd =
             MenuItem::with_id(ID_ENABLE_VDD, "Enable Virtual Display Driver", true, None);
         let disable_vdd =
@@ -238,6 +245,7 @@ impl TrayApp {
         menu.append(&sep3)?;
         menu.append(&install_vdd)?;
         menu.append(&list_vdd)?;
+        menu.append(&attach_vdd)?;
         menu.append(&enable_vdd)?;
         menu.append(&disable_vdd)?;
         menu.append(&remove_vdd)?;
@@ -269,7 +277,7 @@ impl TrayApp {
         self.items = Some(items);
         self.tray = Some(tray);
         self.sync_menu();
-        crate::updater::start_background_update_checks(self.update_status_tx.clone());
+        crate::updater::start_background_update_checks(self.status_tx.clone());
         self.restart_diagnostics_server();
 
         if let Err(error) = autostart::set_enabled(self.config.autostart) {
@@ -311,6 +319,7 @@ impl TrayApp {
             ID_RUN_PEER_DIAGNOSTICS => self.run_peer_diagnostics(),
             ID_INSTALL_VDD => self.run_vdd_action(crate::vdd::VddAction::Install),
             ID_LIST_VDD => self.open_vdd_status(),
+            ID_ATTACH_VDD => self.attach_virtual_displays(),
             ID_ENABLE_VDD => self.run_vdd_action(crate::vdd::VddAction::Enable),
             ID_DISABLE_VDD => self.run_vdd_action(crate::vdd::VddAction::Disable),
             ID_REMOVE_VDD => self.run_vdd_action(crate::vdd::VddAction::Remove),
@@ -411,7 +420,10 @@ impl TrayApp {
         }
 
         if crate::lan::wants_auto_host(&args.host) {
-            self.sender_supervisor = Some(crate::lan::SenderSupervisor::start(args));
+            self.sender_supervisor = Some(crate::lan::SenderSupervisor::start(
+                args,
+                self.status_tx.clone(),
+            ));
             self.active_mode = ActiveMode::Sender;
             self.config.startup_mode = StartupMode::Sender;
             self.save_config();
@@ -419,20 +431,21 @@ impl TrayApp {
             return;
         }
 
-        let args = match crate::lan::resolve_sender_args(args) {
-            Ok(args) => args,
+        let (args, capture_target) = match crate::lan::resolve_sender_args(args) {
+            Ok(resolved) => resolved,
             Err(error) => {
                 self.set_error(format!("Receiver discovery failed: {error:#}"));
                 return;
             }
         };
-        let video_description = match pipeline::build_sender_video_pipeline(&args) {
-            Ok(description) => description,
-            Err(error) => {
-                self.set_error(format!("Sender start failed: {error:#}"));
-                return;
-            }
-        };
+        let video_description =
+            match pipeline::build_sender_video_pipeline_for(&args, capture_target.as_ref()) {
+                Ok(description) => description,
+                Err(error) => {
+                    self.set_error(format!("Sender start failed: {error:#}"));
+                    return;
+                }
+            };
         let audio_description = if args.audio_enabled {
             match pipeline::build_sender_audio_pipeline(&args) {
                 Ok(description) => Some(description),
@@ -766,7 +779,7 @@ impl TrayApp {
     }
 
     fn check_for_updates(&self) {
-        crate::updater::start_manual_update_check(self.update_status_tx.clone());
+        crate::updater::start_manual_update_check(self.status_tx.clone());
         if let Some(items) = self.items.as_ref() {
             items.status.set_text("Status: update check started");
         }
@@ -858,6 +871,21 @@ impl TrayApp {
         }
     }
 
+    /// Manual counterpart to the attach the sender performs on start, for repairing a detached
+    /// virtual display without waiting for the next session.
+    fn attach_virtual_displays(&self) {
+        if crate::monitors::attach_detached_bundled_virtual_displays() {
+            let ready = crate::monitors::bundled_virtual_capture_targets().len();
+            if let Some(items) = self.items.as_ref() {
+                items
+                    .status
+                    .set_text(format!("Status: {ready} virtual display(s) capture-ready"));
+            }
+        } else {
+            self.set_error("No detached virtual display could be attached".to_string());
+        }
+    }
+
     /// Writes the same display report the old PowerShell status action produced, then shows it.
     fn open_vdd_status(&self) {
         let mut report = vec![
@@ -879,6 +907,25 @@ impl TrayApp {
         ));
         for target in &targets {
             report.push(format!("  {}", target.adapter_name));
+        }
+
+        let detached: Vec<&crate::monitors::DisplayMonitor> = monitors
+            .iter()
+            .filter(|monitor| monitor.bundled_virtual_display && !monitor.attached)
+            .collect();
+        report.push(format!(
+            "Bundled virtual displays detached from the desktop: {}",
+            detached.len()
+        ));
+        for monitor in &detached {
+            report.push(format!("  {}", monitor.adapter_name));
+        }
+        if !detached.is_empty() {
+            report.push(String::new());
+            report.push(
+                "A detached virtual display cannot be captured. Use \"Attach Virtual Displays to Desktop\", or extend the desktop with Win+P."
+                    .to_string(),
+            );
         }
 
         let path = std::env::temp_dir().join("ScreenMirror-vdd-status.txt");
@@ -946,6 +993,7 @@ impl TrayApp {
     }
 
     fn sync_menu(&self) {
+        crate::updater::set_session_active(self.active_mode != ActiveMode::Idle);
         let Some(items) = self.items.as_ref() else {
             return;
         };
@@ -1002,11 +1050,11 @@ impl TrayApp {
         });
     }
 
-    fn poll_update_status(&self) {
+    fn poll_status_messages(&self) {
         let Some(items) = self.items.as_ref() else {
             return;
         };
-        while let Ok(message) = self.update_status_rx.try_recv() {
+        while let Ok(message) = self.status_rx.try_recv() {
             items.status.set_text(message);
         }
     }

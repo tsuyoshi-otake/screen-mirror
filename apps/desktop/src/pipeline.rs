@@ -413,16 +413,19 @@ pub fn spawn_receiver_pipeline(plan: ReceiverPipelinePlan) -> PipelineHandle {
 }
 
 pub fn build_sender_pipeline(args: &SendArgs) -> Result<String> {
-    let video = build_sender_video_pipeline(args)?;
+    build_sender_pipeline_for(args, None)
+}
+
+pub fn build_sender_pipeline_for(
+    args: &SendArgs,
+    target: Option<&crate::monitors::DisplayMonitor>,
+) -> Result<String> {
+    let video = build_sender_video_pipeline_for(args, target)?;
     if !args.audio_enabled {
         return Ok(video);
     }
 
     Ok(format!("{video} {}", build_sender_audio_pipeline(args)?))
-}
-
-pub fn build_sender_video_pipeline(args: &SendArgs) -> Result<String> {
-    build_sender_video_pipeline_for(args, None)
 }
 
 /// Same pipeline, but pinned to one capture target so each receiver can get its own display.
@@ -446,11 +449,6 @@ pub fn build_sender_video_pipeline_for(
         ));
     }
 
-    let gpu = crate::gpu::resolve(&args.gpu);
-    if let Some(gpu) = gpu.as_ref() {
-        crate::logging::append(format!("sender GPU selected: {}", gpu.summary()));
-    }
-    let encoder = select_encoder(args.encoder, args.allow_software_encoder, gpu.as_ref())?;
     let clients = multi_udp_clients(&args.host, args.port)?;
     let show_cursor = if args.no_cursor { "false" } else { "true" };
     let mut capture_target: Option<crate::monitors::DisplayMonitor> = target.cloned();
@@ -507,13 +505,18 @@ pub fn build_sender_video_pipeline_for(
         )
     };
     crate::logging::append(format!("sender pipeline source: {source}"));
+    let capture_adapter = capture_adapter(capture_target.as_ref(), args.monitor_index);
+    let gpu = sender_gpu(&args.gpu, capture_adapter.as_ref());
+    if let Some(gpu) = gpu.as_ref() {
+        crate::logging::append(format!("sender GPU selected: {}", gpu.summary()));
+    }
+    let encoder = select_encoder(args.encoder, args.allow_software_encoder, gpu.as_ref())?;
     let encoder_accepts_d3d11 = encoder.supports_d3d11_input();
     // Frames captured on one GPU cannot stay in D3D11 memory while another GPU encodes them, so
     // that combination goes through system memory and lets the encoder upload on its own device.
     let same_gpu_as_capture = match encoder.adapter_luid {
         Some(encoder_luid) => {
-            capture_adapter(capture_target.as_ref(), args.monitor_index).map(|adapter| adapter.luid)
-                == Some(encoder_luid)
+            capture_adapter.as_ref().map(|adapter| adapter.luid) == Some(encoder_luid)
         }
         None => true,
     };
@@ -596,6 +599,27 @@ fn capture_source_for_target(
 
 /// The GPU DXGI desktop duplication captures on, which is always the GPU that drives the captured
 /// monitor. `None` when the capture target cannot be tied to a monitor.
+/// Resolves the GPU the sender encodes on. `auto` follows the adapter that owns the capture target
+/// so a multi-GPU machine does not encode on an adapter the frames never touch, which would force
+/// every frame through system memory.
+fn sender_gpu(
+    selection: &str,
+    capture_adapter: Option<&crate::gpu::GpuAdapter>,
+) -> Option<crate::gpu::GpuAdapter> {
+    match crate::gpu::resolve(selection) {
+        Some(gpu) => Some(gpu),
+        None => {
+            if let Some(adapter) = capture_adapter {
+                crate::logging::append(format!(
+                    "sender automatic GPU selected from the capture display: {}",
+                    adapter.summary()
+                ));
+            }
+            capture_adapter.cloned()
+        }
+    }
+}
+
 fn capture_adapter(
     target: Option<&crate::monitors::DisplayMonitor>,
     monitor_index: i32,

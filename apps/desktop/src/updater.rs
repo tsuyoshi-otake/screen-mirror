@@ -20,6 +20,16 @@ const MSI_HEADER: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
 static START: Once = Once::new();
 static UPDATE_STARTED: AtomicBool = AtomicBool::new(false);
+static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Installing restarts the app, so the background check only does it while nothing is streaming.
+pub fn set_session_active(active: bool) {
+    SESSION_ACTIVE.store(active, Ordering::SeqCst);
+}
+
+fn session_active() -> bool {
+    SESSION_ACTIVE.load(Ordering::SeqCst)
+}
 
 #[derive(Debug)]
 struct GithubRelease {
@@ -52,13 +62,20 @@ pub fn start_background_update_checks(status: Sender<String>) {
             thread::sleep(FIRST_CHECK_DELAY);
             loop {
                 crate::logging::append("background update check started (in-process HTTP)");
-                match check_and_start_update(UpdateCheckKind::Background) {
+                // An unattended sender machine never clicks Check for Updates, so install as soon
+                // as the app is idle and only defer to a manual run while a session is streaming.
+                let kind = if session_active() {
+                    UpdateCheckKind::Background
+                } else {
+                    UpdateCheckKind::Manual
+                };
+                match check_and_start_update(kind) {
                     Ok(UpdateOutcome::Available { latest }) => {
                         crate::logging::append(format!(
-                            "background update available: v{latest}; waiting for manual update"
+                            "background update available: v{latest}; deferred while a session is active"
                         ));
                         if let Err(error) = status.send(format!(
-                            "Status: update v{latest} available; use Check for Updates"
+                            "Status: update v{latest} available; installs when idle"
                         )) {
                             crate::logging::append(format!(
                                 "failed to publish background update status: {error}"
@@ -72,8 +89,9 @@ pub fn start_background_update_checks(status: Sender<String>) {
                     }
                     Ok(UpdateOutcome::UpdateStarted { latest }) => {
                         crate::logging::append(format!(
-                            "unexpected background update start: v{latest}; exiting for installer"
+                            "background update started while idle: v{latest}; exiting for installer"
                         ));
+                        let _ = status.send(format!("Status: updating to v{latest}"));
                         thread::sleep(Duration::from_secs(2));
                         std::process::exit(0);
                     }

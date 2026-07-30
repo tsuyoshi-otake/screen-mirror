@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.48`.
+The desktop and Android package versions for this release are `0.1.49`.
 
 ## Transport Model
 
@@ -202,7 +202,7 @@ The sender uses D3D11 screen capture and prefers hardware encoders:
 3. `amfh264enc` for AMD Radeon
 4. `mfh264enc` for Windows Media Foundation hardware encoders
 
-By default `allow_software_encoder = false`, so `auto` will not silently fall back to CPU `x264enc`. Set it to `true` only if software fallback is acceptable.
+By default `allow_software_encoder = false`, so `auto` will not silently fall back to CPU `x264enc`. Set it to `true` only if software fallback is acceptable, and only on a machine with a full GStreamer install: `x264enc` is GPL-licensed and the MSI does not bundle it, so the setting has no effect on an installed build. Receiving is unaffected - the installer does bundle a software *decoder*.
 
 ### Choosing a GPU
 
@@ -234,6 +234,8 @@ The value is `auto` (default), an adapter description, a case-insensitive substr
 The chosen GPU is applied by selecting the per-device element GStreamer registers for that adapter (`nvd3d11h264device1enc`, `qsvh264device1enc`, `amfh264device1enc`, `d3d12h264device1dec`, `d3d11h264device1dec`, and the matching sink `adapter` property). If the requested vendor has no encoder on that GPU, the sender logs the mismatch and keeps the automatic choice. `mfh264enc` has no adapter property, so it is never GPU-pinned.
 
 For receivers, `auto` follows the GPU that owns the primary attached display. On Intel GPUs, a matching per-device D3D12/DXVA H.264 decoder plus D3D12 sink is selected as one zero-copy route when the active driver exposes both capabilities; this covers current Core Ultra and Arc hardware without a generation-name allowlist. If that D3D12 route reports a runtime error, the receiver retries once on the same GPU's compatible D3D11/Quick Sync route. Older Intel GPUs automatically retain the matching D3D11 route. NVIDIA, Radeon, Intel, and other adapters otherwise prefer the matching per-device D3D11/DXVA H.264 decoder and same-adapter D3D11 sink. NVIDIA can fall back to NVDEC and Intel can fall back to Quick Sync when a matching D3D11 decoder is unavailable; Radeon uses the Windows D3D11/DXVA decode path because the GStreamer AMF plugin is encoder-only. An explicit `gpu`, `decoder`, or `sink` setting still overrides its corresponding automatic choice.
+
+Every automatic route ends with a bundled software decoder (`openh264dec`, BSD-licensed). Hardware decoders advertise fixed caps - Intel HD Graphics 4000 tops out at 1920x1920 and no DXVA decoder accepts 4:4:4 - and a stream outside those caps fails to negotiate before a single frame reaches the decoder, which used to stop the receiver with `not-negotiated (-4)` and no picture. The receiver now walks its routes in order (D3D12, then D3D11/Quick Sync, then software) and keeps the first one that plays. Software decode is 4:2:0-only and costs CPU, so it is never chosen first. Set `decoder = "software"` to pin it, or `decoder = "avdec"` to require libav on a machine with a full GStreamer install (the MSI does not bundle `gstlibav.dll`).
 
 Desktop duplication always captures on the GPU that owns the captured monitor. When the selected encoder GPU is not that GPU, the sender drops out of the zero-copy path for that session and hands the encoder system-memory frames, because D3D11 textures cannot cross adapters.
 

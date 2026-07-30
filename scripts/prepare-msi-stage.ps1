@@ -90,6 +90,10 @@ $pluginAllowList = @(
     'gstd3d12.dll',
     'gstmediafoundation.dll',
     'gstnvcodec.dll',
+    # BSD-licensed software H.264 decoder. Hardware decoders reject streams outside their DXVA
+    # caps (Intel HD Graphics 4000 tops out at 1920x1920), so the receiver needs a decoder with
+    # no such limit to fall back on. gstlibav/gstx264 stay excluded for licensing.
+    'gstopenh264.dll',
     'gstopus.dll',
     'gstplayback.dll',
     'gstqsv.dll',
@@ -117,13 +121,14 @@ $licenseStage = Join-Path $stage "licenses"
 New-Item -ItemType Directory -Force -Path $licenseStage | Out-Null
 $notice = Join-Path $licenseStage "THIRD-PARTY-NOTICES.txt"
 @"
-Screen Mirror bundles selected GStreamer runtime DLLs and plugins, libopus, and the Virtual Display Driver package.
+Screen Mirror bundles selected GStreamer runtime DLLs and plugins, libopus, openh264, and the Virtual Display Driver package.
 
 GStreamer is distributed under LGPL terms. See the bundled GStreamer license files in this directory and https://gstreamer.freedesktop.org/.
 Opus/libopus is distributed under a BSD-style license with royalty-free patent grants. See the bundled Opus license files and https://opus-codec.org/license/.
+openh264 is distributed under a BSD 2-clause license by Cisco Systems. See the bundled openh264 license files and https://github.com/cisco/openh264.
 Virtual Display Driver license text is bundled as Virtual-Display-Driver-LICENSE.txt.
 
-GPL-only plugins such as gstx264.dll and gstlibav.dll are intentionally not bundled.
+GPL-only plugins such as gstx264.dll and gstlibav.dll are intentionally not bundled; openh264 provides the bundled software H.264 decoder instead.
 "@ | Set-Content -Path $notice -Encoding UTF8
 $script:runtimeFiles += "licenses\THIRD-PARTY-NOTICES.txt"
 
@@ -150,7 +155,8 @@ if (Test-Path -LiteralPath $licenseRoot) {
         'gst-plugins-bad-1.0',
         'glib',
         'libopus',
-        'opus'
+        'opus',
+        'openh264'
     )
     foreach ($package in $licensePackages) {
         $packageDir = Join-Path $licenseRoot $package

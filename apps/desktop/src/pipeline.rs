@@ -171,7 +171,8 @@ pub struct RecvArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub fullscreen: bool,
 
-    /// Decoder to use. auto prefers a matching D3D12 route on modern Intel, then D3D11 GPU decode.
+    /// Decoder to use. auto prefers a matching D3D12 route on modern Intel, then D3D11 GPU decode,
+    /// and retries on the bundled software decoder when hardware decode rejects the stream.
     #[arg(long, value_enum, default_value_t = Decoder::Auto)]
     pub decoder: Decoder,
 
@@ -208,6 +209,7 @@ pub enum Decoder {
     Auto,
     D3d11,
     Avdec,
+    Software,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -240,7 +242,16 @@ pub struct PipelineHandle {
 #[derive(Clone, Debug)]
 pub struct ReceiverPipelinePlan {
     primary: String,
-    fallback: Option<String>,
+    /// Ordered retry routes, most capable first. A hardware decoder rejects a stream that exceeds
+    /// its DXVA limits before any frame reaches it, so every route after the first exists to keep
+    /// the receiver showing a picture instead of stopping on `not-negotiated`.
+    fallbacks: Vec<ReceiverFallbackRoute>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReceiverFallbackRoute {
+    label: &'static str,
+    description: String,
 }
 
 impl ReceiverPipelinePlan {
@@ -251,9 +262,9 @@ impl ReceiverPipelinePlan {
     fn append_pipeline(&mut self, description: &str) {
         self.primary.push(' ');
         self.primary.push_str(description);
-        if let Some(fallback) = self.fallback.as_mut() {
-            fallback.push(' ');
-            fallback.push_str(description);
+        for fallback in self.fallbacks.iter_mut() {
+            fallback.description.push(' ');
+            fallback.description.push_str(description);
         }
     }
 }
@@ -636,19 +647,54 @@ pub fn build_receiver_video_plan(args: &RecvArgs) -> Result<ReceiverPipelinePlan
         crate::logging::append(format!("receiver GPU selected: {}", gpu.summary()));
     }
     let (primary, uses_d3d12) = build_receiver_video_pipeline_for(args, gpu.as_ref(), true, true)?;
-    let fallback = uses_d3d12
-        .then(|| build_receiver_video_pipeline_for(args, gpu.as_ref(), false, false))
-        .and_then(|result| match result {
-            Ok((description, _)) => Some(description),
-            Err(error) => {
-                crate::logging::append(format!(
-                    "receiver D3D12 route has no compatible D3D11/QSV fallback: {error:#}"
-                ));
-                None
-            }
-        });
+    let mut fallbacks = Vec::new();
 
-    Ok(ReceiverPipelinePlan { primary, fallback })
+    if uses_d3d12 {
+        match build_receiver_video_pipeline_for(args, gpu.as_ref(), false, false) {
+            Ok((description, _)) => fallbacks.push(ReceiverFallbackRoute {
+                label: "D3D11/QSV",
+                description,
+            }),
+            Err(error) => crate::logging::append(format!(
+                "receiver D3D12 route has no compatible D3D11/QSV fallback: {error:#}"
+            )),
+        }
+    }
+
+    match build_receiver_software_video_pipeline(args, gpu.as_ref()) {
+        Ok(Some(description)) => fallbacks.push(ReceiverFallbackRoute {
+            label: "software",
+            description,
+        }),
+        Ok(None) => {}
+        Err(error) => crate::logging::append(format!(
+            "receiver has no software H.264 fallback route: {error:#}"
+        )),
+    }
+
+    Ok(ReceiverPipelinePlan { primary, fallbacks })
+}
+
+/// Hardware decoders advertise fixed caps: Intel HD Graphics 4000 tops out at 1920x1920 and no
+/// DXVA decoder accepts 4:4:4. A stream outside those caps fails to negotiate before the decoder
+/// sees a frame, which used to leave the receiver with no picture and no retry. Software decode
+/// has no such limit, so it is kept as the last route for every GPU.
+fn build_receiver_software_video_pipeline(
+    args: &RecvArgs,
+    gpu: Option<&crate::gpu::GpuAdapter>,
+) -> Result<Option<String>> {
+    // An explicitly requested software decoder is already the primary route.
+    if matches!(args.decoder, Decoder::Avdec | Decoder::Software) {
+        return Ok(None);
+    }
+    let Some(decoder) = software_decoder() else {
+        return Ok(None);
+    };
+    let route = ReceiverVideoRoute {
+        decoder,
+        sink: select_sink(args.sink, args.fullscreen, gpu)?,
+    };
+    Ok(Some(receiver_video_pipeline(args, &route)?))
 }
 
 fn build_receiver_video_pipeline_for(
@@ -657,13 +703,6 @@ fn build_receiver_video_pipeline_for(
     allow_modern_intel_d3d12: bool,
     log_route: bool,
 ) -> Result<(String, bool)> {
-    ensure_positive("jitter-ms", args.jitter_ms)?;
-    ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
-    ensure_positive("mtu", args.mtu)?;
-    ensure_positive("jitter-faststart-packets", args.jitter_faststart_packets)?;
-    ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
-    ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
-
     let route = select_receiver_route(
         args.decoder,
         args.sink,
@@ -671,30 +710,43 @@ fn build_receiver_video_pipeline_for(
         gpu,
         allow_modern_intel_d3d12,
     )?;
-    let decoder = route.decoder;
-    let sink = route.sink;
-    let uses_d3d12 = decoder.memory == ReceiverMemory::D3d12 && sink.starts_with("d3d12videosink");
-    // Keep the decoder and renderer in one graphics API. Explicit compatibility modes are left
-    // negotiated so GStreamer can choose a system-memory bridge instead of crossing GPU textures.
-    let output_caps = decoder.output_caps_for(&sink);
+    let uses_d3d12 =
+        route.decoder.memory == ReceiverMemory::D3d12 && route.sink.starts_with("d3d12videosink");
     if log_route {
         let profile = receiver_gpu_profile(gpu);
         crate::logging::append(format!(
             "receiver profile={} adapter={} decoder={} decoder-luid={} memory={} sink={}",
-            profile.route_label(decoder.memory),
+            profile.route_label(route.decoder.memory),
             gpu.map(crate::gpu::GpuAdapter::summary)
                 .unwrap_or_else(|| "GStreamer default".to_string()),
-            decoder.factory,
-            decoder
+            route.decoder.factory,
+            route
+                .decoder
                 .adapter_luid
                 .map(|luid| luid.to_string())
                 .unwrap_or_else(|| "default/unknown".to_string()),
-            decoder.memory_label_for(&sink),
-            sink
+            route.decoder.memory_label_for(&route.sink),
+            route.sink
         ));
     }
 
-    let video = format!(
+    Ok((receiver_video_pipeline(args, &route)?, uses_d3d12))
+}
+
+fn receiver_video_pipeline(args: &RecvArgs, route: &ReceiverVideoRoute) -> Result<String> {
+    ensure_positive("jitter-ms", args.jitter_ms)?;
+    ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
+    ensure_positive("mtu", args.mtu)?;
+    ensure_positive("jitter-faststart-packets", args.jitter_faststart_packets)?;
+    ensure_positive("jitter-max-dropout-ms", args.jitter_max_dropout_ms)?;
+    ensure_positive("jitter-max-misorder-ms", args.jitter_max_misorder_ms)?;
+
+    // Keep the decoder and renderer in one graphics API. Explicit compatibility modes are left
+    // negotiated so GStreamer can choose a system-memory bridge instead of crossing GPU textures.
+    let output_caps = route.decoder.output_caps_for(&route.sink);
+    let sink = &route.sink;
+
+    Ok(format!(
         "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
          ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=true faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
          ! rtph264depay wait-for-keyframe=true \
@@ -710,11 +762,9 @@ fn build_receiver_video_pipeline_for(
         args.jitter_faststart_packets,
         args.jitter_max_dropout_ms,
         args.jitter_max_misorder_ms,
-        decoder.pipeline_element(),
+        route.decoder.pipeline_element(),
         output_caps,
-    );
-
-    Ok((video, uses_d3d12))
+    ))
 }
 
 pub fn build_receiver_audio_pipeline(args: &RecvArgs) -> Result<String> {
@@ -783,28 +833,43 @@ fn run_receiver_pipeline_plan_until_stop(
     plan: ReceiverPipelinePlan,
     stop_rx: &mpsc::Receiver<()>,
 ) -> Result<()> {
-    let ReceiverPipelinePlan { primary, fallback } = plan;
-    match run_pipeline_until_stop(&primary, stop_rx) {
-        Err(primary_error) => {
-            let Some(fallback) = fallback else {
-                return Err(primary_error);
-            };
-            if stop_rx.try_recv().is_ok() {
-                return Ok(());
-            }
+    let ReceiverPipelinePlan { primary, fallbacks } = plan;
+    let primary_error = match run_pipeline_until_stop(&primary, stop_rx) {
+        Err(error) => error,
+        result => return result,
+    };
 
-            crate::logging::append(format!(
-                "receiver D3D12 route failed; retrying once with the same GPU's D3D11/QSV route: {primary_error:#}"
-            ));
-            crate::logging::append(format!("receiver fallback pipeline: {fallback}"));
-            run_pipeline_until_stop(&fallback, stop_rx).with_context(|| {
-                format!(
-                    "D3D12 receiver route failed ({primary_error:#}); D3D11/QSV fallback also failed"
-                )
-            })
+    let mut last_error = primary_error;
+    for (index, route) in fallbacks.iter().enumerate() {
+        if stop_rx.try_recv().is_ok() {
+            return Ok(());
         }
-        result => result,
+
+        crate::logging::append(format!(
+            "receiver route failed; retrying on the {} route: {last_error:#}",
+            route.label
+        ));
+        crate::logging::append(format!(
+            "receiver fallback pipeline ({}): {}",
+            route.label, route.description
+        ));
+        match run_pipeline_until_stop(&route.description, stop_rx) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                if index + 1 == fallbacks.len() {
+                    return Err(last_error).with_context(|| {
+                        format!(
+                            "every receiver decode route failed (last: {} route)",
+                            route.label
+                        )
+                    });
+                }
+            }
+        }
     }
+
+    Err(last_error)
 }
 
 fn run_pipeline_until_stop(description: &str, stop_rx: &mpsc::Receiver<()>) -> Result<()> {
@@ -1403,6 +1468,12 @@ fn select_decoder(
             "avdec_h264",
             ReceiverDecoder::new("avdec_h264", ReceiverMemory::Negotiated),
         ),
+        Decoder::Software => software_decoder().ok_or_else(|| {
+            anyhow!(
+                "no software H.264 decoder is available; expected one of {}",
+                SOFTWARE_H264_DECODERS.join(", ")
+            )
+        }),
         Decoder::Auto => {
             if let Some(decoder) = gpu.and_then(d3d11_decoder_on_gpu) {
                 return Ok(decoder);
@@ -1449,6 +1520,19 @@ fn select_decoder(
             )
         }
     }
+}
+
+/// Ordered by preference. The MSI bundles openh264 (BSD) and deliberately omits the
+/// GPL/LGPL-encumbered libav and x264 plugins, so `openh264dec` is the only software decoder that
+/// exists on an installed build; `avdec_h264` stays as a second choice for developer machines
+/// running a full GStreamer install.
+const SOFTWARE_H264_DECODERS: [&str; 2] = ["openh264dec", "avdec_h264"];
+
+fn software_decoder() -> Option<ReceiverDecoder> {
+    SOFTWARE_H264_DECODERS
+        .into_iter()
+        .find(|factory| has_element(factory))
+        .map(|factory| ReceiverDecoder::new(factory, ReceiverMemory::System))
 }
 
 fn nvidia_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<ReceiverDecoder> {
@@ -2063,12 +2147,86 @@ mod tests {
             return;
         }
 
+        // Both hardware routes fail the way an out-of-caps stream does, so only the last route in
+        // the chain can keep the receiver showing a picture.
         let plan = ReceiverPipelinePlan {
             primary: "screen_mirror_missing_d3d12_element ! fakesink".to_string(),
-            fallback: Some("videotestsrc num-buffers=1 ! fakesink sync=false".to_string()),
+            fallbacks: vec![
+                ReceiverFallbackRoute {
+                    label: "D3D11/QSV",
+                    description: "screen_mirror_missing_d3d11_element ! fakesink".to_string(),
+                },
+                ReceiverFallbackRoute {
+                    label: "software",
+                    description: "videotestsrc num-buffers=1 ! fakesink sync=false".to_string(),
+                },
+            ],
         };
 
         run_receiver_pipeline_plan(plan).expect("compatible receiver fallback should reach EOS");
+    }
+
+    #[test]
+    fn receiver_plan_ends_with_a_software_route() {
+        gst::init().expect("GStreamer initialization");
+        let Some(software) = software_decoder() else {
+            eprintln!("skipping software fallback test: no software H.264 decoder installed");
+            return;
+        };
+        let args = crate::config::AppConfig::default().recv_args();
+        let Ok(plan) = build_receiver_video_plan(&args) else {
+            eprintln!("skipping software fallback test: no receiver route on this machine");
+            return;
+        };
+
+        let last = plan
+            .fallbacks
+            .last()
+            .expect("a software route after the hardware routes");
+        assert_eq!(last.label, "software");
+        assert!(last.description.contains(&software.factory));
+        // Software decode lands in system memory, so the caps filter must not demand GPU memory.
+        assert!(last.description.contains("! video/x-raw !"));
+    }
+
+    #[test]
+    fn explicit_software_decoder_is_not_repeated_as_a_fallback() {
+        gst::init().expect("GStreamer initialization");
+        if software_decoder().is_none() {
+            eprintln!("skipping software fallback test: no software H.264 decoder installed");
+            return;
+        }
+        let mut args = crate::config::AppConfig::default().recv_args();
+        args.decoder = Decoder::Software;
+        let Ok(plan) = build_receiver_video_plan(&args) else {
+            eprintln!("skipping software fallback test: no receiver route on this machine");
+            return;
+        };
+
+        assert!(plan.fallbacks.iter().all(|route| route.label != "software"));
+    }
+
+    #[test]
+    fn appending_audio_extends_every_receiver_route() {
+        let mut plan = ReceiverPipelinePlan {
+            primary: "primary".to_string(),
+            fallbacks: vec![
+                ReceiverFallbackRoute {
+                    label: "D3D11/QSV",
+                    description: "d3d11".to_string(),
+                },
+                ReceiverFallbackRoute {
+                    label: "software",
+                    description: "software".to_string(),
+                },
+            ],
+        };
+
+        plan.append_pipeline("audio");
+
+        assert_eq!(plan.primary(), "primary audio");
+        assert_eq!(plan.fallbacks[0].description, "d3d11 audio");
+        assert_eq!(plan.fallbacks[1].description, "software audio");
     }
 
     #[test]

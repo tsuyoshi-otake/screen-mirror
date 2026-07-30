@@ -500,6 +500,22 @@ function Get-ReceiverPlaybackRoute {
         "default/unknown"
     }
 
+    # A hardware decoder rejects a stream outside its DXVA caps before the first frame reaches it,
+    # so the receiver walks its routes until one plays.  Report which retry actually took over.
+    # Only a retry logged after the most recent planned route belongs to the current session.
+    $planIndex = -1
+    $fallbackIndex = -1
+    for ($i = 0; $i -lt $logLines.Count; $i++) {
+        if ($logLines[$i] -match "^receiver profile=\S+\s+adapter=") { $planIndex = $i }
+        if ($logLines[$i] -match "^receiver route failed; retrying on the (\S+) route:") { $fallbackIndex = $i }
+    }
+    $fallbackLine = if ($fallbackIndex -gt $planIndex) { $logLines[$fallbackIndex] } else { $null }
+    $fallbackNote = if ($fallbackLine) {
+        $fallbackLine -replace "^receiver route failed; retrying on the ", "retried on the " -replace "\s+$", ""
+    } else {
+        "(none; the primary route played)"
+    }
+
     $hardwareProfile = if ($profile -ne "UNKNOWN") {
         $profile
     } elseif ($decoder -match "^d3d12.*h264.*dec$") {
@@ -508,8 +524,8 @@ function Get-ReceiverPlaybackRoute {
         "D3D11/DXVA H.264 hardware decode requested"
     } elseif ($decoder -eq "decodebin") {
         "Autoplug decode (hardware decoder selection is not recorded)"
-    } elseif ($decoder -match "^avdec") {
-        "Software H.264 decode requested"
+    } elseif ($decoder -match "^(?:avdec|openh264)") {
+        "Software H.264 decode"
     } elseif ($decoder -eq "UNKNOWN") {
         "UNKNOWN - no receiver route was found in the log"
     } else {
@@ -526,6 +542,7 @@ function Get-ReceiverPlaybackRoute {
         NegotiatedCaps = $negotiatedCaps
         Sink = $sink
         SinkAdapterIndex = $sinkAdapter
+        RouteFallback = $fallbackNote
         LastRuntimeRoute = if ($runtimeLine) { $runtimeLine } else { "(not recorded)" }
         LastPipeline = if ($pipelineLine) { $pipelineLine } else { "(not recorded)" }
     }

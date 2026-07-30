@@ -216,6 +216,7 @@ pub enum ConfigDecoder {
     Auto,
     D3d11,
     Avdec,
+    Software,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
@@ -438,6 +439,7 @@ impl From<ConfigDecoder> for Decoder {
             ConfigDecoder::Auto => Self::Auto,
             ConfigDecoder::D3d11 => Self::D3d11,
             ConfigDecoder::Avdec => Self::Avdec,
+            ConfigDecoder::Software => Self::Software,
         }
     }
 }

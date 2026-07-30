@@ -595,6 +595,7 @@ public final class MainActivity extends Activity implements ScreenCaptureService
                     displayWidth(),
                     displayHeight(),
                     displayRefreshHz(),
+                    RtpH264Receiver.decodeLimits(),
                     receiverPin
             );
             setStatus("送信側の接続を待っています :" + STREAM_PORT);

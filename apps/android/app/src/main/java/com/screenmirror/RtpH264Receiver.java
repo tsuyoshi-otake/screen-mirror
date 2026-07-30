@@ -1,6 +1,8 @@
 package com.screenmirror;
 
 import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.view.Surface;
 
@@ -137,6 +139,53 @@ final class RtpH264Receiver {
 
     String lastSenderHost() {
         return lastSenderHost;
+    }
+
+    /**
+     * Largest frame this device's H.264 decoder accepts, as {@code {width, height}}, or null when
+     * it cannot be determined.
+     *
+     * <p>Senders scale their capture to this before encoding. A stream above it is rejected while
+     * the decoder is being configured, which on this receiver shows up as a black screen rather
+     * than an error, so the limit is announced instead of discovered the hard way. Only the codec
+     * {@link MediaCodec#createDecoderByType} would pick is asked, because that is the one that has
+     * to decode the stream.
+     */
+    static int[] decodeLimits() {
+        try {
+            MediaCodecList codecs = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+            for (MediaCodecInfo info : codecs.getCodecInfos()) {
+                if (info.isEncoder() || !supportsAvc(info)) {
+                    continue;
+                }
+                MediaCodecInfo.VideoCapabilities video = info
+                        .getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                        .getVideoCapabilities();
+                if (video == null) {
+                    continue;
+                }
+                // The height is read for that exact width: the two upper bounds are independent and
+                // their combination is not necessarily a frame the decoder accepts.
+                int width = video.getSupportedWidths().getUpper();
+                int height = video.getSupportedHeightsFor(width).getUpper();
+                if (width > 0 && height > 0) {
+                    AppLog.info("H.264 decoder " + info.getName() + " accepts up to " + width + "x" + height);
+                    return new int[]{width, height};
+                }
+            }
+        } catch (Exception error) {
+            AppLog.warn("could not read the H.264 decoder frame limits", error);
+        }
+        return null;
+    }
+
+    private static boolean supportsAvc(MediaCodecInfo info) {
+        for (String type : info.getSupportedTypes()) {
+            if (MediaFormat.MIMETYPE_VIDEO_AVC.equalsIgnoreCase(type)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static MediaCodec createDecoder(Surface surface) throws Exception {

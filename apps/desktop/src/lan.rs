@@ -32,7 +32,6 @@ enum SenderSupervisorCommand {
 
 struct ResolvedSender {
     args: SendArgs,
-    target_display: Option<DisplayInfo>,
     receivers: Vec<ReceiverTarget>,
 }
 
@@ -349,14 +348,33 @@ impl Drop for SenderSupervisor {
 
 impl Announcer {
     pub fn sender(stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
-        Self::start(PeerRole::Sender, stream_port, audio_port, pin)
+        Self::start(PeerRole::Sender, stream_port, audio_port, pin, None)
     }
 
-    pub fn receiver(stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
-        Self::start(PeerRole::Receiver, stream_port, audio_port, pin)
+    /// `decode_limits` is the largest frame this receiver's decoder accepts, taken from the route
+    /// it is about to run. Senders scale to it instead of pushing a stream the decoder rejects.
+    pub fn receiver(
+        stream_port: u16,
+        audio_port: Option<u16>,
+        pin: &str,
+        decode_limits: Option<(u32, u32)>,
+    ) -> Result<Self> {
+        Self::start(
+            PeerRole::Receiver,
+            stream_port,
+            audio_port,
+            pin,
+            decode_limits,
+        )
     }
 
-    fn start(role: PeerRole, stream_port: u16, audio_port: Option<u16>, pin: &str) -> Result<Self> {
+    fn start(
+        role: PeerRole,
+        stream_port: u16,
+        audio_port: Option<u16>,
+        pin: &str,
+        decode_limits: Option<(u32, u32)>,
+    ) -> Result<Self> {
         let socket = discovery::bind_ephemeral_broadcast_socket()?;
         let mut announcement =
             PeerAnnouncement::new(instance_id(), device_name(), role, stream_port)
@@ -364,7 +382,7 @@ impl Announcer {
                 .with_audio_port(audio_port)
                 .with_diagnostics_port(DIAGNOSTICS_PORT);
         if let Some(display) = crate::monitors::primary_display_info() {
-            announcement = announcement.with_display(display);
+            announcement = announcement.with_display(display.with_decode_limits(decode_limits));
         }
         let announcement_bytes = announcement.encode()?;
         let probe_socket = match discovery::bind_probe_responder_socket() {
@@ -455,16 +473,22 @@ pub fn resolve_sender_args(
     args: SendArgs,
 ) -> Result<(SendArgs, Option<crate::monitors::DisplayMonitor>)> {
     let mut resolved = discover_sender_args(args)?;
-    (resolved.args.width, resolved.args.height) = effective_video_size(
-        resolved.args.width,
-        resolved.args.height,
-        resolved.target_display.as_ref(),
-    );
     prepare_sender_environment(&resolved)?;
     // The direct CLI/manual-host path builds its pipeline outside SenderSupervisor, so perform
     // the same exact-count and per-receiver mode checks before returning control to the caller.
     let target = assign_receiver_displays(&resolved)?.into_iter().next();
-    Ok((resolved.args, target.flatten()))
+    let target = target.flatten();
+    // The capture target's mode is only final once the virtual display has been assigned and
+    // synced, so the decoder-limit clamp is applied after that rather than before.
+    if let Some(receiver) = resolved.receivers.first() {
+        (resolved.args.width, resolved.args.height) = clamped_video_size(
+            resolved.args.width,
+            resolved.args.height,
+            receiver,
+            capture_display_mode(target.as_ref()).as_ref(),
+        );
+    }
+    Ok((resolved.args, target))
 }
 
 fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
@@ -479,11 +503,7 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
                 display: None,
             })
             .collect();
-        return Ok(ResolvedSender {
-            args,
-            target_display: None,
-            receivers,
-        });
+        return Ok(ResolvedSender { args, receivers });
     }
 
     let receivers = stable_unique_receivers(discover_receivers_with_pin(
@@ -511,10 +531,6 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
             display: peer.announcement.display.clone(),
         })
         .collect();
-    let target_display = selected
-        .iter()
-        .find_map(|receiver| receiver.display.clone());
-
     args.host = selected
         .iter()
         .map(|receiver| receiver.host.as_str())
@@ -522,7 +538,6 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         .join(",");
     Ok(ResolvedSender {
         args,
-        target_display,
         receivers: selected,
     })
 }
@@ -553,11 +568,17 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
         .iter()
         .map(|receiver| match receiver.display.as_ref() {
             Some(display) => format!(
-                "{}@{}x{}@{}",
+                "{}@{}x{}@{}@{}",
                 receiver.host,
                 display.width,
                 display.height,
-                display.refresh_hz.unwrap_or_default()
+                display.refresh_hz.unwrap_or_default(),
+                // A receiver that restarts on a different decoder needs the sender to rebuild its
+                // pipeline at the new size, so the limit belongs in the key that triggers that.
+                match display.decode_limits() {
+                    Some((width, height)) => format!("{width}x{height}"),
+                    None => "unlimited".to_string(),
+                }
             ),
             None => format!("{}@unknown", receiver.host),
         })
@@ -565,17 +586,70 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
         .join("|")
 }
 
-/// Preserve the capture source's native mode unless the user explicitly requested output caps.
+/// Preserve the capture source's native mode unless the user explicitly requested output caps or
+/// the receiver cannot decode a frame that large.
 ///
 /// A receiver's display dimensions are only a target for VDD mode sync. Using them as encoder
 /// caps stretches the source when Windows cannot apply that mode (for example, a 1366x768 VDD
-/// paired with a portrait phone).
+/// paired with a portrait phone). Its announced decoder limit is a different matter: a hardware
+/// decoder rejects an oversized stream during negotiation, before a single frame reaches it, so
+/// the sender scales the capture to fit rather than let the receiver drop to software decoding.
 fn effective_video_size(
     width: Option<u32>,
     height: Option<u32>,
-    _receiver_display: Option<&DisplayInfo>,
+    receiver_display: Option<&DisplayInfo>,
+    capture: Option<&crate::monitors::DisplayMode>,
 ) -> (Option<u32>, Option<u32>) {
-    (width, height)
+    // Explicit caps are what actually leaves the encoder, so they are what has to fit; without
+    // them the capture runs at the source's own mode, which is only known for a resolved target.
+    let source = match (width, height) {
+        (Some(width), Some(height)) => Some((width, height)),
+        _ => capture.map(|mode| (mode.width, mode.height)),
+    };
+    let fitted = source
+        .zip(receiver_display)
+        .and_then(|(source, display)| display.fitted_frame_size(source));
+    match fitted {
+        Some((fitted_width, fitted_height)) => (Some(fitted_width), Some(fitted_height)),
+        None => (width, height),
+    }
+}
+
+/// Same as [`effective_video_size`], with a log line whenever the receiver's decoder is what
+/// decided the size. Sizes chosen for a reason the operator did not configure are hard to explain
+/// from a diagnostics report alone.
+fn clamped_video_size(
+    width: Option<u32>,
+    height: Option<u32>,
+    receiver: &ReceiverTarget,
+    capture: Option<&crate::monitors::DisplayMode>,
+) -> (Option<u32>, Option<u32>) {
+    let resolved = effective_video_size(width, height, receiver.display.as_ref(), capture);
+    if resolved != (width, height) {
+        let (resolved_width, resolved_height) = resolved;
+        let limits = receiver
+            .display
+            .as_ref()
+            .and_then(DisplayInfo::decode_limits)
+            .map(|(width, height)| format!("{width}x{height}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        log_sender(format!(
+            "receiver {} decodes up to {limits}; encoding at {}x{} instead of the capture size",
+            receiver.host,
+            resolved_width.unwrap_or_default(),
+            resolved_height.unwrap_or_default()
+        ));
+    }
+    resolved
+}
+
+/// Mode of the display a receiver's stream is captured from, which is what the decoder limit has
+/// to be compared against. A route with no assigned target captures a monitor the pipeline builder
+/// picks later, so its size is unknown here and the capture is left at its native mode.
+fn capture_display_mode(
+    target: Option<&crate::monitors::DisplayMonitor>,
+) -> Option<crate::monitors::DisplayMode> {
+    crate::monitors::current_display_mode(&target?.adapter_name)
 }
 
 /// Gives every receiver its own virtual display, so a second phone joining gets a new desktop
@@ -620,10 +694,11 @@ fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Result<Vec<Pipel
     for (receiver, target) in resolved.receivers.iter().zip(assignments) {
         let mut receiver_args = resolved.args.clone();
         receiver_args.host = receiver.host.clone();
-        (receiver_args.width, receiver_args.height) = effective_video_size(
+        (receiver_args.width, receiver_args.height) = clamped_video_size(
             receiver_args.width,
             receiver_args.height,
-            receiver.display.as_ref(),
+            receiver,
+            capture_display_mode(target.as_ref()).as_ref(),
         );
         let description =
             pipeline::build_sender_video_pipeline_for(&receiver_args, target.as_ref())
@@ -692,6 +767,7 @@ mod tests {
         effective_video_size, ensure_virtual_target_count, receiver_set_key,
         stable_unique_receivers, ReceiverTarget, SenderPreparationState,
     };
+    use crate::monitors::DisplayMode;
     use sm_core::discovery::{DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole};
     use std::net::Ipv4Addr;
 
@@ -726,20 +802,18 @@ mod tests {
     fn receiver_key_changes_when_the_announced_display_mode_changes() {
         let mut receivers = vec![ReceiverTarget {
             host: "10.0.0.2:5004".to_string(),
-            display: Some(DisplayInfo {
-                width: 1366,
-                height: 768,
-                refresh_hz: Some(60),
-            }),
+            display: Some(DisplayInfo::new(1366, 768, Some(60))),
         }];
         let initial = receiver_set_key(&receivers);
-        receivers[0].display = Some(DisplayInfo {
-            width: 1920,
-            height: 1080,
-            refresh_hz: Some(60),
-        });
+        receivers[0].display = Some(DisplayInfo::new(1920, 1080, Some(60)));
+        let resized = receiver_set_key(&receivers);
+        assert_ne!(initial, resized);
 
-        assert_ne!(initial, receiver_set_key(&receivers));
+        // A receiver that comes back on a weaker decoder needs the sender to rebuild at a size
+        // that decoder accepts, even though its display mode did not change.
+        receivers[0].display =
+            Some(DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088))));
+        assert_ne!(resized, receiver_set_key(&receivers));
     }
 
     #[test]
@@ -779,19 +853,55 @@ mod tests {
 
     #[test]
     fn receiver_display_size_never_overrides_capture_native_size() {
-        let portrait = DisplayInfo {
-            width: 720,
-            height: 1604,
+        let portrait = DisplayInfo::new(720, 1604, Some(60));
+        let capture = DisplayMode {
+            width: 2560,
+            height: 1080,
             refresh_hz: Some(60),
         };
 
         assert_eq!(
-            effective_video_size(None, None, Some(&portrait)),
+            effective_video_size(None, None, Some(&portrait), Some(&capture)),
             (None, None)
         );
         assert_eq!(
-            effective_video_size(Some(1920), Some(1080), Some(&portrait)),
+            effective_video_size(Some(1920), Some(1080), Some(&portrait), Some(&capture)),
             (Some(1920), Some(1080))
+        );
+    }
+
+    #[test]
+    fn a_capture_larger_than_the_receiver_decoder_is_scaled_to_fit() {
+        let limited = DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088)));
+        let ultrawide = DisplayMode {
+            width: 2560,
+            height: 1080,
+            refresh_hz: Some(60),
+        };
+        let fits = DisplayMode {
+            width: 1366,
+            height: 768,
+            refresh_hz: Some(60),
+        };
+
+        assert_eq!(
+            effective_video_size(None, None, Some(&limited), Some(&ultrawide)),
+            (Some(1920), Some(810))
+        );
+        // A capture the receiver can already decode keeps its native size and stays zero-copy.
+        assert_eq!(
+            effective_video_size(None, None, Some(&limited), Some(&fits)),
+            (None, None)
+        );
+        // Explicitly requested caps are what reaches the encoder, so they are clamped too.
+        assert_eq!(
+            effective_video_size(Some(3840), Some(2160), Some(&limited), Some(&fits)),
+            (Some(1920), Some(1080))
+        );
+        // Without a resolved capture target there is no size to compare against.
+        assert_eq!(
+            effective_video_size(None, None, Some(&limited), None),
+            (None, None)
         );
     }
 }

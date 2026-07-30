@@ -508,6 +508,8 @@ impl TrayApp {
 
         crate::logging::append(format!("receiver video pipeline: {}", video_plan.primary()));
         eprintln!("receiver video pipeline: {}", video_plan.primary());
+        // Announced below so senders can scale to it; read before the plan is handed to the thread.
+        let decode_limits = video_plan.decode_limits();
         self.pipeline = Some(pipeline::spawn_receiver_pipeline(video_plan));
         if let Some(description) = audio_description {
             crate::logging::append(format!("receiver audio pipeline: {description}"));
@@ -519,6 +521,7 @@ impl TrayApp {
             self.config.recv.port,
             Some(self.config.recv.audio_port),
             &self.config.security.pin,
+            decode_limits,
         ) {
             Ok(announcer) => self.announcer = Some(announcer),
             Err(error) => {

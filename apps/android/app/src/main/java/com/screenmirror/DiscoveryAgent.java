@@ -74,10 +74,14 @@ final class DiscoveryAgent {
         this.listener = listener;
     }
 
-    synchronized void startReceiverBeacon(int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) throws Exception {
+    /**
+     * @param decodeLimits largest frame this device's H.264 decoder accepts as {@code {width,
+     *                     height}}, or null when it is unknown. Senders scale their capture to it.
+     */
+    synchronized void startReceiverBeacon(int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, int[] decodeLimits, String pin) throws Exception {
         stop();
         String normalizedPin = Pin.normalize(pin);
-        byte[] payload = announcement("receiver", streamPort, audioPort, displayWidth, displayHeight, refreshHz, normalizedPin);
+        byte[] payload = announcement("receiver", streamPort, audioPort, displayWidth, displayHeight, refreshHz, decodeLimits, normalizedPin);
         DatagramSocket localSocket = new DatagramSocket(null);
         try {
             localSocket.setReuseAddress(true);
@@ -347,7 +351,7 @@ final class DiscoveryAgent {
         peers.add(peer);
     }
 
-    private byte[] announcement(String role, int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, String pin) throws Exception {
+    private byte[] announcement(String role, int streamPort, int audioPort, int displayWidth, int displayHeight, int refreshHz, int[] decodeLimits, String pin) throws Exception {
         JSONObject json = new JSONObject();
         json.put("protocol", PROTOCOL);
         json.put("version", VERSION);
@@ -362,6 +366,12 @@ final class DiscoveryAgent {
         display.put("height", displayHeight);
         if (refreshHz > 0) {
             display.put("refresh_hz", refreshHz);
+        }
+        // Omitted when unknown: a sender reads a missing limit as "no known limit", which is how
+        // every peer released before this field behaves.
+        if (decodeLimits != null && decodeLimits.length == 2 && decodeLimits[0] > 0 && decodeLimits[1] > 0) {
+            display.put("max_decode_width", decodeLimits[0]);
+            display.put("max_decode_height", decodeLimits[1]);
         }
         json.put("display", display);
         json.put("timestamp_ms", System.currentTimeMillis());

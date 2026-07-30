@@ -37,6 +37,76 @@ pub struct DisplayInfo {
     pub height: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_hz: Option<u32>,
+    /// Largest frame the peer's hardware decoder accepts, when it knows one. A stream above this
+    /// fails to negotiate before the decoder sees a frame, so a sender scales down to fit instead.
+    /// Peers that predate this field leave it empty, which means "no known limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_decode_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_decode_height: Option<u32>,
+}
+
+impl DisplayInfo {
+    pub fn new(width: u32, height: u32, refresh_hz: Option<u32>) -> Self {
+        Self {
+            width,
+            height,
+            refresh_hz,
+            max_decode_width: None,
+            max_decode_height: None,
+        }
+    }
+
+    /// A limit is only usable as a pair, so a peer that reports one side and not the other is
+    /// treated as having reported nothing.
+    pub fn with_decode_limits(mut self, limits: Option<(u32, u32)>) -> Self {
+        (self.max_decode_width, self.max_decode_height) = match limits {
+            Some((width, height)) => (Some(width), Some(height)),
+            None => (None, None),
+        };
+        self
+    }
+
+    pub fn decode_limits(&self) -> Option<(u32, u32)> {
+        self.max_decode_width.zip(self.max_decode_height)
+    }
+
+    /// Frame size a `source`-sized capture has to be scaled to before this peer can decode it,
+    /// or `None` when the capture already fits or the peer announced no limit.
+    pub fn fitted_frame_size(&self, source: (u32, u32)) -> Option<(u32, u32)> {
+        fit_within(source, self.decode_limits()?)
+    }
+}
+
+/// Scales `source` down to fit `limit` while keeping its aspect ratio, or `None` when it already
+/// fits and needs no scaling at all.
+///
+/// Both sides are rounded down to an even number: H.264 chroma subsampling needs even dimensions
+/// and the D3D11 encoders reject odd ones. Rounding down also keeps the result inside the limit.
+pub fn fit_within(source: (u32, u32), limit: (u32, u32)) -> Option<(u32, u32)> {
+    let (width, height) = source;
+    let (max_width, max_height) = limit;
+    if [width, height, max_width, max_height].contains(&0) {
+        return None;
+    }
+    if width <= max_width && height <= max_height {
+        return None;
+    }
+
+    // Scaling by the wider-constrained side keeps the whole frame inside the limit; comparing the
+    // two candidate heights avoids the rounding a floating-point ratio would introduce.
+    let height_at_max_width = u64::from(max_width) * u64::from(height) / u64::from(width);
+    let fitted = if height_at_max_width <= u64::from(max_height) {
+        (u64::from(max_width), height_at_max_width)
+    } else {
+        (
+            u64::from(max_height) * u64::from(width) / u64::from(height),
+            u64::from(max_height),
+        )
+    };
+    let even = |value: u64| (value as u32) & !1;
+    let fitted = (even(fitted.0).max(2), even(fitted.1).max(2));
+    (fitted != source).then_some(fitted)
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -435,7 +505,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_probe_subnet, DiscoveryProbe, PeerAnnouncement, PeerRole, DISCOVERY_PROBE_PORT,
+        append_probe_subnet, fit_within, DiscoveryProbe, DisplayInfo, PeerAnnouncement, PeerRole,
+        DISCOVERY_PROBE_PORT,
     };
     use std::net::Ipv4Addr;
 
@@ -457,6 +528,50 @@ mod tests {
         assert!(!decoded.accepts(&wrong_role));
         assert!(!decoded.accepts(&wrong_pin));
         assert_eq!(DISCOVERY_PROBE_PORT, 47776);
+    }
+
+    #[test]
+    fn frames_are_scaled_to_fit_a_decoder_limit_without_changing_their_aspect() {
+        // An ultrawide desktop into the 1920x1088 an Intel HD 4000 decodes.
+        assert_eq!(fit_within((2560, 1080), (1920, 1088)), Some((1920, 810)));
+        // 4K fits by width alone, and the height it lands on needs no further scaling.
+        assert_eq!(fit_within((3840, 2160), (1920, 1088)), Some((1920, 1080)));
+        // A portrait capture is bounded by height instead, and both sides stay even.
+        assert_eq!(fit_within((1080, 2400), (1920, 1088)), Some((488, 1088)));
+        // Anything that already fits is left alone, so the capture keeps its native size.
+        assert_eq!(fit_within((1366, 768), (1920, 1088)), None);
+        assert_eq!(fit_within((1920, 1088), (1920, 1088)), None);
+        // A source or limit we know nothing about is not a reason to resize.
+        assert_eq!(fit_within((0, 0), (1920, 1088)), None);
+        assert_eq!(fit_within((2560, 1080), (0, 1088)), None);
+    }
+
+    #[test]
+    fn a_display_without_announced_decode_limits_never_resizes_the_capture() {
+        let unknown = DisplayInfo::new(1366, 768, Some(60));
+        let limited = DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088)));
+
+        assert_eq!(unknown.decode_limits(), None);
+        assert_eq!(unknown.fitted_frame_size((2560, 1080)), None);
+        assert_eq!(limited.fitted_frame_size((2560, 1080)), Some((1920, 810)));
+        assert_eq!(limited.fitted_frame_size((1366, 768)), None);
+    }
+
+    #[test]
+    fn decode_limits_survive_the_wire_and_older_peers_decode_without_them() {
+        let announced = PeerAnnouncement::new("receiver-1", "receiver", PeerRole::Receiver, 5004)
+            .with_display(
+                DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088))),
+            );
+        let decoded = PeerAnnouncement::decode(&announced.encode().unwrap()).unwrap();
+        assert_eq!(decoded.display.unwrap().decode_limits(), Some((1920, 1088)));
+
+        let older = PeerAnnouncement::new("receiver-2", "receiver", PeerRole::Receiver, 5004)
+            .with_display(DisplayInfo::new(1920, 1080, Some(60)));
+        let encoded = String::from_utf8(older.encode().unwrap()).unwrap();
+        assert!(!encoded.contains("max_decode"));
+        let decoded = PeerAnnouncement::decode(encoded.as_bytes()).unwrap();
+        assert_eq!(decoded.display.unwrap().decode_limits(), None);
     }
 
     #[test]

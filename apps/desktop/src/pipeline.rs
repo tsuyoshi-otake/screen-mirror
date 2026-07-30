@@ -246,6 +246,9 @@ pub struct ReceiverPipelinePlan {
     /// its DXVA limits before any frame reaches it, so every route after the first exists to keep
     /// the receiver showing a picture instead of stopping on `not-negotiated`.
     fallbacks: Vec<ReceiverFallbackRoute>,
+    /// Largest frame the primary decoder accepts, announced to senders so they can scale down
+    /// before encoding instead of pushing the receiver onto a software fallback.
+    decode_limits: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -257,6 +260,10 @@ struct ReceiverFallbackRoute {
 impl ReceiverPipelinePlan {
     pub fn primary(&self) -> &str {
         &self.primary
+    }
+
+    pub fn decode_limits(&self) -> Option<(u32, u32)> {
+        self.decode_limits
     }
 
     fn append_pipeline(&mut self, description: &str) {
@@ -670,10 +677,21 @@ pub fn build_receiver_video_plan(args: &RecvArgs) -> Result<ReceiverPipelinePlan
     if let Some(gpu) = gpu.as_ref() {
         crate::logging::append(format!("receiver GPU selected: {}", gpu.summary()));
     }
-    let (primary, uses_d3d12) = build_receiver_video_pipeline_for(args, gpu.as_ref(), true, true)?;
+    let (primary, route) = build_receiver_video_pipeline_for(args, gpu.as_ref(), true, true)?;
+    let decode_limits = decoder_frame_limits(&route.decoder.factory);
+    match decode_limits {
+        Some((width, height)) => crate::logging::append(format!(
+            "receiver decoder {} accepts up to {width}x{height}; announcing that limit to senders",
+            route.decoder.factory
+        )),
+        None => crate::logging::append(format!(
+            "receiver decoder {} advertises no frame-size limit; senders will not scale for it",
+            route.decoder.factory
+        )),
+    }
     let mut fallbacks = Vec::new();
 
-    if uses_d3d12 {
+    if route.uses_d3d12() {
         match build_receiver_video_pipeline_for(args, gpu.as_ref(), false, false) {
             Ok((description, _)) => fallbacks.push(ReceiverFallbackRoute {
                 label: "D3D11/QSV",
@@ -696,7 +714,11 @@ pub fn build_receiver_video_plan(args: &RecvArgs) -> Result<ReceiverPipelinePlan
         )),
     }
 
-    Ok(ReceiverPipelinePlan { primary, fallbacks })
+    Ok(ReceiverPipelinePlan {
+        primary,
+        fallbacks,
+        decode_limits,
+    })
 }
 
 /// Hardware decoders advertise fixed caps: Intel HD Graphics 4000 tops out at 1920x1920 and no
@@ -726,7 +748,7 @@ fn build_receiver_video_pipeline_for(
     gpu: Option<&crate::gpu::GpuAdapter>,
     allow_modern_intel_d3d12: bool,
     log_route: bool,
-) -> Result<(String, bool)> {
+) -> Result<(String, ReceiverVideoRoute)> {
     let route = select_receiver_route(
         args.decoder,
         args.sink,
@@ -734,8 +756,6 @@ fn build_receiver_video_pipeline_for(
         gpu,
         allow_modern_intel_d3d12,
     )?;
-    let uses_d3d12 =
-        route.decoder.memory == ReceiverMemory::D3d12 && route.sink.starts_with("d3d12videosink");
     if log_route {
         let profile = receiver_gpu_profile(gpu);
         crate::logging::append(format!(
@@ -754,7 +774,58 @@ fn build_receiver_video_pipeline_for(
         ));
     }
 
-    Ok((receiver_video_pipeline(args, &route)?, uses_d3d12))
+    Ok((receiver_video_pipeline(args, &route)?, route))
+}
+
+/// Largest frame the decoder advertises on its sink pad.
+///
+/// GStreamer's D3D11/D3D12/QSV decoders probe DXVA when they register and bake the answer into
+/// their pad templates, so an Intel HD 4000 reports `width=[1,1920]` where an RTX 4060 Ti reports
+/// far more. A decoder that names no bound — `decodebin`, and the software decoders — is reported
+/// as unlimited, which is what senders assume for peers that announce nothing.
+fn decoder_frame_limits(factory: &str) -> Option<(u32, u32)> {
+    let factory = gst::ElementFactory::find(factory)?;
+    let mut limits: Option<(u32, u32)> = None;
+    for template in factory.static_pad_templates() {
+        if template.direction() != gst::PadDirection::Sink {
+            continue;
+        }
+        let caps = template.caps();
+        if caps.is_any() {
+            continue;
+        }
+        for structure in caps.iter() {
+            if structure.name() != "video/x-h264" {
+                continue;
+            }
+            let Some(width) = maximum_dimension(structure, "width") else {
+                continue;
+            };
+            let Some(height) = maximum_dimension(structure, "height") else {
+                continue;
+            };
+            // A decoder can list several H.264 caps; the widest one is what it accepts.
+            limits = Some(match limits {
+                Some((known_width, known_height)) => {
+                    (known_width.max(width), known_height.max(height))
+                }
+                None => (width, height),
+            });
+        }
+    }
+    limits
+}
+
+/// Reads a caps dimension that hardware decoders write as a range and software ones sometimes
+/// write as a single value.
+fn maximum_dimension(structure: &gst::StructureRef, field: &str) -> Option<u32> {
+    if let Ok(range) = structure.get::<gst::IntRange<i32>>(field) {
+        return u32::try_from(range.max()).ok();
+    }
+    structure
+        .get::<i32>(field)
+        .ok()
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 fn receiver_video_pipeline(args: &RecvArgs, route: &ReceiverVideoRoute) -> Result<String> {
@@ -857,7 +928,9 @@ fn run_receiver_pipeline_plan_until_stop(
     plan: ReceiverPipelinePlan,
     stop_rx: &mpsc::Receiver<()>,
 ) -> Result<()> {
-    let ReceiverPipelinePlan { primary, fallbacks } = plan;
+    let ReceiverPipelinePlan {
+        primary, fallbacks, ..
+    } = plan;
     let primary_error = match run_pipeline_until_stop(&primary, stop_rx) {
         Err(error) => error,
         result => return result,
@@ -1486,6 +1559,12 @@ impl ReceiverDecoder {
 struct ReceiverVideoRoute {
     decoder: ReceiverDecoder,
     sink: String,
+}
+
+impl ReceiverVideoRoute {
+    fn uses_d3d12(&self) -> bool {
+        self.decoder.memory == ReceiverMemory::D3d12 && self.sink.starts_with("d3d12videosink")
+    }
 }
 
 fn select_receiver_route(
@@ -2256,6 +2335,7 @@ mod tests {
                     description: "videotestsrc num-buffers=1 ! fakesink sync=false".to_string(),
                 },
             ],
+            decode_limits: None,
         };
 
         run_receiver_pipeline_plan(plan).expect("compatible receiver fallback should reach EOS");
@@ -2315,6 +2395,7 @@ mod tests {
                     description: "software".to_string(),
                 },
             ],
+            decode_limits: None,
         };
 
         plan.append_pipeline("audio");
@@ -2646,37 +2727,24 @@ mod tests {
     }
 
     #[test]
+    fn a_hardware_decoder_reports_the_frame_size_it_accepts() {
+        gst::init().expect("GStreamer initialization");
+
+        if let Some((width, height)) = decoder_frame_limits("d3d11h264dec") {
+            // Every DXVA H.264 decoder takes at least 1080p. What matters is that the value is
+            // bounded at all, because that is what a sender scales down to.
+            assert!(width >= 1920 && height >= 1080, "{width}x{height}");
+        }
+        // decodebin picks its decoder while running and advertises no frame size of its own, and a
+        // decoder that is not installed cannot be asked; both mean "no known limit".
+        assert_eq!(decoder_frame_limits("decodebin"), None);
+        assert_eq!(decoder_frame_limits("screen_mirror_missing_element"), None);
+    }
+
+    #[test]
     fn native_video_caps_do_not_force_a_receiver_aspect_ratio() {
         let caps = video_caps(30, None, None, true);
         assert!(!caps.contains("width="));
         assert!(!caps.contains("height="));
-    }
-}
-
-#[cfg(test)]
-mod scratch_probe {
-    use super::*;
-
-    #[test]
-    fn scratch_report_element_creation() {
-        gst::init().unwrap();
-        for name in [
-            "qsvh264enc",
-            "amfh264enc",
-            "nvd3d11h264enc",
-            "mfh264enc",
-            "x264enc",
-        ] {
-            let found = gst::ElementFactory::find(name).is_some();
-            let built = gst::ElementFactory::make(name).build();
-            let has_bitrate = built
-                .as_ref()
-                .ok()
-                .map(|element| element.find_property("bitrate").is_some());
-            println!(
-                "{name}: find={found} built={:?} bitrate={has_bitrate:?}",
-                built.as_ref().map(|_| ()).map_err(|e| e.to_string())
-            );
-        }
     }
 }

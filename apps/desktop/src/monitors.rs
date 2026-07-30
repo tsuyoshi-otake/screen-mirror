@@ -108,11 +108,7 @@ pub fn primary_display_info() -> Option<sm_core::discovery::DisplayInfo> {
         .into_iter()
         .find(|monitor| monitor.primary)
         .and_then(|monitor| current_display_mode(&monitor.adapter_name))
-        .map(|mode| sm_core::discovery::DisplayInfo {
-            width: mode.width,
-            height: mode.height,
-            refresh_hz: mode.refresh_hz,
-        })
+        .map(|mode| sm_core::discovery::DisplayInfo::new(mode.width, mode.height, mode.refresh_hz))
 }
 
 pub fn request_extended_desktop() {
@@ -454,7 +450,7 @@ impl DisplayMonitor {
 }
 
 #[cfg(windows)]
-fn current_display_mode(device_name: &str) -> Option<DisplayMode> {
+pub fn current_display_mode(device_name: &str) -> Option<DisplayMode> {
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
     };
@@ -471,7 +467,7 @@ fn current_display_mode(device_name: &str) -> Option<DisplayMode> {
 }
 
 #[cfg(not(windows))]
-fn current_display_mode(_device_name: &str) -> Option<DisplayMode> {
+pub fn current_display_mode(_device_name: &str) -> Option<DisplayMode> {
     None
 }
 

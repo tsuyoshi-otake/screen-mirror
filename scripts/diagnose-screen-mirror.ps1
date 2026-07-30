@@ -525,11 +525,24 @@ function Get-ReceiverPlaybackRoute {
     # Only a retry logged after the most recent planned route belongs to the current session.
     $planIndex = -1
     $fallbackIndex = -1
+    $limitIndex = -1
     for ($i = 0; $i -lt $logLines.Count; $i++) {
         if ($logLines[$i] -match "^receiver profile=\S+\s+adapter=") { $planIndex = $i }
         if ($logLines[$i] -match "^receiver route failed; retrying on the (\S+) route:") { $fallbackIndex = $i }
+        if ($logLines[$i] -match "^receiver decoder \S+ (?:accepts up to|advertises no frame-size limit)") { $limitIndex = $i }
     }
     $fallbackLine = if ($fallbackIndex -gt $planIndex) { $logLines[$fallbackIndex] } else { $null }
+    # The limit this receiver announces to senders, which a sender scales its capture down to
+    # instead of pushing a stream this decoder would reject. It is logged right after the route it
+    # belongs to, so an older one is not this session's.
+    $decodeLimitLine = if ($limitIndex -gt $planIndex) { $logLines[$limitIndex] } else { $null }
+    $decodeLimit = if ($decodeLimitLine -match "accepts up to (\d+x\d+)") {
+        "$($Matches[1]) announced to senders"
+    } elseif ($decodeLimitLine) {
+        "NONE - this decoder advertises no frame-size limit, so senders will not scale for it"
+    } else {
+        "(not recorded)"
+    }
     $fallbackNote = if ($fallbackLine) {
         $fallbackLine -replace "^receiver route failed; retrying on the ", "retried on the " -replace "\s+$", ""
     } else {
@@ -562,6 +575,7 @@ function Get-ReceiverPlaybackRoute {
         NegotiatedCaps = $negotiatedCaps
         Sink = $sink
         SinkAdapterIndex = $sinkAdapter
+        DecoderFrameLimit = $decodeLimit
         RouteFallback = $fallbackNote
         LastRuntimeRoute = if ($runtimeLine) { $runtimeLine } else { "(not recorded)" }
         LastPipeline = if ($pipelineLine) { $pipelineLine } else { "(not recorded)" }
@@ -608,6 +622,7 @@ function Get-GpuAccelerationVerdict {
     $mismatchIndex = -1
     $failureIndex = -1
     $droppedIndex = -1
+    $clampIndex = -1
     for ($index = 0; $index -lt $logLines.Count; $index++) {
         $line = $logLines[$index]
         if ($line -match "^sender encoder=\S+\s+frame-memory=\S+") {
@@ -619,6 +634,8 @@ function Get-GpuAccelerationVerdict {
             $failureIndex = $index
         } elseif ($line -match "^encoder \S+ does not expose ") {
             $droppedIndex = $index
+        } elseif ($line -match "^receiver \S+ decodes up to ") {
+            $clampIndex = $index
         }
     }
     $routeLine = if ($routeIndex -ge 0) { $logLines[$routeIndex] } else { $null }
@@ -639,6 +656,13 @@ function Get-GpuAccelerationVerdict {
     $pipelineFailureLine = if ($failureIndex -gt $routeIndex) { $logLines[$failureIndex] } else { $null }
     $droppedSettingsLine = if ($droppedIndex -gt $previousRouteIndex -and $droppedIndex -ge 0) {
         $logLines[$droppedIndex]
+    } else {
+        $null
+    }
+    # The scale-to-fit decision is logged while the route is being built, so it belongs to the
+    # newest route the same way dropped encoder settings do.
+    $decodeClampLine = if ($clampIndex -gt $previousRouteIndex -and $clampIndex -ge 0) {
+        $logLines[$clampIndex]
     } else {
         $null
     }
@@ -706,6 +730,11 @@ function Get-GpuAccelerationVerdict {
             "UNKNOWN - no capture-GPU mismatch was recorded in the log tail"
         }
         LastSenderRoute = if ($routeLine) { $routeLine } else { "(not recorded)" }
+        ReceiverDecodeClamp = if ($decodeClampLine) {
+            $decodeClampLine
+        } else {
+            "(none; the capture fits every receiver's decoder or none announced a limit)"
+        }
         LastPipelineFailure = if ($pipelineFailureLine) { $pipelineFailureLine } else { "(none in the log tail)" }
         DroppedEncoderSettings = if ($droppedSettingsLine) { $droppedSettingsLine } else { "(none in the log tail)" }
         LatestFallbackReason = if ($fallbackLine) {

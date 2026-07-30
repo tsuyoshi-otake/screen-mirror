@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.46`.
+The desktop and Android package versions for this release are `0.1.47`.
 
 ## Transport Model
 
@@ -231,9 +231,9 @@ screen-mirror.exe recv --gpu 0
 
 The value is `auto` (default), an adapter description, a case-insensitive substring of it such as `4060`, or a DXGI adapter index. A description that no longer matches an installed adapter falls back to `auto` and is logged. Machines with a single GPU do not show the tray submenus and do not need the keys at all.
 
-The chosen GPU is applied by selecting the per-device element GStreamer registers for that adapter (`nvd3d11h264device1enc`, `qsvh264device1enc`, `amfh264device1enc`, `d3d11h264device1dec`, and the `adapter` property of `d3d11videosink`). If the requested vendor has no encoder on that GPU, the sender logs the mismatch and keeps the automatic choice. `mfh264enc` has no adapter property, so it is never GPU-pinned.
+The chosen GPU is applied by selecting the per-device element GStreamer registers for that adapter (`nvd3d11h264device1enc`, `qsvh264device1enc`, `amfh264device1enc`, `d3d12h264device1dec`, `d3d11h264device1dec`, and the matching sink `adapter` property). If the requested vendor has no encoder on that GPU, the sender logs the mismatch and keeps the automatic choice. `mfh264enc` has no adapter property, so it is never GPU-pinned.
 
-For receivers, `auto` follows the GPU that owns the primary attached display. NVIDIA, Radeon, Intel, and other adapters all prefer the matching per-device D3D11/DXVA H.264 decoder and the same-adapter D3D11 sink. NVIDIA can fall back to NVDEC and Intel can fall back to Quick Sync when a matching D3D11 decoder is unavailable; Radeon uses the Windows D3D11/DXVA decode path because the GStreamer AMF plugin is encoder-only. An explicit `gpu`, `decoder`, or `sink` setting still overrides its corresponding automatic choice.
+For receivers, `auto` follows the GPU that owns the primary attached display. On Intel GPUs, a matching per-device D3D12/DXVA H.264 decoder plus D3D12 sink is selected as one zero-copy route when the active driver exposes both capabilities; this covers current Core Ultra and Arc hardware without a generation-name allowlist. If that D3D12 route reports a runtime error, the receiver retries once on the same GPU's compatible D3D11/Quick Sync route. Older Intel GPUs automatically retain the matching D3D11 route. NVIDIA, Radeon, Intel, and other adapters otherwise prefer the matching per-device D3D11/DXVA H.264 decoder and same-adapter D3D11 sink. NVIDIA can fall back to NVDEC and Intel can fall back to Quick Sync when a matching D3D11 decoder is unavailable; Radeon uses the Windows D3D11/DXVA decode path because the GStreamer AMF plugin is encoder-only. An explicit `gpu`, `decoder`, or `sink` setting still overrides its corresponding automatic choice.
 
 Desktop duplication always captures on the GPU that owns the captured monitor. When the selected encoder GPU is not that GPU, the sender drops out of the zero-copy path for that session and hands the encoder system-memory frames, because D3D11 textures cannot cross adapters.
 
@@ -309,9 +309,9 @@ The report includes:
 - Recent Screen Mirror log lines
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
-- Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, GPU-engine usage, and `Video Decode` / Radeon `Video Codec` peak/current activity when Windows exposes those counters; negotiated D3D11 memory is reported separately when an older driver returns zero
+- Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, GPU-engine usage, and `Video Decode` / Radeon `Video Codec` peak/current activity when Windows exposes those counters; negotiated D3D12/D3D11 memory is reported separately when a driver returns zero
 - GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` / AMD `Video Codec` engine activity
-- Latest receiver playback route: selected hardware profile, adapter, decoder, inferred memory path, and video sink
+- Latest receiver playback route: selected hardware profile, PCI device ID, adapter LUID, decoder, negotiated D3D12/D3D11 memory path, and video sink
 - Bundled VDD device status and other virtual display candidates
 - Communication health verdict, Windows network profiles, active UDP/TCP endpoints, and the installed Screen Mirror firewall rule
 - Windows display list, GStreamer probe, receiver discovery, network adapters, and virtual display state
@@ -455,7 +455,7 @@ Android build requirements:
 - Keep `mtu = 1200` on Wi-Fi; try `mtu = 1400` only on a clean wired LAN
 - Keep `udp_buffer_size = 1048576` for low memory usage with adequate burst tolerance; raise it only after observing packet drops
 - Set `qos_dscp = 46` only if your router/switch honors DSCP; otherwise leave `-1`
-- Use GPU encode/decode where available: `nvd3d11h264enc`, `mfh264enc`, `qsvh264enc`, `d3d11h264dec`
+- Use GPU encode/decode where available: `nvd3d11h264enc`, `mfh264enc`, `qsvh264enc`, `d3d12h264dec`, `d3d11h264dec`
 - Increase bitrate for desktop readability: `--bitrate 16000`
 - For stable low audio latency, keep `audio_frame_ms = "5"` and `audio_jitter_ms = 10`; raise jitter to `15` on unstable Wi-Fi
 

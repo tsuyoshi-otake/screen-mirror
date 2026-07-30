@@ -87,6 +87,7 @@ $pluginAllowList = @(
     'gstaudioconvert.dll',
     'gstaudioresample.dll',
     'gstd3d11.dll',
+    'gstd3d12.dll',
     'gstmediafoundation.dll',
     'gstnvcodec.dll',
     'gstopus.dll',

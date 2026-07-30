@@ -126,9 +126,9 @@ fn main() -> Result<()> {
         Command::Recv(args) => {
             let _sleep_guard = power::SleepGuard::receiver();
             let _render_window = receiver_window::RenderWindowGuard::start();
-            let pipeline = pipeline::build_receiver_pipeline(&args)?;
-            eprintln!("pipeline: {pipeline}");
-            run_pipeline(&pipeline)
+            let plan = pipeline::build_receiver_pipeline_plan(&args)?;
+            eprintln!("pipeline: {}", plan.primary());
+            pipeline::run_receiver_pipeline_plan(plan)
         }
         Command::Probe => {
             probe_elements();

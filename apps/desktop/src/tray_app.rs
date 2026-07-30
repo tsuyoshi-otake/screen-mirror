@@ -474,8 +474,8 @@ impl TrayApp {
         }
 
         let args = self.config.recv_args();
-        let video_description = match pipeline::build_receiver_video_pipeline(&args) {
-            Ok(description) => description,
+        let video_plan = match pipeline::build_receiver_video_plan(&args) {
+            Ok(plan) => plan,
             Err(error) => {
                 self.set_error(format!("Receiver start failed: {error:#}"));
                 return;
@@ -493,9 +493,9 @@ impl TrayApp {
             None
         };
 
-        crate::logging::append(format!("receiver video pipeline: {video_description}"));
-        eprintln!("receiver video pipeline: {video_description}");
-        self.pipeline = Some(pipeline::spawn_pipeline(video_description));
+        crate::logging::append(format!("receiver video pipeline: {}", video_plan.primary()));
+        eprintln!("receiver video pipeline: {}", video_plan.primary());
+        self.pipeline = Some(pipeline::spawn_receiver_pipeline(video_plan));
         if let Some(description) = audio_description {
             crate::logging::append(format!("receiver audio pipeline: {description}"));
             self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
@@ -568,13 +568,13 @@ impl TrayApp {
 
         if result.is_ok() && self.active_mode == ActiveMode::Receiver {
             let args = self.config.recv_args();
-            match pipeline::build_receiver_video_pipeline(&args) {
-                Ok(description) => {
+            match pipeline::build_receiver_video_plan(&args) {
+                Ok(plan) => {
                     crate::logging::append(
                         "receiver stream disconnected; fullscreen closed and listener restarted",
                     );
-                    crate::logging::append(format!("receiver pipeline: {description}"));
-                    self.pipeline = Some(pipeline::spawn_pipeline(description));
+                    crate::logging::append(format!("receiver pipeline: {}", plan.primary()));
+                    self.pipeline = Some(pipeline::spawn_receiver_pipeline(plan));
                     self.sync_menu();
                     return;
                 }
@@ -1201,6 +1201,7 @@ mod tests {
             index,
             luid: index as i64 + 1,
             vendor_id: 0x10DE,
+            device_id: 0,
             description: description.to_string(),
         }
     }

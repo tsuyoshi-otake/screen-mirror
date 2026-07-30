@@ -279,12 +279,14 @@ function Get-ReceiverPlaybackRoute {
         Select-Object -Last 1
     $routeLine = $logLines |
         Where-Object {
-            $_ -match "^receiver profile=\S+\s+adapter=.*\s+decoder=\S+\s+memory=\S+\s+sink=" -or
+            $_ -match "^receiver profile=\S+\s+adapter=.*\s+decoder=\S+(?:\s+decoder-luid=\S+)?\s+memory=\S+\s+sink=" -or
             $_ -match "^receiver decoder=\S+\s+sink="
         } |
         Select-Object -Last 1
     $runtimeLine = $logLines |
-        Where-Object { $_ -match "^receiver runtime decoder=\S+\s+memory=.*\s+caps=.*\s+sink=\S+$" } |
+        Where-Object {
+            $_ -match "^receiver runtime decoder=\S+(?:\s+decoder-luid=\S+)?\s+memory=.*\s+caps=.*\s+sink=\S+(?:\s+sink-adapter=\S+)?$"
+        } |
         Select-Object -Last 1
     $pipelineLine = $logLines |
         Where-Object { $_ -match "^receiver video pipeline:" } |
@@ -294,13 +296,13 @@ function Get-ReceiverPlaybackRoute {
     $routeText = if ($null -eq $routeLine) { "" } else { $routeLine.ToString() }
     $plannedMatch = [regex]::Match(
         $routeText,
-        "^receiver profile=(\S+)\s+adapter=(.*?)\s+decoder=(\S+)\s+memory=(\S+)\s+sink=(.+)$"
+        "^receiver profile=(\S+)\s+adapter=(.*?)\s+decoder=(\S+)(?:\s+decoder-luid=(\S+))?\s+memory=(\S+)\s+sink=(.+)$"
     )
     $legacyMatch = [regex]::Match($routeText, "^receiver decoder=(\S+)\s+sink=(.+)$")
     $runtimeText = if ($null -eq $runtimeLine) { "" } else { $runtimeLine.ToString() }
     $runtimeMatch = [regex]::Match(
         $runtimeText,
-        "^receiver runtime decoder=(\S+)\s+memory=(.*?)\s+caps=(.*?)\s+sink=(\S+)$"
+        "^receiver runtime decoder=(\S+)(?:\s+decoder-luid=(\S+))?\s+memory=(.*?)\s+caps=(.*?)\s+sink=(\S+)(?:\s+sink-adapter=(\S+))?$"
     )
 
     $profile = if ($plannedMatch.Success) { $plannedMatch.Groups[1].Value } else { "UNKNOWN" }
@@ -324,36 +326,54 @@ function Get-ReceiverPlaybackRoute {
         $configuredDecoder
     }
     $configuredMemory = if ($plannedMatch.Success) {
-        $plannedMatch.Groups[4].Value
+        $plannedMatch.Groups[5].Value
     } else {
         "UNKNOWN"
     }
     $memoryPath = if ($runtimeMatch.Success) {
-        $runtimeMatch.Groups[2].Value
+        $runtimeMatch.Groups[3].Value
     } elseif ($configuredMemory -ne "UNKNOWN") {
         "$configuredMemory (planned; no negotiated caps were logged)"
+    } elseif ($decoder -match "^d3d12" -and $routeText -match "sink=d3d12videosink") {
+        "D3D12Memory expected between hardware decoder and D3D12 sink"
     } elseif ($decoder -match "^d3d11" -and $routeText -match "sink=d3d11videosink") {
         "D3D11Memory expected between hardware decoder and D3D11 sink"
     } else {
         "UNKNOWN - no negotiated decoder caps were found in the log"
     }
     $negotiatedCaps = if ($runtimeMatch.Success) {
-        $runtimeMatch.Groups[3].Value
+        $runtimeMatch.Groups[4].Value
     } else {
         "(not recorded; run diagnostics while video is being received)"
     }
     $sink = if ($runtimeMatch.Success) {
-        $runtimeMatch.Groups[4].Value
+        $runtimeMatch.Groups[5].Value
     } elseif ($plannedMatch.Success) {
-        $plannedMatch.Groups[5].Value
+        $plannedMatch.Groups[6].Value
     } elseif ($legacyMatch.Success) {
         $legacyMatch.Groups[2].Value
     } else {
         "UNKNOWN"
     }
+    $decoderLuid = if ($runtimeMatch.Success -and $runtimeMatch.Groups[2].Value) {
+        $runtimeMatch.Groups[2].Value
+    } elseif ($plannedMatch.Success -and $plannedMatch.Groups[4].Value) {
+        $plannedMatch.Groups[4].Value
+    } else {
+        "default/unknown"
+    }
+    $sinkAdapter = if ($runtimeMatch.Success -and $runtimeMatch.Groups[6].Value) {
+        $runtimeMatch.Groups[6].Value
+    } elseif ($sink -match "(?:^|\s)adapter=(\d+)") {
+        $Matches[1]
+    } else {
+        "default/unknown"
+    }
 
     $hardwareProfile = if ($profile -ne "UNKNOWN") {
         $profile
+    } elseif ($decoder -match "^d3d12.*h264.*dec$") {
+        "D3D12/DXVA H.264 hardware decode requested"
     } elseif ($decoder -match "^d3d11.*h264.*dec$") {
         "D3D11/DXVA H.264 hardware decode requested"
     } elseif ($decoder -eq "decodebin") {
@@ -371,9 +391,11 @@ function Get-ReceiverPlaybackRoute {
         Adapter = $adapter
         ConfiguredDecoder = $configuredDecoder
         ActualDecoder = $decoder
+        DecoderAdapterLuid = $decoderLuid
         MemoryPath = $memoryPath
         NegotiatedCaps = $negotiatedCaps
         Sink = $sink
+        SinkAdapterIndex = $sinkAdapter
         LastRuntimeRoute = if ($runtimeLine) { $runtimeLine } else { "(not recorded)" }
         LastPipeline = if ($pipelineLine) { $pipelineLine } else { "(not recorded)" }
     }
@@ -600,9 +622,9 @@ function Get-ScreenMirrorResourceSummary {
     $gpuCounterInterpretation = if (
         $script:gpuEngineSampleSucceeded -and
         $gpuPeak -eq 0 -and
-        $latestRuntimeRoute -match "^receiver runtime decoder=(?:d3d11|nvh264|qsvh264|mfh264)\S*\s+memory=D3D11Memory\s"
+        $latestRuntimeRoute -match "^receiver runtime decoder=(?:d3d12|d3d11|nvh264|qsvh264|mfh264)\S*(?:\s+decoder-luid=\S+)?\s+memory=D3D1[12]Memory\s"
     ) {
-        "D3D11 hardware decode and GPU-memory caps were confirmed; this Windows/driver counter set reported 0%."
+        "D3D hardware decode and GPU-memory caps were confirmed; this Windows/driver counter set reported 0%."
     } elseif (-not $script:gpuEngineSampleSucceeded) {
         "Windows GPU performance counters were unavailable; use Receiver Playback Route to confirm hardware decode."
     } else {
@@ -662,7 +684,7 @@ Add-CommandOutput "Running Processes" {
 
 Add-CommandOutput "Display Adapters" {
     Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-        Select-Object Name, DriverVersion, AdapterRAM, VideoProcessor, Status |
+        Select-Object Name, PNPDeviceID, DriverVersion, AdapterRAM, VideoProcessor, Status |
         Format-Table -AutoSize
 }
 
@@ -843,6 +865,7 @@ Add-CommandOutput "Bundled Runtime" {
         "glib-2.0-0.dll",
         "gobject-2.0-0.dll",
         "gstreamer-1.0-0.dll",
+        "lib\gstreamer-1.0\gstd3d12.dll",
         "lib\gstreamer-1.0\gstwasapi2.dll",
         "lib\gstreamer-1.0\gstopus.dll",
         "lib\gstreamer-1.0\gstrtp.dll",

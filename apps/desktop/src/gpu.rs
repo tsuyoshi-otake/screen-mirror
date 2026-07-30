@@ -14,6 +14,9 @@ pub struct GpuAdapter {
     /// DXGI adapter LUID; matches the `adapter-luid` property of the d3d11/nvcodec/qsv/amf elements.
     pub luid: i64,
     pub vendor_id: u32,
+    /// PCI device identifier reported by DXGI. This is diagnostic context only; routing is
+    /// capability-based so new devices do not require a hard-coded generation table.
+    pub device_id: u32,
     pub description: String,
 }
 
@@ -42,8 +45,8 @@ impl GpuAdapter {
 
     pub fn summary(&self) -> String {
         format!(
-            "index={} luid={} vendor=0x{:04X} name={}",
-            self.index, self.luid, self.vendor_id, self.description
+            "index={} luid={} vendor=0x{:04X} device=0x{:04X} name={}",
+            self.index, self.luid, self.vendor_id, self.device_id, self.description
         )
     }
 }
@@ -153,6 +156,7 @@ pub fn adapters() -> Vec<GpuAdapter> {
                         index,
                         luid: luid_to_i64(desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart),
                         vendor_id: desc.VendorId,
+                        device_id: desc.DeviceId,
                         description: wide_array_to_string(&desc.Description),
                     });
                 }
@@ -225,6 +229,7 @@ fn outputs() -> Vec<AdapterOutput> {
                         index: adapter_index,
                         luid: luid_to_i64(desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart),
                         vendor_id: desc.VendorId,
+                        device_id: desc.DeviceId,
                         description: wide_array_to_string(&desc.Description),
                     };
 
@@ -288,11 +293,26 @@ mod tests {
             index: 0,
             luid: 0,
             vendor_id,
+            device_id: 0,
             description: String::new(),
         };
         assert_eq!(adapter(0x10DE).vendor(), GpuVendor::Nvidia);
         assert_eq!(adapter(0x1002).vendor(), GpuVendor::Amd);
         assert_eq!(adapter(0x8086).vendor(), GpuVendor::Intel);
         assert_eq!(adapter(0x1414).vendor(), GpuVendor::Other);
+    }
+
+    #[test]
+    fn summary_includes_pci_device_id_for_diagnostics() {
+        let adapter = GpuAdapter {
+            index: 2,
+            luid: 42,
+            vendor_id: 0x8086,
+            device_id: 0xB080,
+            description: "Intel Arc B390".to_string(),
+        };
+
+        assert!(adapter.summary().contains("vendor=0x8086"));
+        assert!(adapter.summary().contains("device=0xB080"));
     }
 }

@@ -8,6 +8,7 @@ import android.view.Surface;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
@@ -44,6 +45,12 @@ final class RtpH264Receiver {
     private final byte[] receiveBuffer = new byte[2048];
     private final DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
     private final FuState fuState = new FuState();
+    /**
+     * Refilled in place for every packet instead of allocated: at 30 fps a 1080p stream arrives as
+     * thousands of packets a second, and this object never outlives the call that parses it.
+     * Confined to the receive thread, which is also the only thread the test entry points use.
+     */
+    private final RtpHeader header = new RtpHeader();
     private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
     private final DisconnectWatchdog watchdog;
     private final RtpStreamLock streamLock = new RtpStreamLock();
@@ -66,6 +73,9 @@ final class RtpH264Receiver {
     private int reportedBufferWidth;
     private int reportedBufferHeight;
     private volatile String lastSenderHost;
+    /** Receive-thread-only memo for {@link #hostOf}; see the note there. */
+    private InetAddress cachedSenderAddress;
+    private String cachedSenderHost;
 
     RtpH264Receiver() {
         this(new DisconnectWatchdog(DISCONNECT_TIMEOUT_MS));
@@ -105,6 +115,8 @@ final class RtpH264Receiver {
         }
         socket = localSocket;
         lastSenderHost = null;
+        cachedSenderAddress = null;
+        cachedSenderHost = null;
         fuState.reset();
         watchdog.reset();
         streamLock.reset();
@@ -281,9 +293,8 @@ final class RtpH264Receiver {
                 try {
                     receivePacket.setData(receiveBuffer, 0, receiveBuffer.length);
                     localSocket.receive(receivePacket);
-                    String senderHost = receivePacket.getAddress().getHostAddress();
-                    RtpHeader header = selectRtpHeader(senderHost, receiveBuffer, receivePacket.getLength());
-                    if (header == null) {
+                    String senderHost = hostOf(receivePacket.getAddress());
+                    if (!selectRtpHeader(senderHost, receiveBuffer, receivePacket.getLength())) {
                         disconnectIfSelectedStreamTimedOut();
                         continue;
                     }
@@ -342,10 +353,23 @@ final class RtpH264Receiver {
         return true;
     }
 
+    /**
+     * Address formatting allocates a string, and every packet of a session carries the same address.
+     * Remember the last one: a session is locked to a single sender, so this misses once per stream
+     * rather than thousands of times a second.
+     */
+    private String hostOf(InetAddress address) {
+        InetAddress known = cachedSenderAddress;
+        if (address != known && !address.equals(known)) {
+            cachedSenderAddress = address;
+            cachedSenderHost = address.getHostAddress();
+        }
+        return cachedSenderHost;
+    }
+
     // Visible for testing: depacketization is pure parsing and needs no decoder to be exercised.
     boolean depacketizeAndQueue(byte[] packet, int length) throws Exception {
-        RtpHeader header = RtpHeader.parse(packet, length);
-        if (header == null) {
+        if (!header.parse(packet, length)) {
             return false;
         }
         return depacketizeAndQueue(packet, header);
@@ -353,8 +377,7 @@ final class RtpH264Receiver {
 
     /** Visible for testing: admits exactly one valid RTP sender stream per receiver session. */
     boolean acceptsStreamPacket(String senderHost, byte[] packet, int length) {
-        RtpHeader header = selectRtpHeader(senderHost, packet, length);
-        if (header == null) {
+        if (!selectRtpHeader(senderHost, packet, length)) {
             return false;
         }
         watchdog.onPacket();
@@ -362,17 +385,18 @@ final class RtpH264Receiver {
     }
 
     /**
-     * Reject packets from every other stream, but do not let that traffic mask a dead selected
+     * Parses into {@link #header} and reports whether the packet belongs to this session's stream.
+     *
+     * <p>Rejects packets from every other stream, but does not let that traffic mask a dead selected
      * stream forever. Once the selected stream has been silent for the normal watchdog interval,
-     * make the current valid candidate the new stream and wait for its SPS/IDR again.
+     * the current valid candidate becomes the new stream and its SPS/IDR is awaited again.
      */
-    private RtpHeader selectRtpHeader(String senderHost, byte[] packet, int length) {
-        RtpHeader header = RtpHeader.parse(packet, length);
-        if (header == null) {
-            return null;
+    private boolean selectRtpHeader(String senderHost, byte[] packet, int length) {
+        if (!header.parse(packet, length)) {
+            return false;
         }
         if (streamLock.accepts(senderHost, header.ssrc)) {
-            return header;
+            return true;
         }
         if (watchdog.isTimedOut()) {
             AppLog.warn("selected RTP video stream timed out; switching from "
@@ -382,14 +406,14 @@ final class RtpH264Receiver {
             streamLock.reset();
             streamLock.accepts(senderHost, header.ssrc);
             watchdog.reset();
-            return header;
+            return true;
         }
         if (streamLock.shouldWarnFor(senderHost, header.ssrc)) {
             AppLog.warn("ignoring RTP video stream from " + senderHost
                     + " with SSRC " + Integer.toUnsignedString(header.ssrc)
                     + "; receiver is locked to " + streamLock.description(), null);
         }
-        return null;
+        return false;
     }
 
     private void resyncForStreamTakeover() {
@@ -650,70 +674,69 @@ final class RtpH264Receiver {
         }
     }
 
-    /** Validates the RTP envelope before any packet can select or feed the decoder. */
+    /**
+     * Validates the RTP envelope before any packet can select or feed the decoder.
+     *
+     * <p>Refilled in place rather than reallocated per packet; the fields are only meaningful after
+     * {@link #parse} has returned true, and only until the next call.
+     */
     private static final class RtpHeader {
-        final int ssrc;
-        final int sequence;
-        final int timestamp;
-        final int payloadOffset;
-        final int payloadLength;
+        int ssrc;
+        int sequence;
+        int timestamp;
+        int payloadOffset;
+        int payloadLength;
 
-        RtpHeader(int ssrc, int sequence, int timestamp, int payloadOffset, int payloadLength) {
-            this.ssrc = ssrc;
-            this.sequence = sequence;
-            this.timestamp = timestamp;
-            this.payloadOffset = payloadOffset;
-            this.payloadLength = payloadLength;
-        }
-
-        static RtpHeader parse(byte[] packet, int length) {
+        boolean parse(byte[] packet, int length) {
             if (packet == null || length <= RTP_HEADER_SIZE || length > packet.length) {
-                return null;
+                return false;
             }
             int first = packet[0] & 0xff;
             if ((first & 0xc0) != 0x80 || (packet[1] & 0x7f) != H264_PAYLOAD_TYPE) {
-                return null;
+                return false;
             }
 
             int payloadEnd = length;
             if ((first & 0x20) != 0) {
                 int padding = packet[length - 1] & 0xff;
                 if (padding == 0 || padding > length - RTP_HEADER_SIZE) {
-                    return null;
+                    return false;
                 }
                 payloadEnd -= padding;
             }
 
-            int payloadOffset = RTP_HEADER_SIZE + (first & 0x0f) * 4;
-            if (payloadOffset > payloadEnd) {
-                return null;
+            int offset = RTP_HEADER_SIZE + (first & 0x0f) * 4;
+            if (offset > payloadEnd) {
+                return false;
             }
             if ((first & 0x10) != 0) {
-                if (payloadOffset + 4 > payloadEnd) {
-                    return null;
+                if (offset + 4 > payloadEnd) {
+                    return false;
                 }
-                int extensionWords = ((packet[payloadOffset + 2] & 0xff) << 8)
-                        | (packet[payloadOffset + 3] & 0xff);
-                long extensionEnd = (long) payloadOffset + 4L + (long) extensionWords * 4L;
+                int extensionWords = ((packet[offset + 2] & 0xff) << 8)
+                        | (packet[offset + 3] & 0xff);
+                long extensionEnd = (long) offset + 4L + (long) extensionWords * 4L;
                 if (extensionEnd > payloadEnd) {
-                    return null;
+                    return false;
                 }
-                payloadOffset = (int) extensionEnd;
+                offset = (int) extensionEnd;
             }
-            if (payloadOffset >= payloadEnd) {
-                return null;
+            if (offset >= payloadEnd) {
+                return false;
             }
 
-            int ssrc = ((packet[8] & 0xff) << 24)
+            ssrc = ((packet[8] & 0xff) << 24)
                     | ((packet[9] & 0xff) << 16)
                     | ((packet[10] & 0xff) << 8)
                     | (packet[11] & 0xff);
-            int sequence = ((packet[2] & 0xff) << 8) | (packet[3] & 0xff);
-            int timestamp = ((packet[4] & 0xff) << 24)
+            sequence = ((packet[2] & 0xff) << 8) | (packet[3] & 0xff);
+            timestamp = ((packet[4] & 0xff) << 24)
                     | ((packet[5] & 0xff) << 16)
                     | ((packet[6] & 0xff) << 8)
                     | (packet[7] & 0xff);
-            return new RtpHeader(ssrc, sequence, timestamp, payloadOffset, payloadEnd - payloadOffset);
+            payloadOffset = offset;
+            payloadLength = payloadEnd - offset;
+            return true;
         }
     }
 

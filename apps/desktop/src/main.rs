@@ -121,7 +121,13 @@ fn main() -> Result<()> {
             let _control = control::ControlServer::start(&args.pin)?;
             let pipeline = pipeline::build_sender_pipeline_for(&args, capture_target.as_ref())?;
             eprintln!("pipeline: {pipeline}");
-            run_pipeline(&pipeline)
+            let result = run_pipeline(&pipeline);
+            // The virtual display exists for this session only; the desktop must not keep it once
+            // the stream is over.
+            if args.enable_virtual_display {
+                monitors::remove_bundled_virtual_display();
+            }
+            result
         }
         Command::Recv(args) => {
             let _sleep_guard = power::SleepGuard::receiver();

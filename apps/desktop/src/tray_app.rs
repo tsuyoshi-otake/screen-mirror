@@ -96,7 +96,7 @@ pub fn run() -> Result<()> {
             }
             Event::UserEvent(UserEvent::Tray(event)) => app.handle_tray_event(event),
             Event::LoopDestroyed => {
-                let _ = app.stop_current();
+                let _ = app.end_session("event loop destroyed");
             }
             _ => {}
         }
@@ -304,7 +304,7 @@ impl TrayApp {
             ID_START_SENDER => self.start_sender(),
             ID_START_RECEIVER => self.start_receiver(),
             ID_STOP => {
-                if let Err(error) = self.stop_current() {
+                if let Err(error) = self.end_session("stopped from the tray") {
                     self.set_error(format!("Stop failed: {error:#}"));
                 }
                 self.config.startup_mode = StartupMode::Idle;
@@ -328,7 +328,7 @@ impl TrayApp {
             ID_OPEN_CONFIG => self.open_config(),
             ID_RELOAD_CONFIG => self.reload_config(),
             ID_QUIT => {
-                let _ = self.stop_current();
+                let _ = self.end_session("app quit");
                 if let Some(server) = self.diagnostics_server.take() {
                     server.stop();
                 }
@@ -481,7 +481,7 @@ impl TrayApp {
             return;
         }
 
-        if let Err(error) = self.stop_current() {
+        if let Err(error) = self.end_session("switching to receiver mode") {
             self.set_error(format!("Stop failed: {error:#}"));
             return;
         }
@@ -533,6 +533,30 @@ impl TrayApp {
         self.config.startup_mode = StartupMode::Receiver;
         self.save_config();
         self.sync_menu();
+    }
+
+    /// Ends the running session and gives back everything it borrowed from the desktop.
+    ///
+    /// This is the stop for the paths that really finish a session. `start_sender` deliberately
+    /// keeps using `stop_current`: restarting the sender would otherwise remove its virtual
+    /// displays and immediately reinstall them, behind two UAC prompts instead of none.
+    fn end_session(&mut self, reason: &str) -> Result<()> {
+        let ending_mode = self.active_mode;
+        let result = self.stop_current();
+        // Cleanup runs even when a pipeline failed to stop cleanly; a stranded desktop is the more
+        // visible failure of the two.
+        self.release_sender_virtual_displays(ending_mode, reason);
+        result
+    }
+
+    /// A sender session owns the virtual displays it brought up. Once it ends there is no receiver
+    /// showing them, so leaving them attached strands a desktop nobody can see.
+    fn release_sender_virtual_displays(&self, ending_mode: ActiveMode, reason: &str) {
+        if !releases_sender_virtual_displays(ending_mode, self.config.send.enable_virtual_display) {
+            return;
+        }
+        crate::logging::append(format!("releasing sender virtual displays: {reason}"));
+        crate::monitors::remove_bundled_virtual_display();
     }
 
     fn stop_current(&mut self) -> Result<()> {
@@ -620,6 +644,9 @@ impl TrayApp {
                 crate::logging::append(format!("audio pipeline cleanup failed: {error:#}"));
             }
         }
+        // Released only once nothing is capturing any more, so the driver is not torn out from
+        // under a running pipeline.
+        self.release_sender_virtual_displays(self.active_mode, "sender pipeline stopped");
         self.render_window = None;
         self.sleep_guard = None;
         self.active_mode = ActiveMode::Idle;
@@ -1244,10 +1271,31 @@ fn app_icon() -> Result<Icon> {
     Icon::from_rgba(rgba, size as u32, size as u32).context("failed to create tray icon image")
 }
 
+/// Whether the session that is ending has virtual displays of its own to hand back.
+///
+/// Only a sender brings them up, and only when it is configured to. A receiver-mode or idle stop
+/// must leave the driver alone: the device may have been installed by hand from the tray menu, and
+/// removing it needs elevation, so a stop that cannot own the displays must not prompt for one.
+fn releases_sender_virtual_displays(ending_mode: ActiveMode, enable_virtual_display: bool) -> bool {
+    ending_mode == ActiveMode::Sender && enable_virtual_display
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gpu::GpuAdapter;
+
+    #[test]
+    fn only_a_sender_session_hands_back_its_virtual_displays() {
+        assert!(releases_sender_virtual_displays(ActiveMode::Sender, true));
+        assert!(!releases_sender_virtual_displays(ActiveMode::Receiver, true));
+        assert!(!releases_sender_virtual_displays(ActiveMode::Idle, true));
+    }
+
+    #[test]
+    fn a_sender_that_never_created_virtual_displays_leaves_the_driver_alone() {
+        assert!(!releases_sender_virtual_displays(ActiveMode::Sender, false));
+    }
 
     fn adapter(index: u32, description: &str) -> GpuAdapter {
         GpuAdapter {

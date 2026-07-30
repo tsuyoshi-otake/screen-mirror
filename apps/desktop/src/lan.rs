@@ -41,20 +41,20 @@ struct ReceiverTarget {
 
 #[derive(Default)]
 struct SenderPreparationState {
-    hosts: String,
+    receiver_key: String,
 }
 
 impl SenderPreparationState {
-    fn should_prepare(&mut self, hosts: &str) -> bool {
-        if self.hosts == hosts {
-            return false;
-        }
-        self.hosts = hosts.to_string();
-        true
+    fn needs_prepare(&self, receiver_key: &str) -> bool {
+        self.receiver_key != receiver_key
+    }
+
+    fn mark_prepared(&mut self, receiver_key: &str) {
+        self.receiver_key = receiver_key.to_string();
     }
 
     fn reset(&mut self) {
-        self.hosts.clear();
+        self.receiver_key.clear();
     }
 }
 
@@ -65,6 +65,7 @@ impl SenderSupervisor {
             log_sender("sender supervisor started; waiting for matching receivers");
             let mut args = args;
             let mut active_hosts = String::new();
+            let mut active_receiver_key = String::new();
             let mut active_video_pipelines: Vec<PipelineHandle> = Vec::new();
             let mut active_audio_pipeline: Option<PipelineHandle> = None;
             let mut detached_for_no_receivers = false;
@@ -101,6 +102,7 @@ impl SenderSupervisor {
                         }
                     }
                     active_hosts.clear();
+                    active_receiver_key.clear();
                     preparation.reset();
                 }
 
@@ -119,46 +121,66 @@ impl SenderSupervisor {
                 }
 
                 match discover_sender_args(args.clone()) {
-                    Ok(resolved) if resolved.args.host != active_hosts => {
+                    Ok(resolved) => {
                         last_receiver_seen = Some(Instant::now());
-                        if let Some(handle) = active_audio_pipeline.take() {
-                            if let Err(error) = handle.stop() {
-                                log_sender(format!("sender audio target update failed: {error:#}"));
+                        let receiver_key = receiver_set_key(&resolved.receivers);
+                        if receiver_key != active_receiver_key {
+                            if let Some(handle) = active_audio_pipeline.take() {
+                                if let Err(error) = handle.stop() {
+                                    log_sender(format!(
+                                        "sender audio target update failed: {error:#}"
+                                    ));
+                                }
                             }
-                        }
-                        stop_video_pipelines(
-                            &mut active_video_pipelines,
-                            "sender video target update failed",
-                        );
-                        active_hosts.clear();
-                        if preparation.should_prepare(&resolved.args.host)
-                            && prepare_sender_environment(&resolved)
-                        {
-                            detached_for_no_receivers = false;
-                        }
-                        let pipelines = spawn_receiver_video_pipelines(&resolved);
-                        if pipelines.is_empty() {
-                            log_sender("no sender video pipeline could be started for the current receivers");
+                            stop_video_pipelines(
+                                &mut active_video_pipelines,
+                                "sender video target update failed",
+                            );
+                            active_hosts.clear();
+                            active_receiver_key.clear();
+
+                            let start_result = (|| {
+                                if preparation.needs_prepare(&receiver_key) {
+                                    prepare_sender_environment(&resolved)?;
+                                    preparation.mark_prepared(&receiver_key);
+                                }
+                                spawn_receiver_video_pipelines(&resolved)
+                            })();
+
+                            match start_result {
+                                Ok(pipelines) => {
+                                    log_sender(format!(
+                                        "sender targets updated: {} ({} display stream(s))",
+                                        resolved.args.host,
+                                        pipelines.len()
+                                    ));
+                                    active_hosts = resolved.args.host;
+                                    active_receiver_key = receiver_key;
+                                    active_video_pipelines = pipelines;
+                                    apply_sender_audio_state(
+                                        &args,
+                                        &active_hosts,
+                                        &mut active_audio_pipeline,
+                                    );
+                                    detached_for_no_receivers = false;
+                                }
+                                Err(error) => {
+                                    // Preparation is committed only for a complete receiver route.
+                                    // Any count, mode or pipeline build failure must retry it.
+                                    preparation.reset();
+                                    log_sender(format!(
+                                        "sender environment not ready; transmission deferred and will retry: {error:#}"
+                                    ));
+                                }
+                            }
                         } else {
-                            log_sender(format!(
-                                "sender targets updated: {} ({} display stream(s))",
-                                resolved.args.host,
-                                pipelines.len()
-                            ));
-                            active_hosts = resolved.args.host;
-                            active_video_pipelines = pipelines;
+                            detached_for_no_receivers = false;
                             apply_sender_audio_state(
                                 &args,
                                 &active_hosts,
                                 &mut active_audio_pipeline,
                             );
-                            detached_for_no_receivers = false;
                         }
-                    }
-                    Ok(_) => {
-                        detached_for_no_receivers = false;
-                        last_receiver_seen = Some(Instant::now());
-                        apply_sender_audio_state(&args, &active_hosts, &mut active_audio_pipeline);
                     }
                     Err(error) => {
                         if !detached_for_no_receivers
@@ -184,6 +206,7 @@ impl SenderSupervisor {
                             "sender video stop after receiver loss failed",
                         );
                         active_hosts.clear();
+                        active_receiver_key.clear();
                         if args.enable_virtual_display && !detached_for_no_receivers {
                             crate::monitors::remove_bundled_virtual_display();
                             detached_for_no_receivers = true;
@@ -414,7 +437,10 @@ pub fn resolve_sender_args(args: SendArgs) -> Result<SendArgs> {
         resolved.args.height,
         resolved.target_display.as_ref(),
     );
-    let _ = prepare_sender_environment(&resolved);
+    prepare_sender_environment(&resolved)?;
+    // The direct CLI/manual-host path builds its pipeline outside SenderSupervisor, so perform
+    // the same exact-count and per-receiver mode checks before returning control to the caller.
+    assign_receiver_displays(&resolved)?;
     Ok(resolved.args)
 }
 
@@ -447,10 +473,6 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         ));
     }
 
-    let target_display = receivers
-        .iter()
-        .find_map(|peer| peer.announcement.display.clone());
-
     let selected: Vec<ReceiverTarget> = receivers
         .into_iter()
         .take(args.max_receivers as usize)
@@ -459,6 +481,9 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
             display: peer.announcement.display.clone(),
         })
         .collect();
+    let target_display = selected
+        .iter()
+        .find_map(|receiver| receiver.display.clone());
 
     args.host = selected
         .iter()
@@ -493,6 +518,23 @@ fn stable_unique_receivers(mut receivers: Vec<DiscoveredPeer>) -> Vec<Discovered
     receivers
 }
 
+fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
+    receivers
+        .iter()
+        .map(|receiver| match receiver.display.as_ref() {
+            Some(display) => format!(
+                "{}@{}x{}@{}",
+                receiver.host,
+                display.width,
+                display.height,
+                display.refresh_hz.unwrap_or_default()
+            ),
+            None => format!("{}@unknown", receiver.host),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Preserve the capture source's native mode unless the user explicitly requested output caps.
 ///
 /// A receiver's display dimensions are only a target for VDD mode sync. Using them as encoder
@@ -510,53 +552,47 @@ fn effective_video_size(
 /// instead of a copy of the first one's.
 fn assign_receiver_displays(
     resolved: &ResolvedSender,
-) -> Vec<Option<crate::monitors::DisplayMonitor>> {
+) -> Result<Vec<Option<crate::monitors::DisplayMonitor>>> {
     let receivers = &resolved.receivers;
     if !resolved.args.enable_virtual_display || receivers.is_empty() {
-        return receivers.iter().map(|_| None).collect();
+        return Ok(receivers.iter().map(|_| None).collect());
     }
 
     let targets = crate::monitors::ensure_bundled_virtual_display_count(receivers.len());
-    if targets.is_empty() {
-        log_sender("no bundled virtual display is capture-ready; receivers fall back to the default capture target");
-        return receivers.iter().map(|_| None).collect();
-    }
-    if targets.len() < receivers.len() {
-        log_sender(format!(
-            "only {} virtual display(s) for {} receiver(s); the remaining receivers share the last display",
-            targets.len(),
-            receivers.len()
-        ));
-    }
+    ensure_virtual_target_count(receivers.len(), targets.len())?;
 
-    receivers
-        .iter()
-        .enumerate()
-        .map(|(index, receiver)| {
-            let target = targets[index.min(targets.len() - 1)].clone();
-            if resolved.args.sync_virtual_display_resolution {
-                if let Err(error) =
-                    crate::monitors::sync_virtual_display_mode(&target, receiver.display.as_ref())
-                {
-                    log_sender(format!(
-                        "virtual display sync for {} failed: {error:#}",
+    let mut assignments = Vec::with_capacity(receivers.len());
+    for (receiver, target) in receivers.iter().zip(targets) {
+        if resolved.args.sync_virtual_display_resolution {
+            crate::monitors::sync_virtual_display_mode(&target, receiver.display.as_ref())
+                .with_context(|| {
+                    format!(
+                        "failed to sync virtual display for receiver {}",
                         receiver.host
-                    ));
-                }
-            }
-            log_sender(format!(
-                "receiver {} captures {}",
-                receiver.host, target.adapter_name
-            ));
-            Some(target)
-        })
-        .collect()
+                    )
+                })?;
+        }
+        log_sender(format!(
+            "receiver {} captures {}",
+            receiver.host, target.adapter_name
+        ));
+        assignments.push(Some(target));
+    }
+    Ok(assignments)
 }
 
-/// One video pipeline per receiver; a build failure only drops that receiver.
-fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Vec<PipelineHandle> {
-    let assignments = assign_receiver_displays(resolved);
-    let mut pipelines = Vec::new();
+fn ensure_virtual_target_count(required: usize, available: usize) -> Result<()> {
+    anyhow::ensure!(
+        available == required,
+        "bundled virtual displays are not capture-ready: required {required}, available {available}; refusing physical-display fallback"
+    );
+    Ok(())
+}
+
+/// Validate every receiver route before starting any pipeline.
+fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Result<Vec<PipelineHandle>> {
+    let assignments = assign_receiver_displays(resolved)?;
+    let mut descriptions = Vec::with_capacity(resolved.receivers.len());
     for (receiver, target) in resolved.receivers.iter().zip(assignments) {
         let mut receiver_args = resolved.args.clone();
         receiver_args.host = receiver.host.clone();
@@ -565,33 +601,36 @@ fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Vec<PipelineHand
             receiver_args.height,
             receiver.display.as_ref(),
         );
-        match pipeline::build_sender_video_pipeline_for(&receiver_args, target.as_ref()) {
-            Ok(description) => pipelines.push(pipeline::spawn_pipeline(description)),
-            Err(error) => log_sender(format!(
-                "sender video pipeline build failed for {}: {error:#}",
-                receiver.host
-            )),
-        }
+        let description =
+            pipeline::build_sender_video_pipeline_for(&receiver_args, target.as_ref())
+                .with_context(|| {
+                    format!(
+                        "failed to build sender video pipeline for {}",
+                        receiver.host
+                    )
+                })?;
+        descriptions.push(description);
     }
-    pipelines
+    anyhow::ensure!(
+        !descriptions.is_empty(),
+        "no receiver video pipelines were prepared"
+    );
+    Ok(descriptions
+        .into_iter()
+        .map(pipeline::spawn_pipeline)
+        .collect())
 }
 
-fn prepare_sender_environment(resolved: &ResolvedSender) -> bool {
-    let display_ready = !resolved.args.enable_virtual_display
-        || crate::monitors::ensure_bundled_virtual_display_ready();
-    if !display_ready {
-        crate::logging::append("bundled VDD was not capture-ready before sender start");
+fn prepare_sender_environment(resolved: &ResolvedSender) -> Result<()> {
+    if resolved.args.enable_virtual_display
+        && !crate::monitors::ensure_bundled_virtual_display_ready()
+    {
+        return Err(anyhow!(
+            "bundled VDD was not capture-ready before sender start"
+        ));
     }
 
-    if resolved.args.sync_virtual_display_resolution {
-        if let Err(error) =
-            crate::monitors::sync_preferred_virtual_display_mode(resolved.target_display.as_ref())
-        {
-            crate::logging::append(format!("virtual display resolution sync failed: {error:#}"));
-        }
-    }
-
-    display_ready
+    Ok(())
 }
 
 pub fn discover_receivers_with_pin(timeout: Duration, pin: &str) -> Result<Vec<DiscoveredPeer>> {
@@ -625,7 +664,10 @@ fn device_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_video_size, stable_unique_receivers, SenderPreparationState};
+    use super::{
+        effective_video_size, ensure_virtual_target_count, receiver_set_key,
+        stable_unique_receivers, ReceiverTarget, SenderPreparationState,
+    };
     use sm_core::discovery::{DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole};
     use std::net::Ipv4Addr;
 
@@ -633,13 +675,47 @@ mod tests {
     fn sender_environment_is_prepared_once_per_receiver_set() {
         let mut state = SenderPreparationState::default();
 
-        assert!(state.should_prepare("10.0.0.2:5004"));
-        assert!(!state.should_prepare("10.0.0.2:5004"));
-        assert!(state.should_prepare("10.0.0.3:5004"));
-        assert!(!state.should_prepare("10.0.0.3:5004"));
+        assert!(state.needs_prepare("10.0.0.2:5004@1366x768"));
+        // A failed attempt is not committed, so the same receiver remains retryable.
+        assert!(state.needs_prepare("10.0.0.2:5004@1366x768"));
+
+        state.mark_prepared("10.0.0.2:5004@1366x768");
+        assert!(!state.needs_prepare("10.0.0.2:5004@1366x768"));
+        assert!(state.needs_prepare("10.0.0.2:5004@1920x1080"));
+
+        state.mark_prepared("10.0.0.2:5004@1920x1080");
+        assert!(!state.needs_prepare("10.0.0.2:5004@1920x1080"));
 
         state.reset();
-        assert!(state.should_prepare("10.0.0.3:5004"));
+        assert!(state.needs_prepare("10.0.0.2:5004@1920x1080"));
+    }
+
+    #[test]
+    fn virtual_display_count_must_match_receivers_before_sending() {
+        assert!(ensure_virtual_target_count(1, 1).is_ok());
+        assert!(ensure_virtual_target_count(1, 0).is_err());
+        assert!(ensure_virtual_target_count(2, 1).is_err());
+        assert!(ensure_virtual_target_count(1, 2).is_err());
+    }
+
+    #[test]
+    fn receiver_key_changes_when_the_announced_display_mode_changes() {
+        let mut receivers = vec![ReceiverTarget {
+            host: "10.0.0.2:5004".to_string(),
+            display: Some(DisplayInfo {
+                width: 1366,
+                height: 768,
+                refresh_hz: Some(60),
+            }),
+        }];
+        let initial = receiver_set_key(&receivers);
+        receivers[0].display = Some(DisplayInfo {
+            width: 1920,
+            height: 1080,
+            refresh_hz: Some(60),
+        });
+
+        assert_ne!(initial, receiver_set_key(&receivers));
     }
 
     #[test]

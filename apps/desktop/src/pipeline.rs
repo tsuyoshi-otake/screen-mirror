@@ -474,6 +474,11 @@ pub fn build_sender_video_pipeline_for(
             }
             None => {
                 crate::logging::append("sender preferred virtual display: not found");
+                if args.enable_virtual_display {
+                    return Err(anyhow!(
+                        "bundled virtual display is enabled but no capture-ready virtual target was found; refusing physical-display fallback"
+                    ));
+                }
                 format!(
                     "d3d11screencapturesrc capture-api={} monitor-index={} show-cursor={}",
                     args.capture_api, args.monitor_index, show_cursor

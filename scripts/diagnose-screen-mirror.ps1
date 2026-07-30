@@ -105,6 +105,136 @@ function Read-Pin {
     "0000"
 }
 
+function Get-ConfigSectionValue([string] $Config, [string] $Section, [string] $Key) {
+    if ([string]::IsNullOrWhiteSpace($Config)) {
+        return $null
+    }
+
+    $inSection = $false
+    $valuePattern = '^\s*' + [regex]::Escape($Key) + '\s*=\s*([^#\r\n]+)'
+    foreach ($line in ($Config -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\[([^\]]+)\]\s*$') {
+            $inSection = $Matches[1] -eq $Section
+            continue
+        }
+        if ($inSection -and $line -match $valuePattern) {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return $null
+}
+
+function Get-RedactedConfigText([string] $Config) {
+    # Diagnostics still need the surrounding configuration, but the pairing PIN must never
+    # leave this machine in the report, clipboard, or Notepad copy.
+    $pinPattern = '(?m)^(\s*pin\s*=\s*)(?:"[^"]*"|''[^'']*''|[^\s#\r\n]+)(\s*(?:#.*)?)$'
+    return $Config -replace $pinPattern, '$1"<redacted>"$2'
+}
+
+function Get-SenderVirtualDisplayVerdict {
+    $config = if (Test-Path -LiteralPath $configPath) {
+        Get-Content -LiteralPath $configPath -Raw -ErrorAction SilentlyContinue
+    } else {
+        ""
+    }
+    $enableValue = Get-ConfigSectionValue $config "send" "enable_virtual_display"
+    $preferValue = Get-ConfigSectionValue $config "send" "prefer_virtual_display"
+    $monitorIndex = Get-ConfigSectionValue $config "send" "monitor_index"
+    # These sender options default to true/-1 in the application when omitted.
+    $vddEnabled = $enableValue -ne "false"
+    $preferVdd = $preferValue -ne "false"
+    if ([string]::IsNullOrWhiteSpace($monitorIndex)) {
+        $monitorIndex = "-1"
+    }
+
+    $logLines = if (Test-Path -LiteralPath $logPath) {
+        @(Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue)
+    } else {
+        @()
+    }
+    $senderLogLines = $logLines
+    $lastSupervisorStart = -1
+    for ($index = 0; $index -lt $logLines.Count; $index++) {
+        if ($logLines[$index] -match '^sender supervisor started;') {
+            $lastSupervisorStart = $index
+        }
+    }
+    if ($lastSupervisorStart -ge 0) {
+        $senderLogLines = @($logLines[$lastSupervisorStart..($logLines.Count - 1)])
+    }
+    $lastSenderSource = $senderLogLines |
+        Where-Object { $_ -match '^sender pipeline source:' } |
+        Select-Object -Last 1
+
+    $issuePatterns = @(
+        @{ Name = "VDD was not capture-ready before sender start"; Pattern = 'bundled VDD was not capture-ready before sender start' },
+        @{ Name = "sender fell back because no bundled VDD capture target was ready"; Pattern = 'no bundled virtual display is capture-ready; receivers fall back to the default capture target' },
+        @{ Name = "sender could not find its preferred virtual display"; Pattern = 'sender preferred virtual display: not found' },
+        @{ Name = "sender blocked physical-display fallback because its VDD target was missing"; Pattern = 'refusing physical-display fallback|no capture-ready virtual target was found' },
+        @{ Name = "VDD capture-target count did not match the receiver count"; Pattern = 'requested \d+ virtual displays but (?:only )?\d+ are capture-ready' },
+        @{ Name = "receiver mode sync failed"; Pattern = 'virtual display (?:resolution )?sync .*failed:|failed to sync virtual display|did not apply .* within \d+ms' },
+        @{ Name = "receiver mode is unsupported by the VDD"; Pattern = 'virtual display .* does not support .*(?:keeping current mode|DISP_CHANGE_BADMODE)' }
+    )
+    $recentIssues = New-Object System.Collections.Generic.List[string]
+    foreach ($issue in $issuePatterns) {
+        if (@($senderLogLines | Where-Object { $_ -match $issue.Pattern }).Count -gt 0) {
+            $recentIssues.Add($issue.Name) | Out-Null
+        }
+    }
+
+    # With the default monitor index, a sender source that contains no monitor handle is the
+    # physical/default-display branch. The virtual target branch always records a handle.
+    if ($vddEnabled -and $preferVdd -and $monitorIndex -eq "-1" -and $lastSenderSource -and
+        $lastSenderSource -match 'monitor-index=' -and $lastSenderSource -notmatch 'monitor-handle=') {
+        $recentIssues.Add("last sender pipeline used a monitor index instead of a VDD monitor handle") | Out-Null
+    }
+
+    $monitorOutput = Invoke-ScreenMirror @("monitors")
+    $monitorQueryAvailable = -not [string]::IsNullOrWhiteSpace($monitorOutput) -and
+        $monitorOutput -notmatch '^screen-mirror\.exe not found$'
+    $monitorLines = if ($monitorQueryAvailable) {
+        @($monitorOutput -split "`r?`n")
+    } else {
+        @()
+    }
+    # Current releases print the structured `capture-index=Some(...) bundled-vdd=true`
+    # summary. Older installed builds use the concise `[index] ... bundled-vdd` form;
+    # accept both so the diagnostic remains useful before a local update.
+    $bundledLines = @($monitorLines | Where-Object { $_ -match 'bundled-vdd(?:=true|(?:\s|$))' })
+    $captureReadyLines = @($bundledLines | Where-Object {
+        $_ -match 'capture-index=Some\(\d+\)' -or
+        $_ -match '^\[\d+\].*bundled-vdd(?:=true|(?:\s|$))'
+    })
+    $vddDevices = @(Get-BundledVddDevices)
+    $vddMonitors = @(Get-BundledVddMonitors)
+
+    $verdict = if (-not $vddEnabled) {
+        "NOT CONFIGURED - sender virtual-display setup is disabled."
+    } elseif ($recentIssues.Count -gt 0) {
+        "FAIL - configured sender VDD fallback or readiness issue was recorded in the recent log."
+    } elseif (-not $monitorQueryAvailable) {
+        "UNKNOWN - current VDD capture targets could not be queried."
+    } elseif ($captureReadyLines.Count -eq 0) {
+        "FAIL - sender VDD is configured, but no bundled virtual display is currently capture-ready."
+    } else {
+        "OK - configured sender VDD has a current capture-ready target."
+    }
+
+    [pscustomobject]@{
+        Verdict = $verdict
+        EnableVirtualDisplay = if ($null -eq $enableValue) { "true (default)" } else { $enableValue }
+        PreferVirtualDisplay = if ($null -eq $preferValue) { "true (default)" } else { $preferValue }
+        MonitorIndex = $monitorIndex
+        CurrentBundledVddTargets = if ($monitorQueryAvailable) { $bundledLines.Count } else { "UNKNOWN" }
+        CurrentCaptureReadyTargets = if ($monitorQueryAvailable) { $captureReadyLines.Count } else { "UNKNOWN" }
+        BundledVddDeviceNodes = $vddDevices.Count
+        BundledVddMonitorNodes = $vddMonitors.Count
+        LastSenderCaptureSource = if ($lastSenderSource) { $lastSenderSource } else { "(not recorded)" }
+        RecentVddWarnings = if ($recentIssues.Count -gt 0) { $recentIssues -join "; " } else { "(none in latest sender session / last 1000 log lines)" }
+    }
+}
+
 function Get-MonitorHandles {
     $source = @"
 using System;
@@ -660,7 +790,7 @@ Add-Line ("Script: {0}" -f $MyInvocation.MyCommand.Path)
 Add-Line ("Executable: {0}" -f $screenMirror)
 Add-Line ("Config: {0}" -f $configPath)
 Add-Line ("Report: {0}" -f $reportPath)
-Add-Line "Note: this report includes the raw Screen Mirror config, including the four-digit PIN."
+Add-Line "Note: the Screen Mirror pairing PIN is redacted from this report."
 
 Add-CommandOutput "Installed Package" {
     Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -859,6 +989,10 @@ Add-CommandOutput "Communication Health" {
     }
 }
 
+Add-CommandOutput "Sender Virtual Display Readiness" {
+    Get-SenderVirtualDisplayVerdict | Format-List
+}
+
 Add-CommandOutput "Bundled Runtime" {
     $appRoot = Split-Path -Parent $screenMirror
     $requiredFiles = @(
@@ -892,7 +1026,7 @@ Add-CommandOutput "Bundled Runtime" {
 Add-Section "Config"
 if (Test-Path -LiteralPath $configPath) {
     $configText = (Get-Content -LiteralPath $configPath -Raw).TrimEnd()
-    Add-Line $configText
+    Add-Line (Get-RedactedConfigText $configText)
 } else {
     Add-Line "Config file not found."
 }

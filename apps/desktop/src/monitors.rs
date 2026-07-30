@@ -21,6 +21,22 @@ pub struct DisplayMode {
     pub refresh_hz: Option<u32>,
 }
 
+const DISPLAY_MODE_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const DISPLAY_MODE_VERIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn display_mode_matches(
+    mode: &DisplayMode,
+    width: u32,
+    height: u32,
+    refresh_hz: Option<u32>,
+) -> bool {
+    mode.width == width
+        && mode.height == height
+        && refresh_hz
+            .map(|refresh_hz| mode.refresh_hz == Some(refresh_hz))
+            .unwrap_or(true)
+}
+
 pub fn print_monitors() {
     let monitors = enumerate_monitors();
     if monitors.is_empty() {
@@ -107,29 +123,6 @@ pub fn request_extended_desktop() {
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
     }
-}
-
-pub fn sync_preferred_virtual_display_mode(
-    display: Option<&sm_core::discovery::DisplayInfo>,
-) -> anyhow::Result<()> {
-    let Some(display) = display else {
-        return Ok(());
-    };
-    if display.width < 640 || display.height < 480 {
-        return Ok(());
-    }
-
-    let Some(monitor) = preferred_bundled_virtual_monitor() else {
-        crate::logging::append("no bundled virtual display found for receiver resolution sync");
-        return Ok(());
-    };
-
-    set_display_mode(
-        &monitor.adapter_name,
-        display.width,
-        display.height,
-        display.refresh_hz,
-    )
 }
 
 pub fn preferred_virtual_monitor_index() -> Option<i32> {
@@ -252,8 +245,9 @@ pub fn bundled_virtual_capture_targets() -> Vec<DisplayMonitor> {
 /// capture targets that actually materialised.
 pub fn ensure_bundled_virtual_display_count(count: usize) -> Vec<DisplayMonitor> {
     let count = count.clamp(1, 8);
-    if bundled_virtual_capture_targets().len() == count {
-        return bundled_virtual_capture_targets();
+    let current_targets = bundled_virtual_capture_targets();
+    if current_targets.len() == count {
+        return current_targets;
     }
 
     if let Err(error) = crate::vdd::request(crate::vdd::VddAction::SetCount, count as u32) {
@@ -261,19 +255,41 @@ pub fn ensure_bundled_virtual_display_count(count: usize) -> Vec<DisplayMonitor>
         return bundled_virtual_capture_targets();
     }
 
-    // The driver restart tears the monitors down and brings them back, so wait for the new set.
+    // The driver restart tears the monitors down and brings them back. Require the exact
+    // requested count twice in succession so a stale pre-restart enumeration cannot start a
+    // sender pipeline against monitor handles that are about to disappear. The new endpoints
+    // may initially be detached, so extend them once the exact endpoint set is visible.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut stable_samples = 0_u8;
+    let mut extended_exact_set = false;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if bundled_virtual_capture_targets().len() >= count {
-            break;
+        let targets = bundled_virtual_capture_targets();
+        if targets.len() == count {
+            stable_samples += 1;
+            if stable_samples >= 2 {
+                return targets;
+            }
+            continue;
+        }
+        stable_samples = 0;
+
+        let endpoint_count = enumerate_monitors()
+            .into_iter()
+            .filter(|monitor| monitor.bundled_virtual_display)
+            .count();
+        if endpoint_count == count && !extended_exact_set {
+            request_extended_desktop();
+            extended_exact_set = true;
+        } else if endpoint_count != count {
+            extended_exact_set = false;
         }
     }
 
     let targets = bundled_virtual_capture_targets();
-    if targets.len() < count {
+    if targets.len() != count {
         crate::logging::append(format!(
-            "requested {count} virtual displays but only {} are capture-ready",
+            "requested {count} virtual displays but {} are capture-ready",
             targets.len()
         ));
     }
@@ -376,12 +392,16 @@ fn set_display_mode(
         return Err(anyhow!("failed to read display mode for {device_name}"));
     }
 
-    if mode.dmPelsWidth == width
-        && mode.dmPelsHeight == height
-        && refresh_hz
-            .map(|refresh_hz| mode.dmDisplayFrequency == refresh_hz)
-            .unwrap_or(true)
-    {
+    if display_mode_matches(
+        &DisplayMode {
+            width: mode.dmPelsWidth,
+            height: mode.dmPelsHeight,
+            refresh_hz: (mode.dmDisplayFrequency > 1).then_some(mode.dmDisplayFrequency),
+        },
+        width,
+        height,
+        refresh_hz,
+    ) {
         return Ok(());
     }
 
@@ -393,7 +413,7 @@ fn set_display_mode(
         mode.dmDisplayFrequency = refresh_hz;
     }
 
-    let result = unsafe {
+    let mut result = unsafe {
         ChangeDisplaySettingsExW(
             wide_name.as_ptr(),
             &mode,
@@ -402,22 +422,57 @@ fn set_display_mode(
             std::ptr::null(),
         )
     };
+    let mut verified_refresh_hz = refresh_hz;
+    if result == DISP_CHANGE_BADMODE && refresh_hz.is_some() {
+        // Receiver panels commonly report fractional rates rounded to an integer (59/60 Hz).
+        // Resolution is the compatibility boundary; let Windows choose a supported refresh
+        // before declaring an otherwise valid receiver-sized mode unusable.
+        mode.dmFields &= !DM_DISPLAYFREQUENCY;
+        mode.dmDisplayFrequency = 0;
+        result = unsafe {
+            ChangeDisplaySettingsExW(
+                wide_name.as_ptr(),
+                &mode,
+                std::ptr::null_mut(),
+                CDS_UPDATEREGISTRY,
+                std::ptr::null(),
+            )
+        };
+        verified_refresh_hz = None;
+        if result == DISP_CHANGE_SUCCESSFUL {
+            crate::logging::append(format!(
+                "virtual display {device_name} accepted {width}x{height} using a driver-selected refresh rate"
+            ));
+        }
+    }
     if result != DISP_CHANGE_SUCCESSFUL {
         if result == DISP_CHANGE_BADMODE {
-            crate::logging::append(format!(
-                "virtual display {device_name} does not support {width}x{height}; keeping current mode"
+            return Err(anyhow!(
+                "virtual display {device_name} does not support {width}x{height}: DISP_CHANGE_BADMODE"
             ));
-            return Ok(());
         }
         return Err(anyhow!(
             "failed to set {device_name} to {width}x{height}: DISP_CHANGE={result}"
         ));
     }
 
-    crate::logging::append(format!(
-        "virtual display {device_name} synced to {width}x{height}"
-    ));
-    Ok(())
+    let deadline = std::time::Instant::now() + DISPLAY_MODE_VERIFY_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if current_display_mode(device_name).is_some_and(|current| {
+            display_mode_matches(&current, width, height, verified_refresh_hz)
+        }) {
+            crate::logging::append(format!(
+                "virtual display {device_name} synced to {width}x{height}"
+            ));
+            return Ok(());
+        }
+        std::thread::sleep(DISPLAY_MODE_VERIFY_INTERVAL);
+    }
+
+    Err(anyhow!(
+        "virtual display {device_name} did not apply {width}x{height} within {}ms",
+        DISPLAY_MODE_VERIFY_TIMEOUT.as_millis()
+    ))
 }
 
 #[cfg(not(windows))]
@@ -654,5 +709,19 @@ mod tests {
         assert!(!looks_like_bundled_virtual_display(
             "Virtual Display Driver"
         ));
+    }
+
+    #[test]
+    fn display_mode_matching_requires_dimensions_and_requested_refresh() {
+        let mode = DisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: Some(60),
+        };
+
+        assert!(display_mode_matches(&mode, 1920, 1080, None));
+        assert!(display_mode_matches(&mode, 1920, 1080, Some(60)));
+        assert!(!display_mode_matches(&mode, 2560, 1080, Some(60)));
+        assert!(!display_mode_matches(&mode, 1920, 1080, Some(30)));
     }
 }

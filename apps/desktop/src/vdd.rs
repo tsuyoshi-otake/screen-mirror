@@ -4,7 +4,7 @@
 //! the driver is installed, restarted and removed in-process, and the only thing we still need
 //! an external process for is the UAC prompt, which re-launches this same executable.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum VddAction {
@@ -72,13 +72,14 @@ fn write_monitor_count(count: u32) -> Result<bool> {
         })?;
     }
 
-    let settings =
-        std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let settings = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
     let updated = replace_monitor_count(&settings, count)?;
     if updated == settings {
         return Ok(false);
     }
-    std::fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(&path, updated)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     crate::logging::append(format!("virtual display count set to {count}"));
     Ok(true)
 }
@@ -126,11 +127,25 @@ fn replace_monitor_count(settings: &str, count: u32) -> Result<String> {
     Ok(updated)
 }
 
+/// SetupAPI can enumerate successfully while there is no bundled device left to operate on.
+/// Treat that as a failed lifecycle action: callers use these operations to make a VDD ready
+/// for capture, so a no-op must not look like success.
+fn require_affected_devices(action: &str, affected: usize) -> Result<()> {
+    if affected == 0 {
+        return Err(anyhow!(
+            "virtual display {action} did not affect any bundled device"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn settings_path() -> std::path::PathBuf {
     // Hard-coded in the driver; it never looks anywhere else.
     let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-    std::path::PathBuf::from(format!("{system_drive}\\VirtualDisplayDriver\\vdd_settings.xml"))
+    std::path::PathBuf::from(format!(
+        "{system_drive}\\VirtualDisplayDriver\\vdd_settings.xml"
+    ))
 }
 
 #[cfg(windows)]
@@ -149,6 +164,7 @@ fn bundled_driver_dir() -> Option<std::path::PathBuf> {
 
 #[cfg(windows)]
 mod win {
+    use super::require_affected_devices;
     use anyhow::{anyhow, Result};
     use std::ffi::c_void;
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -157,8 +173,8 @@ mod win {
         SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiSetClassInstallParamsW,
         SetupDiSetDeviceRegistryPropertyW, UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID,
         DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIF_REGISTERDEVICE,
-        DIF_REMOVE, DIGCF_ALLCLASSES, DIGCF_PRESENT, DI_REMOVEDEVICE_GLOBAL, INSTALLFLAG_FORCE,
-        HDEVINFO, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
+        DIF_REMOVE, DIGCF_ALLCLASSES, DIGCF_PRESENT, DI_REMOVEDEVICE_GLOBAL, HDEVINFO,
+        INSTALLFLAG_FORCE, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
         SP_REMOVEDEVICE_PARAMS,
     };
     use windows_sys::Win32::Foundation::HANDLE;
@@ -166,9 +182,11 @@ mod win {
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
+        GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
     };
-    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     pub const HARDWARE_ID: &str = "Root\\MttVDD";
@@ -220,7 +238,20 @@ mod win {
             }
             if !info.hProcess.is_null() {
                 WaitForSingleObject(info.hProcess, INFINITE);
+                let mut exit_code = 0_u32;
+                let exit_code_read = GetExitCodeProcess(info.hProcess, &mut exit_code);
                 windows_sys::Win32::Foundation::CloseHandle(info.hProcess);
+                if exit_code_read == 0 {
+                    return Err(anyhow!(
+                        "failed to read elevated virtual display action result: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                if exit_code != 0 {
+                    return Err(anyhow!(
+                        "elevated virtual display action failed with exit code {exit_code}"
+                    ));
+                }
             }
         }
         Ok(())
@@ -299,8 +330,8 @@ mod win {
         Ok(matched)
     }
 
-    pub fn device_count() -> usize {
-        for_each_device(|_, _| {}).unwrap_or(0)
+    pub fn device_count() -> Result<usize> {
+        for_each_device(|_, _| {})
     }
 
     fn change_state(state: u32) -> Result<usize> {
@@ -336,6 +367,7 @@ mod win {
     pub fn set_enabled(enabled: bool) -> Result<()> {
         let state = if enabled { DICS_ENABLE } else { DICS_DISABLE };
         let changed = change_state(state)?;
+        require_affected_devices(if enabled { "enable" } else { "disable" }, changed)?;
         crate::logging::append(format!(
             "virtual display devices {}: {changed}",
             if enabled { "enabled" } else { "disabled" }
@@ -345,8 +377,10 @@ mod win {
 
     pub fn restart() -> Result<()> {
         let disabled = change_state(DICS_DISABLE)?;
+        require_affected_devices("restart disable", disabled)?;
         std::thread::sleep(std::time::Duration::from_millis(750));
         let enabled = change_state(DICS_ENABLE)?;
+        require_affected_devices("restart enable", enabled)?;
         crate::logging::append(format!(
             "virtual display driver restarted (disabled {disabled}, enabled {enabled})"
         ));
@@ -506,7 +540,10 @@ fn elevate(action: VddAction, count: u32) -> Result<()> {
 fn install() -> Result<()> {
     use anyhow::anyhow;
 
-    if win::device_count() > 0 {
+    if win::device_count()? > 0 {
+        // A disabled root device still exists in SetupAPI. Install is also the readiness path,
+        // so make an existing device usable instead of treating its existence as success.
+        win::set_enabled(true)?;
         return Ok(());
     }
     let inf = bundled_driver_dir()
@@ -563,7 +600,7 @@ fn set_monitor_count(_count: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::replace_monitor_count;
+    use super::{replace_monitor_count, require_affected_devices};
 
     const SETTINGS: &str = "<vdd_settings>\n    <monitors>\n        <count>1</count>\n    </monitors>\n</vdd_settings>";
 
@@ -596,5 +633,18 @@ mod tests {
     #[test]
     fn settings_without_a_root_element_are_rejected() {
         assert!(replace_monitor_count("<other/>", 2).is_err());
+    }
+
+    #[test]
+    fn zero_affected_devices_is_an_actionable_failure() {
+        let error = require_affected_devices("enable", 0).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("did not affect any bundled device"));
+    }
+
+    #[test]
+    fn one_or_more_affected_devices_succeeds() {
+        assert!(require_affected_devices("restart enable", 1).is_ok());
     }
 }

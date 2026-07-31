@@ -1969,7 +1969,17 @@ pub fn has_element(name: &str) -> bool {
 }
 
 pub fn probe_elements() {
-    let elements = [
+    for (role, name) in probed_elements() {
+        crate::console::line(format!(
+            "{role:12} {name:24} {}",
+            if has_element(name) { "yes" } else { "no" }
+        ));
+    }
+}
+
+/// What `probe` reports on, in the order a reader scans it.
+fn probed_elements() -> Vec<(&'static str, &'static str)> {
+    let mut elements = vec![
         ("capture", "d3d11screencapturesrc"),
         ("gpu encode", "nvd3d11h264enc"),
         ("amf encode", "amfh264enc"),
@@ -1987,17 +1997,14 @@ pub fn probe_elements() {
         ("d3d12 decode", "d3d12h264dec"),
         ("gpu decode", "d3d11h264dec"),
         ("qsv decode", "qsvh264dec"),
-        ("cpu decode", "avdec_h264"),
-        ("d3d12 sink", "d3d12videosink"),
-        ("gpu sink", "d3d11videosink"),
     ];
-
-    for (role, name) in elements {
-        crate::console::line(format!(
-            "{role:12} {name:24} {}",
-            if has_element(name) { "yes" } else { "no" }
-        ));
-    }
+    // Every software decoder the receiver would actually try, in the order it tries them. Naming one
+    // by hand reported "cpu decode: no" on a machine whose bundled openh264 decoder was present and
+    // working, which reads as "this build cannot decode without a GPU" when the opposite is true.
+    elements.extend(SOFTWARE_H264_DECODERS.map(|name| ("cpu decode", name)));
+    elements.push(("d3d12 sink", "d3d12videosink"));
+    elements.push(("gpu sink", "d3d11videosink"));
+    elements
 }
 
 fn ensure_positive(name: &str, value: u32) -> Result<()> {
@@ -2086,6 +2093,18 @@ fn gst_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_reports_on_every_decoder_the_receiver_can_fall_back_to() {
+        let probed = probed_elements();
+
+        for decoder in SOFTWARE_H264_DECODERS {
+            assert!(
+                probed.contains(&("cpu decode", decoder)),
+                "probe never mentions {decoder}, so a build that ships it looks like it cannot decode on the CPU"
+            );
+        }
+    }
 
     fn h264_nal_types_from_rtp(packet: &[u8]) -> Vec<u8> {
         if packet.len() < 12 || packet[0] >> 6 != 2 {

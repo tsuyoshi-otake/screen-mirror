@@ -39,6 +39,30 @@ function Add-Line([string] $Line = "") {
     $script:lines.Add($Line) | Out-Null
 }
 
+# Every log line the application writes begins with this stamp; builds before it wrote the bare
+# message.
+$script:logStampPattern = '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} '
+
+# The same anchor for the few places that keep whole lines because they print the timestamp.
+$script:logMessageAnchor = '^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} )?'
+
+# The log tail with the timestamp stripped off each line.
+#
+# Every verdict in this script anchors its patterns with ^ against the message, so reading the file
+# raw made all of them blind to any line a current build wrote - they could only ever match the
+# pre-timestamp lines still sitting in the tail. A real report claimed the last sender route was a
+# zero-copy NVIDIA one while the log's newest route, six minutes newer and timestamped, had fallen
+# back to system memory. Stripping the stamp once, here, is what makes a pattern mean the same thing
+# whichever build wrote the line. The Recent Log section still prints the file verbatim, which is
+# where the question of *when* something happened is answered.
+function Get-LogMessageTail([int] $Tail) {
+    if (-not (Test-Path -LiteralPath $logPath)) {
+        return @()
+    }
+    return @(Get-Content -LiteralPath $logPath -Tail $Tail -ErrorAction SilentlyContinue |
+        ForEach-Object { $_ -replace $script:logStampPattern, "" })
+}
+
 function Add-Section([string] $Title) {
     Add-Line ""
     Add-Line ("==== {0} ====" -f $Title)
@@ -148,11 +172,7 @@ function Get-SenderVirtualDisplayVerdict {
         $monitorIndex = "-1"
     }
 
-    $logLines = if (Test-Path -LiteralPath $logPath) {
-        @(Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue)
-    } else {
-        @()
-    }
+    $logLines = Get-LogMessageTail 1000
     $senderLogLines = $logLines
     $lastSupervisorStart = -1
     for ($index = 0; $index -lt $logLines.Count; $index++) {
@@ -419,11 +439,7 @@ function Test-VideoDecodeGpuEngine([string] $Engine) {
 }
 
 function Get-ReceiverPlaybackRoute {
-    $logLines = if (Test-Path -LiteralPath $logPath) {
-        @(Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue)
-    } else {
-        @()
-    }
+    $logLines = Get-LogMessageTail 1000
     $adapterLine = $logLines |
         Where-Object { $_ -match "^receiver GPU selected:" } |
         Select-Object -Last 1
@@ -609,11 +625,7 @@ function Get-GpuAccelerationVerdict {
         }
     }
 
-    $logLines = if (Test-Path -LiteralPath $logPath) {
-        @(Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue)
-    } else {
-        @()
-    }
+    $logLines = Get-LogMessageTail 1000
     # A capture-GPU mismatch belongs to one pipeline start, so it is only reported when it was
     # logged for the newest route; an older mismatch would otherwise keep flagging a route that
     # has since been fixed.
@@ -854,13 +866,9 @@ function Get-ScreenMirrorResourceSummary {
     } else {
         "UNAVAILABLE"
     }
-    $latestRuntimeRoute = if (Test-Path -LiteralPath $logPath) {
-        Get-Content -LiteralPath $logPath -Tail 1000 -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match "^receiver runtime decoder=" } |
-            Select-Object -Last 1
-    } else {
-        $null
-    }
+    $latestRuntimeRoute = Get-LogMessageTail 1000 |
+        Where-Object { $_ -match "^receiver runtime decoder=" } |
+        Select-Object -Last 1
     $gpuCounterInterpretation = if (
         $script:gpuEngineSampleSucceeded -and
         $gpuPeak -eq 0 -and
@@ -1155,7 +1163,7 @@ Add-CommandOutput "Update State" {
     # clock can sit on an old build. Show what the updater actually decided.
     $updaterLines = if (Test-Path -LiteralPath $logPath) {
         @(Get-Content -LiteralPath $logPath -Tail 2000 -ErrorAction SilentlyContinue |
-            Where-Object { $_ -match '^(?:background|manual) update' })
+            Where-Object { $_ -match ($script:logMessageAnchor + '(?:background|manual) update') })
     } else {
         @()
     }

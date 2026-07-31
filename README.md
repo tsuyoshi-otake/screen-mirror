@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.58`.
+The desktop and Android package versions for this release are `0.1.59`.
 
 ## Transport Model
 
@@ -55,6 +55,8 @@ Tray actions:
 - `Run Peer Diagnostics`: discovers a sender with the same PIN, requests its debug report, copies it to the clipboard, and opens it in Notepad
 - `Install/Repair Virtual Display Driver`: installs the bundled VDD driver without creating duplicates when it already exists
 - `Show/Enable/Disable/Remove All Bundled Virtual Displays`: manages bundled MTT VDD display devices and monitors. Install/Enable does not request Windows extended desktop; sender mode requests it only after a matching receiver is found.
+- `Capture Frame Rate`: sets the sender's capture rate; restarts an active sender
+- `Scaling Filter`: sets the texture filter the receiver's video sink scales with; restarts an active receiver
 - `Sender GPU` / `Receiver GPU`: pins encoding (sender) and decoding/rendering (receiver) to one GPU. Only shown when the machine has more than one GPU.
 - `Open Display Settings`: opens Windows display settings
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`

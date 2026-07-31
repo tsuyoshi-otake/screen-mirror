@@ -125,7 +125,10 @@ mod tests {
     fn a_line_is_one_buffer_ending_in_one_newline() {
         let line = log_line("2026-07-31 20:03:14.510", "receiver GPU selected: index=0");
 
-        assert_eq!(line, "2026-07-31 20:03:14.510 receiver GPU selected: index=0\n");
+        assert_eq!(
+            line,
+            "2026-07-31 20:03:14.510 receiver GPU selected: index=0\n"
+        );
         assert_eq!(line.matches('\n').count(), 1);
     }
 

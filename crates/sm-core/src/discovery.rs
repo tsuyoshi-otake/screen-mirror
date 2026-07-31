@@ -554,9 +554,8 @@ mod tests {
 
     #[test]
     fn only_interfaces_that_have_a_broadcast_address_get_announced_to() {
-        let broadcast = |ip: [u8; 4], mask: [u8; 4]| {
-            subnet_broadcast(Ipv4Addr::from(ip), Ipv4Addr::from(mask))
-        };
+        let broadcast =
+            |ip: [u8; 4], mask: [u8; 4]| subnet_broadcast(Ipv4Addr::from(ip), Ipv4Addr::from(mask));
 
         assert_eq!(
             broadcast([10, 255, 10, 144], [255, 255, 255, 0]),

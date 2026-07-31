@@ -268,13 +268,36 @@ pub fn bind_probe_responder_socket() -> Result<UdpSocket> {
     Ok(socket)
 }
 
+/// Announces this peer on every interface, including when one of them refuses the packet.
+///
+/// A desktop with WSL, Hyper-V, VMware, or a VPN tunnel installed has broadcast addresses that lead
+/// nowhere, and sending to them fails on every attempt. Stopping at the first failure hid this peer
+/// from the real network entirely whenever a dead adapter happened to be enumerated first, so each
+/// address is attempted on its own and only a round that reached nothing at all is an error.
 pub fn broadcast(socket: &UdpSocket, announcement: &PeerAnnouncement) -> Result<()> {
     let bytes = announcement.encode()?;
-    for address in broadcast_addresses()? {
-        socket
-            .send_to(&bytes, SocketAddrV4::new(address, DISCOVERY_PORT))
-            .with_context(|| format!("failed to broadcast discovery packet to {address}"))?;
-    }
+    let addresses = broadcast_addresses()?;
+    let failures = addresses
+        .iter()
+        .filter_map(|address| {
+            socket
+                .send_to(&bytes, SocketAddrV4::new(*address, DISCOVERY_PORT))
+                .err()
+                .map(|error| format!("{address}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    broadcast_outcome(addresses.len(), &failures)
+}
+
+/// A round that reached at least one interface has announced this peer, so it is not a failure.
+/// Reporting only a round that reached nothing also keeps a permanently dead virtual adapter from
+/// filling the log with a line every second and burying the events worth reading.
+fn broadcast_outcome(attempted: usize, failures: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        attempted > 0 && failures.len() < attempted,
+        "failed to broadcast discovery packet to any interface ({})",
+        failures.join("; ")
+    );
     Ok(())
 }
 
@@ -288,9 +311,9 @@ pub fn broadcast_addresses() -> Result<Vec<Ipv4Addr>> {
         if ip.is_loopback() || ip.octets()[0] == 169 {
             continue;
         }
-        let ip_u32 = u32::from(ip);
-        let mask_u32 = u32::from(ipv4.netmask);
-        let broadcast = Ipv4Addr::from(ip_u32 | !mask_u32);
+        let Some(broadcast) = subnet_broadcast(ip, ipv4.netmask) else {
+            continue;
+        };
         if !addresses.contains(&broadcast) {
             addresses.push(broadcast);
         }
@@ -301,6 +324,25 @@ pub fn broadcast_addresses() -> Result<Vec<Ipv4Addr>> {
     }
 
     Ok(addresses)
+}
+
+/// The directed broadcast address of an interface's subnet, or nothing when the interface does not
+/// describe one.
+///
+/// Virtual and tunnel adapters report addresses that no broadcast follows from - a multicast address
+/// is the one seen in the wild, arriving here as a doomed send to 224.255.255.255 once per
+/// announcement round. A `/31` and a `/32` have no broadcast address either, so they are skipped
+/// rather than turned into a packet addressed to the interface itself.
+fn subnet_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Ipv4Addr> {
+    if ip.is_multicast() || ip.is_broadcast() || ip.is_unspecified() {
+        return None;
+    }
+    let host_bits = !u32::from(netmask);
+    if host_bits < 2 {
+        return None;
+    }
+    let broadcast = Ipv4Addr::from(u32::from(ip) | host_bits);
+    (!broadcast.is_multicast()).then_some(broadcast)
 }
 
 pub fn discover_receivers(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
@@ -505,10 +547,54 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_probe_subnet, fit_within, DiscoveryProbe, DisplayInfo, PeerAnnouncement, PeerRole,
-        DISCOVERY_PROBE_PORT,
+        append_probe_subnet, broadcast_outcome, fit_within, subnet_broadcast, DiscoveryProbe,
+        DisplayInfo, PeerAnnouncement, PeerRole, DISCOVERY_PROBE_PORT,
     };
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn only_interfaces_that_have_a_broadcast_address_get_announced_to() {
+        let broadcast = |ip: [u8; 4], mask: [u8; 4]| {
+            subnet_broadcast(Ipv4Addr::from(ip), Ipv4Addr::from(mask))
+        };
+
+        assert_eq!(
+            broadcast([10, 255, 10, 144], [255, 255, 255, 0]),
+            Some(Ipv4Addr::new(10, 255, 10, 255))
+        );
+        assert_eq!(
+            broadcast([172, 16, 0, 2], [255, 255, 0, 0]),
+            Some(Ipv4Addr::new(172, 16, 255, 255))
+        );
+        // The doomed send this machine logged once a second.
+        assert_eq!(broadcast([224, 0, 0, 251], [255, 0, 0, 0]), None);
+        // A point-to-point tunnel has no subnet to broadcast into.
+        assert_eq!(broadcast([10, 8, 0, 6], [255, 255, 255, 254]), None);
+        assert_eq!(broadcast([10, 8, 0, 6], [255, 255, 255, 255]), None);
+    }
+
+    #[test]
+    fn a_dead_virtual_adapter_does_not_hide_this_peer_from_the_real_network() {
+        let dead = ["172.30.224.255: network is unreachable".to_string()];
+
+        assert!(broadcast_outcome(3, &dead).is_ok());
+        assert!(broadcast_outcome(1, &dead).is_err());
+        assert!(broadcast_outcome(0, &[]).is_err());
+        assert!(broadcast_outcome(2, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_round_that_reached_nothing_names_every_interface_it_tried() {
+        let failures = [
+            "172.30.224.255: network is unreachable".to_string(),
+            "192.168.75.255: host is unreachable".to_string(),
+        ];
+
+        let error = broadcast_outcome(2, &failures).unwrap_err().to_string();
+
+        assert!(error.contains("172.30.224.255"), "{error}");
+        assert!(error.contains("192.168.75.255"), "{error}");
+    }
 
     #[test]
     fn discovery_probe_round_trips_and_filters_role_and_pin() {

@@ -4,7 +4,9 @@ use gst::prelude::*;
 use gstreamer as gst;
 use sm_core::discovery::DEFAULT_PIN;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,12 @@ const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(1);
 const RECEIVER_PACKET_TIMEOUT: Duration = Duration::from_secs(8);
 const RECEIVER_VIDEO_DECODER_NAME: &str = "receiver_video_decoder";
 const RECEIVER_VIDEO_SINK_NAME: &str = "receiver_video_sink";
+const RECEIVER_VIDEO_JITTER_NAME: &str = "receiver_video_jitter";
+/// How often the receiver records what the stream is actually doing.
+///
+/// Long enough that one slow frame does not read as a collapse, short enough that a stutter the user
+/// noticed is inside the window they will point at in the log.
+const RECEIVER_STREAM_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Args, Clone, Debug)]
 pub struct SendArgs {
@@ -851,7 +859,7 @@ fn receiver_video_pipeline(args: &RecvArgs, route: &ReceiverVideoRoute) -> Resul
 
     Ok(format!(
         "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
-         ! rtpjitterbuffer latency={} drop-on-latency=true do-lost=true faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
+         ! rtpjitterbuffer name={RECEIVER_VIDEO_JITTER_NAME} latency={} drop-on-latency=true do-lost=true faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
          ! rtph264depay wait-for-keyframe=true \
          ! h264parse disable-passthrough=true \
          ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 \
@@ -989,6 +997,7 @@ fn run_pipeline_until_stop(description: &str, stop_rx: &mpsc::Receiver<()>) -> R
         .set_state(gst::State::Playing)
         .context("failed to set pipeline to Playing")?;
     let mut key_unit_requester = SenderKeyUnitRequester::attach(&pipeline);
+    let mut stream_report = ReceiverStreamReport::attach(&pipeline, Instant::now());
     let mut receiver_runtime_logged = pipeline
         .by_name(RECEIVER_VIDEO_DECODER_NAME)
         .is_some()
@@ -1001,6 +1010,10 @@ fn run_pipeline_until_stop(description: &str, stop_rx: &mpsc::Receiver<()>) -> R
 
         if let Some(requester) = key_unit_requester.as_mut() {
             requester.request_if_due(Instant::now());
+        }
+
+        if let Some(report) = stream_report.as_mut() {
+            report.report_if_due(Instant::now());
         }
 
         if let Some(logged) = receiver_runtime_logged.as_mut() {
@@ -1059,6 +1072,143 @@ fn run_pipeline_until_stop(description: &str, stop_rx: &mpsc::Receiver<()>) -> R
         .context("failed to stop pipeline")?;
 
     result
+}
+
+/// Records how many frames the receiver decoded and how many of them reached the screen.
+///
+/// "The framerate is low" has three different causes that look identical on screen, and telling them
+/// apart by inspection is guesswork: the sender may never have sent 30 frames, the decoder may not
+/// keep up with them, or frames may be decoded and then dropped before they are drawn. Each of those
+/// wants an opposite fix, so the receiver counts all three and the RTP packets the jitter buffer
+/// discarded, which is what says whether the frames that never arrived were late rather than absent.
+struct ReceiverStreamReport {
+    decoded: Option<Arc<AtomicU64>>,
+    displayed: Arc<AtomicU64>,
+    jitter: Option<gst::Element>,
+    jitter_total: JitterCounts,
+    window_started: Instant,
+}
+
+impl ReceiverStreamReport {
+    /// Attaches to a receiver pipeline, and to nothing else: a sender has no video sink to count at.
+    fn attach(pipeline: &gst::Pipeline, now: Instant) -> Option<Self> {
+        let sink = pipeline.by_name(RECEIVER_VIDEO_SINK_NAME)?;
+        let displayed = count_buffers_on(&sink, "sink")?;
+        // `decodebin` exposes no static source pad, so its frames are counted at the sink only.
+        let decoded = pipeline
+            .by_name(RECEIVER_VIDEO_DECODER_NAME)
+            .and_then(|decoder| count_buffers_on(&decoder, "src"));
+        let jitter = pipeline
+            .by_name(RECEIVER_VIDEO_JITTER_NAME)
+            .filter(|jitter| jitter.find_property("stats").is_some());
+        let jitter_total = jitter.as_ref().map(jitter_counts).unwrap_or_default();
+        Some(Self {
+            decoded,
+            displayed,
+            jitter,
+            jitter_total,
+            window_started: now,
+        })
+    }
+
+    fn report_if_due(&mut self, now: Instant) {
+        let window = now.duration_since(self.window_started);
+        if window < RECEIVER_STREAM_REPORT_INTERVAL {
+            return;
+        }
+        self.window_started = now;
+
+        let jitter = self.jitter.as_ref().map(jitter_counts);
+        let since_last_report = jitter.map(|counts| counts.since(self.jitter_total));
+        if let Some(counts) = jitter {
+            self.jitter_total = counts;
+        }
+
+        crate::logging::append(stream_report_line(
+            window,
+            take_count(&self.displayed),
+            self.decoded.as_ref().map(take_count),
+            since_last_report,
+        ));
+    }
+}
+
+fn count_buffers_on(element: &gst::Element, pad: &str) -> Option<Arc<AtomicU64>> {
+    let pad = element.static_pad(pad)?;
+    let count = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&count);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        gst::PadProbeReturn::Ok
+    })?;
+    Some(count)
+}
+
+fn take_count(count: &Arc<AtomicU64>) -> u64 {
+    count.swap(0, Ordering::Relaxed)
+}
+
+/// RTP packet counters, which `rtpjitterbuffer` reports as running totals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct JitterCounts {
+    pushed: u64,
+    lost: u64,
+    late: u64,
+    duplicates: u64,
+}
+
+impl JitterCounts {
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            pushed: self.pushed.saturating_sub(earlier.pushed),
+            lost: self.lost.saturating_sub(earlier.lost),
+            late: self.late.saturating_sub(earlier.late),
+            duplicates: self.duplicates.saturating_sub(earlier.duplicates),
+        }
+    }
+}
+
+fn jitter_counts(jitter: &gst::Element) -> JitterCounts {
+    let Ok(stats) = jitter.property_value("stats").get::<gst::Structure>() else {
+        return JitterCounts::default();
+    };
+    let count = |field| stats.get::<u64>(field).unwrap_or_default();
+    JitterCounts {
+        pushed: count("num-pushed"),
+        lost: count("num-lost"),
+        late: count("num-late"),
+        duplicates: count("num-duplicates"),
+    }
+}
+
+/// Frame counts are reported as both a count and a rate: the rate is what the user is describing,
+/// and the count is what stays meaningful when a report window is stretched by a stalled pipeline.
+fn stream_report_line(
+    window: Duration,
+    displayed: u64,
+    decoded: Option<u64>,
+    jitter: Option<JitterCounts>,
+) -> String {
+    let seconds = window.as_secs_f64();
+    let rate = |count: u64| {
+        if seconds > 0.0 {
+            format!("{:.1} fps", count as f64 / seconds)
+        } else {
+            "no window".to_string()
+        }
+    };
+    let mut line = format!("receiver stream {seconds:.1}s:");
+    if let Some(decoded) = decoded {
+        line.push_str(&format!(" decoded={decoded} ({})", rate(decoded)));
+    }
+    line.push_str(&format!(" displayed={displayed} ({})", rate(displayed)));
+    if let Some(jitter) = jitter {
+        line.push_str(&format!(
+            " rtp pushed={} lost={} late={} duplicates={}",
+            jitter.pushed, jitter.lost, jitter.late, jitter.duplicates
+        ));
+    }
+    line
 }
 
 fn arm_receiver_timeout_after_first_packet(pipeline: &gst::Pipeline) {
@@ -2216,6 +2366,76 @@ mod tests {
         assert!(gpu_nv12 < download);
         assert!(download < system_nv12);
         assert!(!caps.contains("videoconvert"));
+    }
+
+    #[test]
+    fn a_stream_report_separates_frames_that_never_arrived_from_frames_that_were_dropped() {
+        let line = stream_report_line(
+            Duration::from_secs(5),
+            35,
+            Some(70),
+            Some(JitterCounts {
+                pushed: 3489,
+                lost: 12,
+                late: 4,
+                duplicates: 0,
+            }),
+        );
+
+        assert_eq!(
+            line,
+            "receiver stream 5.0s: decoded=70 (14.0 fps) displayed=35 (7.0 fps) \
+             rtp pushed=3489 lost=12 late=4 duplicates=0"
+        );
+    }
+
+    #[test]
+    fn a_stream_report_still_names_a_rate_when_the_decoder_cannot_be_counted() {
+        let line = stream_report_line(Duration::from_millis(5_000), 150, None, None);
+
+        assert_eq!(line, "receiver stream 5.0s: displayed=150 (30.0 fps)");
+    }
+
+    /// The jitter buffer reports running totals, so a report window has to subtract the last one.
+    /// Reporting the totals instead made every window look worse than the one before it.
+    #[test]
+    fn jitter_counts_report_the_window_and_not_the_session() {
+        let earlier = JitterCounts {
+            pushed: 1_000,
+            lost: 5,
+            late: 2,
+            duplicates: 1,
+        };
+        let now = JitterCounts {
+            pushed: 4_500,
+            lost: 5,
+            late: 9,
+            duplicates: 1,
+        };
+
+        assert_eq!(
+            now.since(earlier),
+            JitterCounts {
+                pushed: 3_500,
+                lost: 0,
+                late: 7,
+                duplicates: 0,
+            }
+        );
+    }
+
+    /// A restarted jitter buffer resets its totals, and a window that spans the restart must not
+    /// wrap into billions of packets.
+    #[test]
+    fn jitter_counts_that_went_backwards_report_nothing_rather_than_wrapping() {
+        let after_reset = JitterCounts::default().since(JitterCounts {
+            pushed: 4_500,
+            lost: 5,
+            late: 9,
+            duplicates: 1,
+        });
+
+        assert_eq!(after_reset, JitterCounts::default());
     }
 
     #[test]

@@ -13,7 +13,17 @@ pub fn append(message: impl AsRef<str>) {
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
-    let _ = writeln!(file, "{} {}", timestamp(), message.as_ref());
+    let _ = file.write_all(log_line(&timestamp(), message.as_ref()).as_bytes());
+}
+
+/// One line, built whole before it is written.
+///
+/// `writeln!` writes each piece of its format string separately, and the sender, the receiver, and
+/// the update checker all append to this file from different threads and processes - two of them
+/// mid-line produced `19:59:38.2461959:38.246 receiver...receiver...`. A single write of a single
+/// buffer is what makes an append atomic, so the line is assembled first.
+fn log_line(timestamp: &str, message: &str) -> String {
+    format!("{timestamp} {message}\n")
 }
 
 /// This log exists to answer what the stream was doing when the user noticed it stutter, and an
@@ -109,7 +119,15 @@ fn civil_from_days(days: i64) -> (u16, u16, u16) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_timestamp, timestamp, WallClock};
+    use super::{format_timestamp, log_line, timestamp, WallClock};
+
+    #[test]
+    fn a_line_is_one_buffer_ending_in_one_newline() {
+        let line = log_line("2026-07-31 20:03:14.510", "receiver GPU selected: index=0");
+
+        assert_eq!(line, "2026-07-31 20:03:14.510 receiver GPU selected: index=0\n");
+        assert_eq!(line.matches('\n').count(), 1);
+    }
 
     #[test]
     fn a_timestamp_is_fixed_width_so_lines_stay_aligned_and_sort_by_time() {

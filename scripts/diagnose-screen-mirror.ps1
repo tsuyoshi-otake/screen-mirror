@@ -231,6 +231,14 @@ function Get-SenderVirtualDisplayVerdict {
     })
     $vddDevices = @(Get-BundledVddDevices)
     $vddMonitors = @(Get-BundledVddMonitors)
+    # Each driver restart hands the desktop a fresh generation of monitor children, and the previous
+    # generation stays in the registry as a node Windows lists but cannot see. The application prunes
+    # these itself now; counting them here is how that pruning is observable, and a count that keeps
+    # climbing across sessions means it is not running or not permitted to.
+    $staleVddMonitors = @($vddMonitors | Where-Object { $_.Status -ne "OK" })
+    $lastPrune = $logLines |
+        Where-Object { $_ -match '^stale virtual display monitor nodes (?:pruned|could not be pruned)' } |
+        Select-Object -Last 1
     # A bundled endpoint Windows left off the desktop is the state direct attach exists to repair,
     # so report it separately from "no endpoint at all".
     $detachedLines = @($bundledLines | Where-Object { $_ -match 'attached=false' -or $_ -match '\sdetached(?:\s|$)' })
@@ -266,6 +274,8 @@ function Get-SenderVirtualDisplayVerdict {
         CurrentCaptureReadyTargets = if ($monitorQueryAvailable) { $captureReadyLines.Count } else { "UNKNOWN" }
         BundledVddDeviceNodes = $vddDevices.Count
         BundledVddMonitorNodes = $vddMonitors.Count
+        StaleBundledVddMonitorNodes = $staleVddMonitors.Count
+        LastMonitorNodePrune = if ($lastPrune) { $lastPrune } else { "(none in last 1000 log lines)" }
         DetachedBundledVddTargets = if ($monitorQueryAvailable) { $detachedLines.Count } else { "UNKNOWN" }
         LastDesktopAttachAttempt = if ($attachLine) { $attachLine } else { "(none in latest sender session)" }
         SenderStartFailures = $prepareFailures

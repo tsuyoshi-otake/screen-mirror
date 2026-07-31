@@ -18,6 +18,8 @@ pub enum VddAction {
     Enable,
     /// Disable the installed devices without removing them.
     Disable,
+    /// Delete the monitor nodes the driver left behind. Runs by itself; this is the manual handle.
+    Prune,
 }
 
 /// Runs an action, elevating through a hidden child process when we are not already admin.
@@ -36,6 +38,7 @@ pub fn apply(action: VddAction, count: u32) -> Result<()> {
         VddAction::Remove => remove(),
         VddAction::Enable => set_enabled(true),
         VddAction::Disable => set_enabled(false),
+        VddAction::Prune => prune_stale_monitors().map(|_| ()),
     }
 }
 
@@ -44,10 +47,27 @@ fn set_monitor_count(count: u32) -> Result<()> {
     let changed = write_monitor_count(count.clamp(1, 8))?;
     install()?;
     if changed {
+        // Collect earlier generations while the live monitors are still present, so pruning cannot
+        // reach a node the desktop is using. The set this restart is about to orphan is caught by
+        // the next start or by the removal at session end.
+        prune_quietly();
         // The driver reads vdd_settings.xml once at start, so the new count needs a restart.
         restart()?;
     }
     Ok(())
+}
+
+/// Prunes leftover nodes without letting that failure sink the lifecycle action around it.
+///
+/// Pruning is housekeeping: a machine whose registry cannot be tidied should still get its
+/// virtual display. The reason lands in the log either way.
+#[cfg(windows)]
+fn prune_quietly() {
+    if let Err(error) = prune_stale_monitors() {
+        crate::logging::append(format!(
+            "stale virtual display monitor nodes could not be pruned: {error:#}"
+        ));
+    }
 }
 
 /// Rewrites `<monitors><count>` in the settings file the driver reads, returning whether it moved.
@@ -170,7 +190,8 @@ mod win {
     use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
         SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-        SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW, SetupDiSetClassInstallParamsW,
+        SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
+        SetupDiSetClassInstallParamsW,
         SetupDiSetDeviceRegistryPropertyW, UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID,
         DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIF_REGISTERDEVICE,
         DIF_REMOVE, DIGCF_ALLCLASSES, DIGCF_PRESENT, DI_REMOVEDEVICE_GLOBAL, HDEVINFO,
@@ -265,25 +286,76 @@ mod win {
         }
     }
 
-    fn present_devices() -> Result<DeviceInfoList> {
+    /// Every device on one enumerator, either all of them or only the ones Windows can see now.
+    ///
+    /// Leaving out `DIGCF_PRESENT` is what makes the leftover nodes visible at all: a monitor the
+    /// driver has torn down keeps its registry node and is reported by nothing else.
+    fn device_list(enumerator: &str, present_only: bool) -> Result<DeviceInfoList> {
         // SetupAPI reports failure as an invalid handle, which windows-sys models as a bare isize.
         const INVALID_DEVICE_LIST: HDEVINFO = -1;
-        let enumerator = to_wide("ROOT");
+        let wide = to_wide(enumerator);
+        let mut flags = DIGCF_ALLCLASSES;
+        if present_only {
+            flags |= DIGCF_PRESENT;
+        }
         let handle = unsafe {
             SetupDiGetClassDevsW(
                 std::ptr::null(),
-                enumerator.as_ptr(),
+                wide.as_ptr(),
                 std::ptr::null_mut(),
-                DIGCF_PRESENT | DIGCF_ALLCLASSES,
+                flags,
             )
         };
         if handle == INVALID_DEVICE_LIST {
             return Err(anyhow!(
-                "failed to enumerate root devices: {}",
+                "failed to enumerate {enumerator} devices: {}",
                 std::io::Error::last_os_error()
             ));
         }
         Ok(DeviceInfoList(handle))
+    }
+
+    fn present_devices() -> Result<DeviceInfoList> {
+        device_list("ROOT", true)
+    }
+
+    fn instance_id(list: HDEVINFO, device: &mut SP_DEVINFO_DATA) -> Option<String> {
+        let mut buffer = [0_u16; 512];
+        let mut required = 0_u32;
+        let ok = unsafe {
+            SetupDiGetDeviceInstanceIdW(
+                list,
+                device,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                &mut required,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let end = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
+        Some(String::from_utf16_lossy(&buffer[..end]))
+    }
+
+    fn remove_device(list: HDEVINFO, device: &mut SP_DEVINFO_DATA) -> bool {
+        let mut params: SP_REMOVEDEVICE_PARAMS = unsafe { std::mem::zeroed() };
+        params.ClassInstallHeader.cbSize = std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32;
+        params.ClassInstallHeader.InstallFunction = DIF_REMOVE;
+        params.Scope = DI_REMOVEDEVICE_GLOBAL;
+        params.HwProfile = 0;
+        unsafe {
+            SetupDiSetClassInstallParamsW(
+                list,
+                device,
+                &params as *const _ as *const SP_CLASSINSTALL_HEADER,
+                std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
+            ) != 0
+                && SetupDiCallClassInstaller(DIF_REMOVE, list, device) != 0
+        }
     }
 
     fn is_bundled_vdd(list: HDEVINFO, device: &mut SP_DEVINFO_DATA) -> bool {
@@ -390,21 +462,7 @@ mod win {
     pub fn remove() -> Result<()> {
         let mut removed = 0;
         for_each_device(|list, device| {
-            let mut params: SP_REMOVEDEVICE_PARAMS = unsafe { std::mem::zeroed() };
-            params.ClassInstallHeader.cbSize = std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32;
-            params.ClassInstallHeader.InstallFunction = DIF_REMOVE;
-            params.Scope = DI_REMOVEDEVICE_GLOBAL;
-            params.HwProfile = 0;
-            let ok = unsafe {
-                SetupDiSetClassInstallParamsW(
-                    list,
-                    device,
-                    &params as *const _ as *const SP_CLASSINSTALL_HEADER,
-                    std::mem::size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
-                ) != 0
-                    && SetupDiCallClassInstaller(DIF_REMOVE, list, device) != 0
-            };
-            if ok {
+            if remove_device(list, device) {
                 removed += 1;
             } else {
                 crate::logging::append(format!(
@@ -415,6 +473,80 @@ mod win {
         })?;
         crate::logging::append(format!("virtual display devices removed: {removed}"));
         Ok(())
+    }
+
+    /// Deletes the monitor nodes the bundled driver left behind, and reports how many went.
+    ///
+    /// Each driver restart hands the desktop a fresh set of monitor children with fresh UIDs, and
+    /// the previous set stays in the registry as a node Windows lists but cannot see. Nothing ever
+    /// collected them, so a machine that mirrors a few times a day walks `\\.\DISPLAY17` to
+    /// `DISPLAY19` to `DISPLAY25`, and every one of those numbers is a monitor record the display
+    /// stack still carries. One report already showed ten nodes behind a single live display.
+    ///
+    /// Only nodes matching the bundled driver's own identity are touched, and only ones Windows
+    /// cannot currently see: a present device is in use, and another vendor's virtual display is
+    /// not ours to delete. Windows recreates any of these on demand, which is what makes deleting
+    /// them safe rather than merely tidy.
+    pub fn prune_stale_monitors() -> Result<usize> {
+        // Uppercase because SetupAPI is free to vary the case of an instance id between calls,
+        // and a case-sensitive miss here would delete a live monitor's node.
+        let mut present = Vec::new();
+        let list = device_list(MONITOR_ENUMERATOR, true)?;
+        for_each_enumerated(&list, |list, device| {
+            if let Some(id) = instance_id(list, device) {
+                present.push(id.to_ascii_uppercase());
+            }
+        });
+        drop(list);
+
+        let list = device_list(MONITOR_ENUMERATOR, false)?;
+        let mut removed = 0;
+        let mut failed = 0;
+        for_each_enumerated(&list, |list, device| {
+            let Some(id) = instance_id(list, device) else {
+                return;
+            };
+            if !crate::monitors::looks_like_bundled_virtual_display(&id) {
+                return;
+            }
+            if present.contains(&id.to_ascii_uppercase()) {
+                return;
+            }
+            if remove_device(list, device) {
+                removed += 1;
+            } else {
+                failed += 1;
+                crate::logging::append(format!(
+                    "stale virtual display monitor node {id} could not be removed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        });
+        if removed > 0 || failed > 0 {
+            crate::logging::append(format!(
+                "stale virtual display monitor nodes pruned: {removed} (failed {failed})"
+            ));
+        }
+        Ok(removed)
+    }
+
+    /// The monitor children of a display driver all hang off this enumerator.
+    const MONITOR_ENUMERATOR: &str = "DISPLAY";
+
+    fn for_each_enumerated(
+        list: &DeviceInfoList,
+        mut action: impl FnMut(HDEVINFO, &mut SP_DEVINFO_DATA),
+    ) {
+        let mut index = 0_u32;
+        loop {
+            let mut device: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+            device.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+            if unsafe { SetupDiEnumDeviceInfo(list.0, index, &mut device) } == 0 {
+                break;
+            }
+            index += 1;
+            action(list.0, &mut device);
+        }
     }
 
     /// The same two steps devcon performs: create the root device node, then bind the INF to it.
@@ -532,6 +664,7 @@ fn elevate(action: VddAction, count: u32) -> Result<()> {
         VddAction::Remove => "remove",
         VddAction::Enable => "enable",
         VddAction::Disable => "disable",
+        VddAction::Prune => "prune",
     };
     win::elevate(&format!("vdd --action {action} --count {count}"))
 }
@@ -555,7 +688,16 @@ fn install() -> Result<()> {
 
 #[cfg(windows)]
 fn remove() -> Result<()> {
-    win::remove()
+    win::remove()?;
+    // The display device is gone, so every monitor child it owned is now a leftover node. This is
+    // the one moment nothing of ours is in use, which makes it the cleanest sweep available.
+    prune_quietly();
+    Ok(())
+}
+
+#[cfg(windows)]
+fn prune_stale_monitors() -> Result<usize> {
+    win::prune_stale_monitors()
 }
 
 #[cfg(windows)]
@@ -596,6 +738,11 @@ fn remove() -> Result<()> {
 #[cfg(not(windows))]
 fn set_monitor_count(_count: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn prune_stale_monitors() -> Result<usize> {
+    Ok(0)
 }
 
 #[cfg(test)]

@@ -895,7 +895,13 @@ fn looks_like_virtual_display(value: &str) -> bool {
     .any(|needle| value.contains(needle))
 }
 
-fn looks_like_bundled_virtual_display(value: &str) -> bool {
+/// Whether a device string belongs to the bundled driver rather than some other virtual display.
+///
+/// `vdd` prunes leftover device nodes with this, so it is the one place that decides what "ours"
+/// means. Anything it says yes to can be deleted from the registry, so it must never widen to the
+/// generic virtual-display words [`looks_like_virtual_display`] accepts - a SuperDisplay or Parsec
+/// node is not ours to remove.
+pub(crate) fn looks_like_bundled_virtual_display(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     ["mtt1337", "mttvdd", "vdd by mtt"]
         .iter()
@@ -956,6 +962,25 @@ mod tests {
         ));
         assert!(!looks_like_bundled_virtual_display(
             "Virtual Display Driver"
+        ));
+    }
+
+    #[test]
+    fn bundled_vdd_identity_gates_monitor_node_pruning() {
+        // The prune deletes whatever this accepts, so the shapes it sees at that call site - raw
+        // device instance ids off the DISPLAY enumerator, in whichever case SetupAPI hands them
+        // over - are worth pinning separately from the description strings above.
+        assert!(looks_like_bundled_virtual_display(
+            r"DISPLAY\MTT1337\1&28A6823A&F&UID256"
+        ));
+        assert!(looks_like_bundled_virtual_display(
+            r"display\mtt1337\1&28a6823a&0&uid4353"
+        ));
+        assert!(!looks_like_bundled_virtual_display(
+            r"DISPLAY\SDP0001\5&1B2C3D4E&0&UID256"
+        ));
+        assert!(!looks_like_bundled_virtual_display(
+            r"DISPLAY\Default_Monitor\4&2A9F1B0C&0&UID0"
         ));
     }
 

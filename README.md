@@ -166,6 +166,7 @@ Runtime behavior:
 8. Only after every VDD target and receiver route has passed those checks does the sender start the video pipelines. A preparation failure starts no stream, never falls back to a physical monitor, and is retried on the next discovery pass.
 9. When auto sender mode loses every matching receiver beyond the disconnect grace period, it requests bundled VDD removal once so the virtual display is not left in Windows while disconnected.
 10. Repeated receiver discovery does not rerun the driver actions or `DisplaySwitch.exe`; those operations run only when the receiver endpoint or its announced display mode changes.
+11. Every driver restart hands the desktop a fresh generation of monitor children, and the previous generation stays in the registry as a node Windows lists but cannot see. The sender deletes those leftovers itself - before each restart and again after removal - so `\\.\DISPLAYn` stops climbing across sessions. Only non-present nodes carrying the bundled driver's own identity are touched, and Windows recreates them on demand.
 
 Use the tray menu to show, enable, disable, or remove all bundled MTT VDD devices and monitors. If repeated installs created two or more virtual displays, the remove action deletes every bundled MTT VDD display/monitor after confirmation.
 Automatic VDD lifecycle commands are limited to connection state changes. Use the tray management actions for explicit repair, disable, or removal operations.

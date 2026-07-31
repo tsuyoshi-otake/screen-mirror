@@ -22,7 +22,7 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.57`.
+The desktop and Android package versions for this release are `0.1.58`.
 
 ## Transport Model
 

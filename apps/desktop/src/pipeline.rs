@@ -11,6 +11,14 @@ use std::time::{Duration, Instant};
 const SENDER_VIDEO_ENCODER_NAME: &str = "sender_video_encoder";
 const SENDER_RTP_PAY_NAME: &str = "sender_rtp_pay";
 const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(1);
+/// How long the receiver waits for video packets before deciding the stream is gone.
+///
+/// Wi-Fi roaming, VPN tunnels, and radio power saving all produce gaps of a few seconds that the
+/// stream comes back from on its own: the sender keeps streaming for its whole receiver-loss grace
+/// and forces a keyframe every second, so playback resumes within a second of the packets returning.
+/// Giving up too early turns that hiccup into a closed fullscreen window and a listener restart,
+/// which is far more disruptive than the gap it reacts to.
+const RECEIVER_PACKET_TIMEOUT: Duration = Duration::from_secs(8);
 const RECEIVER_VIDEO_DECODER_NAME: &str = "receiver_video_decoder";
 const RECEIVER_VIDEO_SINK_NAME: &str = "receiver_video_sink";
 
@@ -1062,7 +1070,7 @@ fn arm_receiver_timeout_after_first_packet(pipeline: &gst::Pipeline) {
     };
     let source_for_probe = source.clone();
     pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-        source_for_probe.set_property("timeout", 3_000_000_000_u64);
+        source_for_probe.set_property("timeout", RECEIVER_PACKET_TIMEOUT.as_nanos() as u64);
         crate::logging::append("receiver video packets started; disconnect timeout armed");
         gst::PadProbeReturn::Remove
     });

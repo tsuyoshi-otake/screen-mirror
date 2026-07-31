@@ -4,7 +4,9 @@ use sm_core::discovery::DEFAULT_PIN;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::pipeline::{CaptureApi, Decoder, Encoder, NvidiaTuning, RecvArgs, SendArgs, Sink};
+use crate::pipeline::{
+    CaptureApi, Decoder, Encoder, NvidiaTuning, RecvArgs, Sampling, SendArgs, Sink,
+};
 
 const CURRENT_CONFIG_VERSION: u32 = 4;
 const BALANCED_RESOURCE_CONFIG_VERSION: u32 = 2;
@@ -184,6 +186,9 @@ pub struct RecvConfig {
     pub fullscreen: bool,
     pub decoder: ConfigDecoder,
     pub sink: ConfigSink,
+    /// Texture filter the sink scales with: auto, linear, or point.
+    #[serde(default)]
+    pub sampling: ConfigSampling,
     /// GPU to decode and render on: "auto", a DXGI adapter index, or part of the adapter name.
     #[serde(default = "default_gpu")]
     pub gpu: String,
@@ -225,6 +230,27 @@ pub enum ConfigSink {
     Auto,
     D3d11,
     AutoVideo,
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigSampling {
+    #[default]
+    Auto,
+    Linear,
+    Point,
+}
+
+impl ConfigSampling {
+    /// The value as it is spelled in config.toml, which is also what the tray menu ids are built
+    /// from so a click and a hand-edited file cannot disagree about what a mode is called.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Linear => "linear",
+            Self::Point => "point",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
@@ -301,6 +327,7 @@ impl Default for RecvConfig {
             fullscreen: true,
             decoder: ConfigDecoder::Auto,
             sink: ConfigSink::Auto,
+            sampling: ConfigSampling::Auto,
             gpu: default_gpu(),
         }
     }
@@ -404,6 +431,7 @@ impl From<RecvConfig> for RecvArgs {
             fullscreen: config.fullscreen,
             decoder: config.decoder.into(),
             sink: config.sink.into(),
+            sampling: config.sampling.into(),
             gpu: config.gpu,
         }
     }
@@ -450,6 +478,16 @@ impl From<ConfigSink> for Sink {
             ConfigSink::Auto => Self::Auto,
             ConfigSink::D3d11 => Self::D3d11,
             ConfigSink::AutoVideo => Self::AutoVideo,
+        }
+    }
+}
+
+impl From<ConfigSampling> for Sampling {
+    fn from(value: ConfigSampling) -> Self {
+        match value {
+            ConfigSampling::Auto => Self::Auto,
+            ConfigSampling::Linear => Self::Linear,
+            ConfigSampling::Point => Self::Point,
         }
     }
 }

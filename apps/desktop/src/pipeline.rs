@@ -196,6 +196,11 @@ pub struct RecvArgs {
     #[arg(long, value_enum, default_value_t = Sink::Auto)]
     pub sink: Sink,
 
+    /// Texture filter the sink scales with. auto keeps text sharp when the stream is larger than
+    /// the window and smooth when it is smaller, linear always blurs, point never does.
+    #[arg(long, value_enum, default_value_t = Sampling::Auto)]
+    pub sampling: Sampling,
+
     /// GPU to decode and render on: "auto", a DXGI adapter index, or part of the adapter name.
     #[arg(long, default_value = crate::gpu::AUTO)]
     pub gpu: String,
@@ -233,6 +238,33 @@ pub enum Sink {
     Auto,
     D3d11,
     AutoVideo,
+}
+
+/// Texture filter the D3D video sinks scale the decoded frame with.
+///
+/// A mirrored desktop is mostly text, and the two directions of scaling want opposite filters:
+/// shrinking a 4K stream into a smaller window needs the averaging a linear filter does or thin
+/// glyph strokes drop out entirely, while stretching it needs a filter that does not smear those
+/// strokes into grey. `auto` is the mode that does both, which is why it is the default rather than
+/// the sinks' own `bilinear`. The other two exist because "sharp" and "smooth" are a matter of
+/// taste at 1:1 and nobody should have to accept ours.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum Sampling {
+    #[default]
+    Auto,
+    Linear,
+    Point,
+}
+
+impl Sampling {
+    /// The `sampling-method` nick, which `d3d11videosink` and `d3d12videosink` spell identically.
+    fn method(self) -> &'static str {
+        match self {
+            Self::Auto => "linear-minification",
+            Self::Linear => "bilinear",
+            Self::Point => "nearest-neighbour",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -754,7 +786,7 @@ fn build_receiver_software_video_pipeline(
     };
     let route = ReceiverVideoRoute {
         decoder,
-        sink: select_sink(args.sink, args.fullscreen, gpu)?,
+        sink: select_sink(args.sink, args.fullscreen, args.sampling, gpu)?,
     };
     Ok(Some(receiver_video_pipeline(args, &route)?))
 }
@@ -769,6 +801,7 @@ fn build_receiver_video_pipeline_for(
         args.decoder,
         args.sink,
         args.fullscreen,
+        args.sampling,
         gpu,
         allow_modern_intel_d3d12,
     )?;
@@ -1729,15 +1762,16 @@ fn select_receiver_route(
     requested_decoder: Decoder,
     requested_sink: Sink,
     fullscreen: bool,
+    sampling: Sampling,
     gpu: Option<&crate::gpu::GpuAdapter>,
     allow_modern_intel_d3d12: bool,
 ) -> Result<ReceiverVideoRoute> {
     if allow_modern_intel_d3d12
         && should_try_modern_intel_d3d12(requested_decoder, requested_sink, gpu)
     {
-        if let Some((decoder, sink)) =
-            gpu.and_then(|gpu| d3d12_decoder_on_gpu(gpu).zip(d3d12_sink_on_gpu(fullscreen, gpu)))
-        {
+        if let Some((decoder, sink)) = gpu.and_then(|gpu| {
+            d3d12_decoder_on_gpu(gpu).zip(d3d12_sink_on_gpu(fullscreen, sampling, gpu))
+        }) {
             crate::logging::append(format!(
                 "receiver Intel GPU exposes a matching D3D12 H.264 route; using {} with D3D12 zero-copy",
                 decoder.factory
@@ -1748,7 +1782,7 @@ fn select_receiver_route(
 
     Ok(ReceiverVideoRoute {
         decoder: select_decoder(requested_decoder, gpu)?,
-        sink: select_sink(requested_sink, fullscreen, gpu)?,
+        sink: select_sink(requested_sink, fullscreen, sampling, gpu)?,
     })
 }
 
@@ -1992,33 +2026,60 @@ fn d3d12_decoder_on_gpu(gpu: &crate::gpu::GpuAdapter) -> Option<ReceiverDecoder>
     decoder
 }
 
-fn d3d12_sink_on_gpu(fullscreen: bool, gpu: &crate::gpu::GpuAdapter) -> Option<String> {
+fn d3d12_sink_on_gpu(
+    fullscreen: bool,
+    sampling: Sampling,
+    gpu: &crate::gpu::GpuAdapter,
+) -> Option<String> {
     if !factory_supports_raw_memory_sink("d3d12videosink", ReceiverMemory::D3d12) {
         return None;
     }
 
+    let filter = sampling_property("d3d12videosink", sampling);
     let fullscreen = if fullscreen { " fullscreen=true" } else { "" };
     Some(format!(
-        "d3d12videosink name={RECEIVER_VIDEO_SINK_NAME} adapter={} sync=false async=false qos=true enable-last-sample=false{fullscreen}",
+        "d3d12videosink name={RECEIVER_VIDEO_SINK_NAME} adapter={} sync=false async=false qos=true enable-last-sample=false{filter}{fullscreen}",
         gpu.index
     ))
+}
+
+/// The `sampling-method=` fragment for a sink that exposes it, and nothing for one that does not.
+///
+/// An unrecognised property in a launch string fails the whole parse, so a GStreamer build without
+/// it would trade the entire picture for a filter preference.
+fn sampling_property(element: &str, sampling: Sampling) -> String {
+    // A sink that is not registered is a sink this pipeline will not use; saying anything about its
+    // properties would only put a confusing line in the log of whoever is diagnosing the real fault.
+    if !has_element(element) {
+        return String::new();
+    }
+    if element_has_property(element, "sampling-method") {
+        return format!(" sampling-method={}", sampling.method());
+    }
+    crate::logging::append(format!(
+        "{element} does not expose sampling-method; the {} filter was not applied",
+        sampling.method()
+    ));
+    String::new()
 }
 
 fn select_sink(
     requested: Sink,
     fullscreen: bool,
+    sampling: Sampling,
     gpu: Option<&crate::gpu::GpuAdapter>,
 ) -> Result<String> {
     let adapter = match gpu {
         Some(gpu) => format!(" adapter={}", gpu.index),
         None => String::new(),
     };
+    let filter = sampling_property("d3d11videosink", sampling);
     let d3d11_sink = if fullscreen {
         format!(
-            "d3d11videosink name={RECEIVER_VIDEO_SINK_NAME}{adapter} sync=false async=false qos=true enable-last-sample=false fullscreen-toggle-mode=property fullscreen=true"
+            "d3d11videosink name={RECEIVER_VIDEO_SINK_NAME}{adapter} sync=false async=false qos=true enable-last-sample=false{filter} fullscreen-toggle-mode=property fullscreen=true"
         )
     } else {
-        format!("d3d11videosink name={RECEIVER_VIDEO_SINK_NAME}{adapter} sync=false async=false qos=true enable-last-sample=false")
+        format!("d3d11videosink name={RECEIVER_VIDEO_SINK_NAME}{adapter} sync=false async=false qos=true enable-last-sample=false{filter}")
     };
 
     match requested {
@@ -2519,6 +2580,40 @@ mod tests {
             "D3D12Memory/NV12"
         );
         assert_eq!(decoder.output_caps_for("d3d11videosink"), "");
+    }
+
+    /// The three modes have to reach the sink as the sink's own nicks, because a launch string is
+    /// parsed as text: a wrong nick is a pipeline that does not build rather than a filter that
+    /// falls back.
+    #[test]
+    fn each_scaling_filter_names_a_sampling_method_the_d3d_sinks_accept() {
+        assert_eq!(Sampling::Auto.method(), "linear-minification");
+        assert_eq!(Sampling::Linear.method(), "bilinear");
+        assert_eq!(Sampling::Point.method(), "nearest-neighbour");
+    }
+
+    /// `auto` is deliberately not the sinks' own default: shrinking a desktop stream into a smaller
+    /// window is the case that loses glyph strokes, and it is the case that needs minification
+    /// filtered.
+    #[test]
+    fn the_default_scaling_filter_is_the_one_that_survives_shrinking() {
+        assert_eq!(Sampling::default(), Sampling::Auto);
+        assert_ne!(Sampling::default().method(), "bilinear");
+    }
+
+    #[test]
+    fn a_fullscreen_d3d11_sink_carries_the_requested_filter() {
+        gst::init().expect("GStreamer initialization");
+        if !has_element("d3d11videosink") {
+            eprintln!("skipping d3d11videosink sampling test: element missing");
+            return;
+        }
+
+        let sink = select_sink(Sink::D3d11, true, Sampling::Point, None)
+            .expect("d3d11videosink is present");
+
+        assert!(sink.contains("sampling-method=nearest-neighbour"), "{sink}");
+        assert!(sink.contains("fullscreen=true"), "{sink}");
     }
 
     #[test]

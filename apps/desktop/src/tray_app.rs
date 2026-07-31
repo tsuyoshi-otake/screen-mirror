@@ -7,7 +7,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::autostart;
-use crate::config::{AppConfig, StartupMode};
+use crate::config::{AppConfig, ConfigSampling, StartupMode};
 use crate::pipeline::{self, PipelineHandle};
 
 const ID_START_SENDER: &str = "start-sender";
@@ -17,6 +17,7 @@ const ID_TOGGLE_AUDIO: &str = "toggle-audio";
 const ID_GPU_SEND_PREFIX: &str = "gpu-send:";
 const ID_GPU_RECV_PREFIX: &str = "gpu-recv:";
 const ID_FRAME_RATE_PREFIX: &str = "fps:";
+const ID_SAMPLING_PREFIX: &str = "sampling:";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
@@ -140,6 +141,7 @@ struct TrayItems {
     gpu_send: Vec<GpuMenuChoice>,
     gpu_recv: Vec<GpuMenuChoice>,
     frame_rates: Vec<FrameRateMenuChoice>,
+    sampling: Vec<SamplingMenuChoice>,
 }
 
 struct GpuMenuChoice {
@@ -163,6 +165,22 @@ struct FrameRateMenuChoice {
 /// because monitors run at them: capturing at a rate the panel does not refresh at beats every
 /// frame against the display clock and judders however high the number is.
 const CAPTURE_FRAME_RATES: [u32; 5] = [15, 30, 60, 75, 90];
+
+struct SamplingMenuChoice {
+    sampling: ConfigSampling,
+    item: CheckMenuItem,
+}
+
+/// Scaling filters offered in the tray, in menu order, with the label each is shown under.
+///
+/// The words are the effect, not the filter: nobody picks a mirrored screen by whether the sampler
+/// is bilinear. `Sharp` is here for the desks where the stream and the panel are the same size and
+/// any filtering at all is pure softening.
+const SAMPLING_CHOICES: [(ConfigSampling, &str); 3] = [
+    (ConfigSampling::Auto, "Auto (sharp text, smooth scaling)"),
+    (ConfigSampling::Linear, "Smooth"),
+    (ConfigSampling::Point, "Sharp"),
+];
 
 impl TrayApp {
     fn new() -> Result<Self> {
@@ -252,6 +270,7 @@ impl TrayApp {
         menu.append(&items.audio)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&frame_rate_submenu(&items.frame_rates)?)?;
+        menu.append(&sampling_submenu(&items.sampling)?)?;
         if !items.gpu_send.is_empty() {
             menu.append(&gpu_submenu("Sender GPU", &items.gpu_send)?)?;
             menu.append(&gpu_submenu("Receiver GPU", &items.gpu_recv)?)?;
@@ -333,6 +352,7 @@ impl TrayApp {
             id if id.starts_with(ID_GPU_SEND_PREFIX) => self.select_gpu(GpuSide::Sender, id),
             id if id.starts_with(ID_GPU_RECV_PREFIX) => self.select_gpu(GpuSide::Receiver, id),
             id if id.starts_with(ID_FRAME_RATE_PREFIX) => self.select_frame_rate(id),
+            id if id.starts_with(ID_SAMPLING_PREFIX) => self.select_sampling(id),
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
             ID_RUN_DIAGNOSTICS => self.run_diagnostics(),
@@ -771,6 +791,29 @@ impl TrayApp {
         }
     }
 
+    /// Applies a scaling filter from the tray menu. The filter is a property of the video sink, so
+    /// it only takes effect once the sink is built: a running receiver restarts, a sender does not
+    /// care. Restarting drops a fraction of a second of video, which is why an unchanged choice
+    /// only re-ticks the menu.
+    fn select_sampling(&mut self, id: &str) {
+        let Some(sampling) = sampling_for_menu_id(id) else {
+            return;
+        };
+        if self.config.recv.sampling == sampling {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.recv.sampling = sampling;
+        self.save_config();
+        crate::logging::append(format!("receiver scaling filter set to {}", sampling.key()));
+        self.sync_menu();
+
+        if self.active_mode == ActiveMode::Receiver {
+            self.start_receiver();
+        }
+    }
+
     fn toggle_autostart(&mut self) {
         let next = !self.config.autostart;
         match autostart::set_enabled(next) {
@@ -1119,6 +1162,11 @@ impl TrayApp {
         for choice in &items.frame_rates {
             choice.item.set_checked(choice.fps == self.config.send.fps);
         }
+        for choice in &items.sampling {
+            choice
+                .item
+                .set_checked(choice.sampling == self.config.recv.sampling);
+        }
         items.autostart.set_text(if self.config.autostart {
             "Disable Autostart"
         } else {
@@ -1194,6 +1242,7 @@ impl TrayItems {
             gpu_send,
             gpu_recv,
             frame_rates: frame_rate_choices(config.send.fps),
+            sampling: sampling_choices(config.recv.sampling),
         })
     }
 }
@@ -1237,6 +1286,37 @@ fn frame_rate_menu_rates(configured: u32) -> Vec<u32> {
 
 fn frame_rate_for_menu_id(id: &str) -> Option<u32> {
     id.strip_prefix(ID_FRAME_RATE_PREFIX)?.parse().ok()
+}
+
+fn sampling_submenu(choices: &[SamplingMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Scaling Filter", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn sampling_choices(configured: ConfigSampling) -> Vec<SamplingMenuChoice> {
+    SAMPLING_CHOICES
+        .into_iter()
+        .map(|(sampling, label)| SamplingMenuChoice {
+            sampling,
+            item: CheckMenuItem::with_id(
+                format!("{ID_SAMPLING_PREFIX}{}", sampling.key()),
+                label,
+                true,
+                sampling == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn sampling_for_menu_id(id: &str) -> Option<ConfigSampling> {
+    let key = id.strip_prefix(ID_SAMPLING_PREFIX)?;
+    SAMPLING_CHOICES
+        .into_iter()
+        .find_map(|(sampling, _)| (sampling.key() == key).then_some(sampling))
 }
 
 fn gpu_submenu(title: &str, choices: &[GpuMenuChoice]) -> Result<Submenu> {
@@ -1418,6 +1498,38 @@ mod tests {
     fn menu_ids_from_other_submenus_are_not_read_as_frame_rates() {
         assert_eq!(frame_rate_for_menu_id("gpu-send:0"), None);
         assert_eq!(frame_rate_for_menu_id("fps:auto"), None);
+    }
+
+    #[test]
+    fn a_scaling_filter_click_resolves_to_the_filter_it_shows() {
+        let choices = sampling_choices(ConfigSampling::Auto);
+
+        assert_eq!(choices.len(), SAMPLING_CHOICES.len());
+        for choice in &choices {
+            assert_eq!(
+                sampling_for_menu_id(choice.item.id().as_ref()),
+                Some(choice.sampling)
+            );
+        }
+    }
+
+    /// The menu ids are the config.toml spellings, so a click can never write a value that a later
+    /// hand edit of the same file would not round-trip.
+    #[test]
+    fn the_scaling_filter_menu_ids_are_the_config_values() {
+        assert_eq!(
+            sampling_choices(ConfigSampling::Point)
+                .iter()
+                .map(|choice| choice.item.id().as_ref().to_string())
+                .collect::<Vec<_>>(),
+            vec!["sampling:auto", "sampling:linear", "sampling:point"]
+        );
+    }
+
+    #[test]
+    fn menu_ids_from_other_submenus_are_not_read_as_scaling_filters() {
+        assert_eq!(sampling_for_menu_id("fps:60"), None);
+        assert_eq!(sampling_for_menu_id("sampling:bilinear"), None);
     }
 
     fn adapter(index: u32, description: &str) -> GpuAdapter {

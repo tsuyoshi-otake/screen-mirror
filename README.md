@@ -130,6 +130,7 @@ jitter_faststart_packets = 2
 jitter_max_dropout_ms = 200
 jitter_max_misorder_ms = 50
 fullscreen = true
+sampling = "auto"
 ```
 
 ## PIN Pairing
@@ -348,6 +349,18 @@ The Windows receiver uses GStreamer `d3d11videosink` for GPU rendering, but scre
 - Taskbar/window title: `screen-mirror Receiver`
 - Window icon: the same simple display icon used by the app and tray
 - Fullscreen: enabled by default with `[recv].fullscreen = true`
+
+### Scaling Filter
+
+When the sender's resolution and the receiver's window do not match, the sink scales the frame, and the texture filter it scales with decides whether text stays legible. Choose it from the tray under `Scaling Filter`, or set `[recv].sampling`:
+
+| `sampling` | `sampling-method` | Effect |
+| --- | --- | --- |
+| `auto` (default) | `linear-minification` | Averages when shrinking so thin glyph strokes survive, and does not smear them when stretching |
+| `linear` | `bilinear` | Filters in both directions; the GStreamer sink default, and softer on an upscaled stream |
+| `point` | `nearest-neighbour` | No filtering at all; sharpest at 1:1, aliased anywhere else |
+
+The setting applies to `d3d11videosink` and `d3d12videosink`, which spell the property identically. It takes effect when the sink is built, so changing it from the tray restarts an active receiver.
 
 ## Audio
 

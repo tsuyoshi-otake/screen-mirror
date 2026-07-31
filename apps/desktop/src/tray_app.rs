@@ -158,9 +158,11 @@ struct FrameRateMenuChoice {
 /// A sender streams at whatever rate it captures, and every frame it does not capture is one the
 /// receiver cannot invent. The rate lived only in config.toml, which meant the one setting that
 /// decides whether motion looks smooth was the one setting nobody could find; 30 stays the default
-/// because it is what a laptop and a Wi-Fi link comfortably sustain, and 60 is now one click away
-/// for the desks where it does not have to be a compromise.
-const CAPTURE_FRAME_RATES: [u32; 3] = [15, 30, 60];
+/// because it is what a laptop and a Wi-Fi link comfortably sustain, and everything above it is now
+/// one click away for the desks where it does not have to be a compromise. 75 and 90 are here
+/// because monitors run at them: capturing at a rate the panel does not refresh at beats every
+/// frame against the display clock and judders however high the number is.
+const CAPTURE_FRAME_RATES: [u32; 5] = [15, 30, 60, 75, 90];
 
 impl TrayApp {
     fn new() -> Result<Self> {
@@ -1386,13 +1388,13 @@ mod tests {
 
     #[test]
     fn the_frame_rate_menu_offers_the_standard_rates() {
-        assert_eq!(frame_rate_menu_rates(30), vec![15, 30, 60]);
+        assert_eq!(frame_rate_menu_rates(30), vec![15, 30, 60, 75, 90]);
     }
 
     #[test]
     fn a_hand_edited_frame_rate_stays_visible_and_selectable() {
-        assert_eq!(frame_rate_menu_rates(90), vec![15, 30, 60, 90]);
-        assert_eq!(frame_rate_menu_rates(24), vec![15, 24, 30, 60]);
+        assert_eq!(frame_rate_menu_rates(120), vec![15, 30, 60, 75, 90, 120]);
+        assert_eq!(frame_rate_menu_rates(24), vec![15, 24, 30, 60, 75, 90]);
     }
 
     #[test]

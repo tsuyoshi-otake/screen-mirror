@@ -16,6 +16,7 @@ const ID_STOP: &str = "stop";
 const ID_TOGGLE_AUDIO: &str = "toggle-audio";
 const ID_GPU_SEND_PREFIX: &str = "gpu-send:";
 const ID_GPU_RECV_PREFIX: &str = "gpu-recv:";
+const ID_FRAME_RATE_PREFIX: &str = "fps:";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
@@ -138,6 +139,7 @@ struct TrayItems {
     /// Empty when this machine has at most one GPU, so no GPU menu is shown at all.
     gpu_send: Vec<GpuMenuChoice>,
     gpu_recv: Vec<GpuMenuChoice>,
+    frame_rates: Vec<FrameRateMenuChoice>,
 }
 
 struct GpuMenuChoice {
@@ -145,6 +147,20 @@ struct GpuMenuChoice {
     selection: String,
     item: CheckMenuItem,
 }
+
+struct FrameRateMenuChoice {
+    fps: u32,
+    item: CheckMenuItem,
+}
+
+/// Capture rates offered in the tray, in menu order.
+///
+/// A sender streams at whatever rate it captures, and every frame it does not capture is one the
+/// receiver cannot invent. The rate lived only in config.toml, which meant the one setting that
+/// decides whether motion looks smooth was the one setting nobody could find; 30 stays the default
+/// because it is what a laptop and a Wi-Fi link comfortably sustain, and 60 is now one click away
+/// for the desks where it does not have to be a compromise.
+const CAPTURE_FRAME_RATES: [u32; 3] = [15, 30, 60];
 
 impl TrayApp {
     fn new() -> Result<Self> {
@@ -232,8 +248,9 @@ impl TrayApp {
         menu.append(&items.start_receiver)?;
         menu.append(&items.stop)?;
         menu.append(&items.audio)?;
+        menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&frame_rate_submenu(&items.frame_rates)?)?;
         if !items.gpu_send.is_empty() {
-            menu.append(&PredefinedMenuItem::separator())?;
             menu.append(&gpu_submenu("Sender GPU", &items.gpu_send)?)?;
             menu.append(&gpu_submenu("Receiver GPU", &items.gpu_recv)?)?;
         }
@@ -313,6 +330,7 @@ impl TrayApp {
             ID_TOGGLE_AUDIO => self.toggle_audio(),
             id if id.starts_with(ID_GPU_SEND_PREFIX) => self.select_gpu(GpuSide::Sender, id),
             id if id.starts_with(ID_GPU_RECV_PREFIX) => self.select_gpu(GpuSide::Receiver, id),
+            id if id.starts_with(ID_FRAME_RATE_PREFIX) => self.select_frame_rate(id),
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
             ID_RUN_DIAGNOSTICS => self.run_diagnostics(),
@@ -730,6 +748,27 @@ impl TrayApp {
         }
     }
 
+    /// Applies a capture rate from the tray menu, and restarts a running sender so the next frame
+    /// is captured at it. A receiver keeps running untouched: the rate belongs to whoever captures.
+    fn select_frame_rate(&mut self, id: &str) {
+        let Some(fps) = frame_rate_for_menu_id(id) else {
+            return;
+        };
+        if self.config.send.fps == fps {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.fps = fps;
+        self.save_config();
+        crate::logging::append(format!("sender capture frame rate set to {fps} fps"));
+        self.sync_menu();
+
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
     fn toggle_autostart(&mut self) {
         let next = !self.config.autostart;
         match autostart::set_enabled(next) {
@@ -1075,6 +1114,9 @@ impl TrayApp {
                 &choice.selection,
             ));
         }
+        for choice in &items.frame_rates {
+            choice.item.set_checked(choice.fps == self.config.send.fps);
+        }
         items.autostart.set_text(if self.config.autostart {
             "Disable Autostart"
         } else {
@@ -1149,8 +1191,50 @@ impl TrayItems {
             autostart,
             gpu_send,
             gpu_recv,
+            frame_rates: frame_rate_choices(config.send.fps),
         })
     }
+}
+
+fn frame_rate_submenu(choices: &[FrameRateMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Capture Frame Rate", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn frame_rate_choices(configured: u32) -> Vec<FrameRateMenuChoice> {
+    frame_rate_menu_rates(configured)
+        .into_iter()
+        .map(|fps| FrameRateMenuChoice {
+            fps,
+            item: CheckMenuItem::with_id(
+                format!("{ID_FRAME_RATE_PREFIX}{fps}"),
+                format!("{fps} fps"),
+                true,
+                fps == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+/// The offered rates, plus whatever rate config.toml already asks for.
+///
+/// A hand-edited `fps = 90` is a deliberate choice, and a menu that cannot show it would leave the
+/// user looking at a list where nothing is ticked and any click silently discards their setting.
+fn frame_rate_menu_rates(configured: u32) -> Vec<u32> {
+    let mut rates = CAPTURE_FRAME_RATES.to_vec();
+    if configured > 0 && !rates.contains(&configured) {
+        rates.push(configured);
+        rates.sort_unstable();
+    }
+    rates
+}
+
+fn frame_rate_for_menu_id(id: &str) -> Option<u32> {
+    id.strip_prefix(ID_FRAME_RATE_PREFIX)?.parse().ok()
 }
 
 fn gpu_submenu(title: &str, choices: &[GpuMenuChoice]) -> Result<Submenu> {
@@ -1288,13 +1372,50 @@ mod tests {
     #[test]
     fn only_a_sender_session_hands_back_its_virtual_displays() {
         assert!(releases_sender_virtual_displays(ActiveMode::Sender, true));
-        assert!(!releases_sender_virtual_displays(ActiveMode::Receiver, true));
+        assert!(!releases_sender_virtual_displays(
+            ActiveMode::Receiver,
+            true
+        ));
         assert!(!releases_sender_virtual_displays(ActiveMode::Idle, true));
     }
 
     #[test]
     fn a_sender_that_never_created_virtual_displays_leaves_the_driver_alone() {
         assert!(!releases_sender_virtual_displays(ActiveMode::Sender, false));
+    }
+
+    #[test]
+    fn the_frame_rate_menu_offers_the_standard_rates() {
+        assert_eq!(frame_rate_menu_rates(30), vec![15, 30, 60]);
+    }
+
+    #[test]
+    fn a_hand_edited_frame_rate_stays_visible_and_selectable() {
+        assert_eq!(frame_rate_menu_rates(90), vec![15, 30, 60, 90]);
+        assert_eq!(frame_rate_menu_rates(24), vec![15, 24, 30, 60]);
+    }
+
+    #[test]
+    fn a_frame_rate_menu_click_resolves_to_the_rate_it_shows() {
+        let choices = frame_rate_choices(60);
+
+        assert_eq!(
+            choices.iter().filter(|choice| choice.fps == 60).count(),
+            1,
+            "the configured rate must appear exactly once or the tick is ambiguous"
+        );
+        for choice in &choices {
+            assert_eq!(
+                frame_rate_for_menu_id(choice.item.id().as_ref()),
+                Some(choice.fps)
+            );
+        }
+    }
+
+    #[test]
+    fn menu_ids_from_other_submenus_are_not_read_as_frame_rates() {
+        assert_eq!(frame_rate_for_menu_id("gpu-send:0"), None);
+        assert_eq!(frame_rate_for_menu_id("fps:auto"), None);
     }
 
     fn adapter(index: u32, description: &str) -> GpuAdapter {

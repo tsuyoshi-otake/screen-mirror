@@ -552,9 +552,9 @@ impl Drop for Announcer {
     }
 }
 
-/// Resolves the single-pipeline (CLI and manual-host) path, returning the capture target the
-/// caller must use. Handing the assignment back keeps that path from re-running the whole
-/// virtual-display setup a second time inside the pipeline builder.
+/// Resolves the single-pipeline CLI path, returning the capture target the caller must use.
+/// Handing the assignment back keeps that path from re-running the whole virtual-display setup a
+/// second time inside the pipeline builder.
 pub fn resolve_sender_args(
     args: SendArgs,
 ) -> Result<(SendArgs, Option<crate::monitors::DisplayMonitor>)> {
@@ -863,10 +863,6 @@ pub fn discover_senders_with_pin(timeout: Duration, pin: &str) -> Result<Vec<Dis
 
 fn is_auto_host(host: &str) -> bool {
     host.trim().is_empty() || host.trim().eq_ignore_ascii_case(AUTO_HOST)
-}
-
-pub fn wants_auto_host(host: &str) -> bool {
-    is_auto_host(host)
 }
 
 fn instance_id() -> String {

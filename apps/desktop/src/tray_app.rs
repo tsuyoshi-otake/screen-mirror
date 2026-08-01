@@ -43,6 +43,7 @@ const ID_QUIT: &str = "quit";
 const TRAY_MENU_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TRAY_RIGHT_CLICK_FALLBACK: Duration = Duration::from_millis(350);
 const TRAY_MENU_REOPEN_GUARD: Duration = Duration::from_millis(750);
+const RECEIVER_PIPELINE_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 enum UserEvent {
@@ -122,6 +123,7 @@ struct TrayApp {
     config_path: std::path::PathBuf,
     active_mode: ActiveMode,
     pipeline: Option<PipelineHandle>,
+    receiver_restart_not_before: Option<Instant>,
     audio_pipeline: Option<PipelineHandle>,
     sender_supervisor: Option<crate::lan::SenderSupervisor>,
     control_server: Option<crate::control::ControlServer>,
@@ -306,6 +308,7 @@ impl TrayApp {
             config_path,
             active_mode: ActiveMode::Idle,
             pipeline: None,
+            receiver_restart_not_before: None,
             audio_pipeline: None,
             sender_supervisor: None,
             control_server: None,
@@ -589,60 +592,14 @@ impl TrayApp {
             }
         }
 
-        if crate::lan::wants_auto_host(&args.host) {
-            self.sender_supervisor = Some(crate::lan::SenderSupervisor::start(
-                args,
-                self.status_tx.clone(),
-                feedback,
-            ));
-            self.active_mode = ActiveMode::Sender;
-            self.config.startup_mode = StartupMode::Sender;
-            self.save_config();
-            self.sync_menu();
-            return;
-        }
-
-        let (args, capture_target) = match crate::lan::resolve_sender_args(args) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                self.set_error(format!("Receiver discovery failed: {error:#}"));
-                return;
-            }
-        };
-        let video_description =
-            match pipeline::build_sender_video_pipeline_for(&args, capture_target.as_ref()) {
-                Ok(description) => description,
-                Err(error) => {
-                    self.set_error(format!("Sender start failed: {error:#}"));
-                    return;
-                }
-            };
-        let audio_description = if args.audio_enabled {
-            match pipeline::build_sender_audio_pipeline(&args) {
-                Ok(description) => Some(description),
-                Err(error) => {
-                    self.set_error(format!("Sender audio start failed: {error:#}"));
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
-        eprintln!("sender video pipeline: {video_description}");
-        crate::logging::append(format!("sender pipeline started: target={}", args.host));
-        self.pipeline = Some(pipeline::spawn_sender_pipeline_with_feedback(
-            video_description,
-            args.bitrate,
-            Some(feedback),
+        // Keep every tray sender under the supervisor, including explicit host lists. This makes
+        // manual targets retry after a pipeline error too, and keeps failed startup from leaving a
+        // sender announcer/control server behind while the tray says nothing is running.
+        self.sender_supervisor = Some(crate::lan::SenderSupervisor::start(
+            args,
+            self.status_tx.clone(),
+            feedback,
         ));
-        if let Some(description) = audio_description {
-            crate::logging::append(format!(
-                "sender audio pipeline started: target={}",
-                args.host
-            ));
-            self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
-        }
         self.active_mode = ActiveMode::Sender;
         self.config.startup_mode = StartupMode::Sender;
         self.save_config();
@@ -780,6 +737,7 @@ impl TrayApp {
         self.render_window = None;
         self.receiver_stats = None;
         self.sleep_guard = None;
+        self.receiver_restart_not_before = None;
         self.active_mode = ActiveMode::Idle;
         self.sync_menu();
         match first_error {
@@ -789,7 +747,20 @@ impl TrayApp {
     }
 
     fn reap_finished_pipeline(&mut self) {
+        let now = Instant::now();
+        let receiver_active = self.active_mode == ActiveMode::Receiver;
+        if receiver_active
+            && self
+                .receiver_restart_not_before
+                .is_some_and(|not_before| now < not_before)
+        {
+            return;
+        }
+
         let Some(handle) = self.pipeline.as_ref() else {
+            if receiver_active {
+                self.restart_receiver_pipeline("receiver pipeline missing", None);
+            }
             return;
         };
         if !handle.is_finished() {
@@ -802,25 +773,9 @@ impl TrayApp {
             .map(PipelineHandle::finish)
             .unwrap_or(Ok(()));
 
-        if result.is_ok() && self.active_mode == ActiveMode::Receiver {
-            let args = self.config.recv_args();
-            match pipeline::build_receiver_video_plan(&args) {
-                Ok(plan) => {
-                    crate::logging::append(
-                        "receiver stream disconnected; fullscreen closed and listener restarted",
-                    );
-                    crate::logging::append(format!("receiver pipeline: {}", plan.primary()));
-                    self.pipeline = Some(pipeline::spawn_receiver_pipeline_with_stats(
-                        plan,
-                        self.receiver_stats.clone(),
-                    ));
-                    self.sync_menu();
-                    return;
-                }
-                Err(error) => {
-                    self.set_error(format!("Receiver restart failed: {error:#}"));
-                }
-            }
+        if receiver_active {
+            self.restart_receiver_pipeline("receiver pipeline ended", result.as_ref().err());
+            return;
         }
 
         if let Err(error) = result {
@@ -856,6 +811,39 @@ impl TrayApp {
         self.config.startup_mode = StartupMode::Idle;
         self.save_config();
         self.sync_menu();
+    }
+
+    fn restart_receiver_pipeline(&mut self, reason: &str, previous_error: Option<&anyhow::Error>) {
+        let retry_at = Instant::now() + RECEIVER_PIPELINE_RESTART_BACKOFF;
+        let args = self.config.recv_args();
+        match pipeline::build_receiver_video_plan(&args) {
+            Ok(plan) => {
+                if let Some(error) = previous_error {
+                    crate::logging::append(format!(
+                        "{reason}; restarting receiver listener after error: {error:#}"
+                    ));
+                } else {
+                    crate::logging::append(
+                        "receiver stream disconnected; fullscreen closed and listener restarted",
+                    );
+                }
+                crate::logging::append(format!("receiver pipeline: {}", plan.primary()));
+                self.pipeline = Some(pipeline::spawn_receiver_pipeline_with_stats(
+                    plan,
+                    self.receiver_stats.clone(),
+                ));
+                self.receiver_restart_not_before = Some(retry_at);
+                self.sync_menu();
+            }
+            Err(error) => {
+                crate::logging::append(format!(
+                    "receiver restart build failed; retrying in {}ms: {error:#}",
+                    RECEIVER_PIPELINE_RESTART_BACKOFF.as_millis()
+                ));
+                self.set_error(format!("Receiver restart failed; retrying: {error:#}"));
+                self.receiver_restart_not_before = Some(retry_at);
+            }
+        }
     }
 
     fn reap_finished_audio_pipeline(&mut self) {

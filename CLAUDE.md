@@ -24,6 +24,11 @@ element availability.
 
 - The tray exposes encoder, quality preset, bitrate, output resolution, frame rate, NVIDIA tuning,
   and receiver scaling-filter menus.
+- Tray sender sessions use the `SenderSupervisor` for both `host = "auto"` and explicit host lists;
+  this is what keeps sender pipeline failures and temporary receiver loss recoverable.
+- Tray receiver sessions retain their discovery advertisement and retry the video pipeline after
+  both packet timeouts and GStreamer errors. The retry has a one-second backoff to avoid a tight
+  restart loop when a local runtime remains unavailable.
 - `send.fec_percentage` defaults to `0`. Nonzero values use RFC 5109 ULP-FEC with a separate RTP
   payload. Automatic discovery enables it only when every selected desktop receiver advertises
   support; Android and older peers are treated as unsupported. An explicit host list is an

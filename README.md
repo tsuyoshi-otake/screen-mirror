@@ -22,11 +22,13 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.63`.
+The desktop and Android package versions for this release are `0.1.64`.
 
-Release `v0.1.63` adds configurable video quality presets and optional RFC 5109 ULP-FEC packet-loss
-protection. FEC is off by default and is negotiated only between compatible desktop receivers;
-Android and mixed receiver sets keep the standard H.264 RTP path.
+Release `v0.1.64` hardens reconnection after receiver pipeline errors and keeps explicit-host tray
+senders under the same retry supervisor as auto-discovered senders. It includes the configurable
+video quality presets and optional RFC 5109 ULP-FEC packet-loss protection from `v0.1.63`. FEC is
+off by default and is negotiated only between compatible desktop receivers; Android and mixed
+receiver sets keep the standard H.264 RTP path.
 
 ## Transport Model
 
@@ -39,7 +41,9 @@ Android and mixed receiver sets keep the standard H.264 RTP path.
 - Pairing: sender and receiver must use the same four-digit PIN; discovery/control packets carry only a SHA-256 PIN hash
 - Sender fan-out: one sender can stream to multiple receivers with `multiudpsink`
 - Default auto-connect limit: `3` receivers, so `1:3` is the standard target
-- Reconnect: receiver advertisements repeat once per second; after a stream disconnects, the receiver closes the render window but keeps listening and advertising for reconnection
+- Reconnect: receiver advertisements repeat once per second; after a timeout or video pipeline
+  error, the receiver keeps its session and retries the video listener with a short backoff. Tray
+  senders supervise both auto-discovered and explicit-host pipelines and rebuild them after errors.
 
 ## Desktop App
 
@@ -52,7 +56,8 @@ cargo run -p screen-mirror --release
 Tray actions:
 
 - `Start as Receiver`: listens on `:5004` and advertises itself on the LAN
-- `Start as Sender`: continuously discovers receivers and streams to up to three
+- `Start as Sender`: continuously discovers configured receivers (or monitors explicit hosts) and
+  streams to up to three
 - `Stop`: stops the active pipeline
 - `Enable Autostart`: registers the tray app under HKCU Run
 - `Check for Updates`: checks GitHub Releases immediately
@@ -367,7 +372,9 @@ Receiver mode prevents the display and system from sleeping while video receptio
 - Windows receiver calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`.
 - Android receiver sets `FLAG_KEEP_SCREEN_ON` and `SurfaceView.setKeepScreenOn(true)`.
 - The sleep/display guard is released when receiver mode stops.
-- After video packets stop arriving, the Windows receiver destroys the fullscreen render pipeline, remains in receiver mode, and immediately starts a fresh video listener so the sender can reconnect without manual intervention.
+- After video packets stop arriving or a video pipeline error occurs, the Windows receiver remains
+  in receiver mode and starts a fresh video listener with a short backoff so the sender can
+  reconnect without manual intervention.
 
 ## Receiver Window
 

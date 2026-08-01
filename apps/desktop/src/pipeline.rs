@@ -6,7 +6,7 @@ use sm_core::discovery::DEFAULT_PIN;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -324,6 +324,72 @@ impl ReceiverPipelinePlan {
     }
 }
 
+/// Keeps a sender from handing a whole encoded frame to the UDP socket in one scheduler turn.
+///
+/// The target is deliberately two times the configured media bitrate.  That leaves room for a
+/// keyframe to finish in roughly half a frame interval while still smoothing the burst that would
+/// otherwise hit the access point as fast as the OS can enqueue it.
+const SENDER_PACING_RATE_MULTIPLIER: u64 = 2;
+
+struct SenderPacketPacer {
+    bytes_per_second: u64,
+    next_send: Instant,
+}
+
+impl SenderPacketPacer {
+    fn new(bitrate_kbit: u32) -> Self {
+        let bits_per_second = u64::from(bitrate_kbit)
+            .saturating_mul(1_000)
+            .saturating_mul(SENDER_PACING_RATE_MULTIPLIER);
+        Self {
+            bytes_per_second: (bits_per_second / 8).max(1),
+            next_send: Instant::now(),
+        }
+    }
+
+    fn wait_for_packet(&mut self, packet_size: usize) {
+        let now = Instant::now();
+        if self.next_send < now {
+            self.next_send = now;
+        }
+        let delay = self.next_send.saturating_duration_since(now);
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+
+        // Schedule from the actual send time rather than the requested deadline.  Windows timer
+        // granularity can oversleep sub-millisecond intervals; carrying that error forward would
+        // turn a short keyframe burst into seconds of accumulated latency.
+        let nanos = ((packet_size as u128) * 1_000_000_000u128)
+            .div_ceil(u128::from(self.bytes_per_second))
+            .min(u128::from(u64::MAX)) as u64;
+        self.next_send = Instant::now() + Duration::from_nanos(nanos.max(1));
+    }
+}
+
+fn attach_sender_packet_pacer(
+    pipeline: &gst::Pipeline,
+    bitrate_kbit: u32,
+) -> Option<Arc<Mutex<SenderPacketPacer>>> {
+    let payloader = pipeline.by_name(SENDER_RTP_PAY_NAME)?;
+    let pad = payloader.static_pad("src")?;
+    let pacer = Arc::new(Mutex::new(SenderPacketPacer::new(bitrate_kbit)));
+    let pacer_for_probe = Arc::clone(&pacer);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        if let Some(buffer) = info.buffer() {
+            if let Ok(mut pacer) = pacer_for_probe.lock() {
+                pacer.wait_for_packet(buffer.size());
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+    crate::logging::append(format!(
+        "sender RTP packet pacing enabled: rate={}kbit/s",
+        u64::from(bitrate_kbit) * SENDER_PACING_RATE_MULTIPLIER
+    ));
+    Some(pacer)
+}
+
 struct SenderKeyUnitRequester {
     request_src: gst::Pad,
     schedule: KeyUnitSchedule,
@@ -438,9 +504,24 @@ impl Drop for PipelineHandle {
 }
 
 pub fn spawn_pipeline(description: String) -> PipelineHandle {
+    spawn_pipeline_with_pacer(description, None)
+}
+
+/// Starts a sender pipeline with a small amount of network shaping on the RTP payloader output.
+///
+/// Hardware encoders commonly produce a whole frame in one scheduler turn.  With UDP that turns
+/// one frame into a short packet burst, which can overflow a Wi-Fi/AP queue even when the average
+/// bitrate is well below link capacity.  Sunshine uses the same basic idea in its network flow
+/// control: pace video packets, while keeping the rate high enough that the added latency stays
+/// below a frame.
+pub fn spawn_sender_pipeline(description: String, bitrate_kbit: u32) -> PipelineHandle {
+    spawn_pipeline_with_pacer(description, Some(bitrate_kbit))
+}
+
+fn spawn_pipeline_with_pacer(description: String, bitrate_kbit: Option<u32>) -> PipelineHandle {
     let (stop, stop_rx) = mpsc::channel();
     let thread = thread::spawn(move || {
-        let result = run_pipeline_until_stop(&description, &stop_rx);
+        let result = run_pipeline_until_stop_with_pacer(&description, &stop_rx, bitrate_kbit);
         if let Err(error) = &result {
             crate::logging::append(format!("pipeline failed: {error:#}"));
         }
@@ -1019,12 +1100,22 @@ fn run_receiver_pipeline_plan_until_stop(
 }
 
 fn run_pipeline_until_stop(description: &str, stop_rx: &mpsc::Receiver<()>) -> Result<()> {
+    run_pipeline_until_stop_with_pacer(description, stop_rx, None)
+}
+
+fn run_pipeline_until_stop_with_pacer(
+    description: &str,
+    stop_rx: &mpsc::Receiver<()>,
+    bitrate_kbit: Option<u32>,
+) -> Result<()> {
     let element = gst::parse::launch(description).context("failed to parse GStreamer pipeline")?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("pipeline description did not create a GstPipeline"))?;
     let bus = pipeline.bus().context("pipeline has no bus")?;
     arm_receiver_timeout_after_first_packet(&pipeline);
+    let _sender_pacer =
+        bitrate_kbit.and_then(|bitrate| attach_sender_packet_pacer(&pipeline, bitrate));
 
     pipeline
         .set_state(gst::State::Playing)

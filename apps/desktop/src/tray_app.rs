@@ -500,7 +500,10 @@ impl TrayApp {
 
         eprintln!("sender video pipeline: {video_description}");
         crate::logging::append(format!("sender pipeline started: target={}", args.host));
-        self.pipeline = Some(pipeline::spawn_pipeline(video_description));
+        self.pipeline = Some(pipeline::spawn_sender_pipeline(
+            video_description,
+            args.bitrate,
+        ));
         if let Some(description) = audio_description {
             crate::logging::append(format!(
                 "sender audio pipeline started: target={}",

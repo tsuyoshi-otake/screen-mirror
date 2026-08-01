@@ -714,9 +714,10 @@ fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Result<Vec<Pipel
         !descriptions.is_empty(),
         "no receiver video pipelines were prepared"
     );
+    let bitrate = resolved.args.bitrate;
     Ok(descriptions
         .into_iter()
-        .map(pipeline::spawn_pipeline)
+        .map(|description| pipeline::spawn_sender_pipeline(description, bitrate))
         .collect())
 }
 

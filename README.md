@@ -22,7 +22,11 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.62`.
+The desktop and Android package versions for this release are `0.1.63`.
+
+Release `v0.1.63` adds configurable video quality presets and optional RFC 5109 ULP-FEC packet-loss
+protection. FEC is off by default and is negotiated only between compatible desktop receivers;
+Android and mixed receiver sets keep the standard H.264 RTP path.
 
 ## Transport Model
 
@@ -30,6 +34,7 @@ The desktop and Android package versions for this release are `0.1.62`.
 - Touch/control: UDP JSON on port `47778`
 - Diagnostics: TCP JSON request/report response on port `47779`
 - Video: RTP/H.264 over UDP on port `5004`
+- Optional packet-loss protection: RFC 5109 ULP-FEC is carried as a separate RTP payload on the video port
 - Audio: optional Opus/RTP over UDP on port `5005`
 - Pairing: sender and receiver must use the same four-digit PIN; discovery/control packets carry only a SHA-256 PIN hash
 - Sender fan-out: one sender can stream to multiple receivers with `multiudpsink`
@@ -56,7 +61,15 @@ Tray actions:
 - `Install/Repair Virtual Display Driver`: installs the bundled VDD driver without creating duplicates when it already exists
 - `Show/Enable/Disable/Remove All Bundled Virtual Displays`: manages bundled MTT VDD display devices and monitors. Install/Enable does not request Windows extended desktop; sender mode requests it only after a matching receiver is found.
 - `Capture Frame Rate`: sets the sender's capture rate; restarts an active sender
+- `Video Encoder`: selects automatic GPU encoding, NVIDIA NVENC, AMD AMF, Intel QuickSync, Media Foundation, or CPU x264; restarts an active sender
+- `Video Quality Preset`: applies Economy, Balanced, High, or Maximum bitrate/tuning as one choice; manual bitrate or NVIDIA tuning remains available as `Custom`
+- `Video Bitrate`: selects the H.264 target bitrate from `3` to `24 Mbps`; restarts an active sender
+- `Packet Loss Protection`: selects `Off`, `10%`, `25%`, or `50%` FEC overhead; auto-discovery enables it only when every selected Windows receiver advertises support, so Android and mixed receiver sets remain compatible
+- `Output Resolution`: keeps the native monitor size or scales the encoded output to 720p, 1080p, 1440p, or 4K; restarts an active sender
+- `NVIDIA Tuning`: selects automatic, low-latency, GTX, or RTX quality tuning for NVENC; restarts an active sender
 - `Scaling Filter`: sets the texture filter the receiver's video sink scales with; restarts an active receiver
+- Windows receiver sessions show a click-through stream statistics overlay with FPS, RTP loss/late/duplicate counts, and jitter
+- Windows receiver sessions send the recent stream statistics back over the paired control port; the sender uses that feedback to reduce bitrate on congestion and recover gradually, while the configured bitrate remains the ceiling
 - `Sender GPU` / `Receiver GPU`: pins encoding (sender) and decoding/rendering (receiver) to one GPU. Only shown when the machine has more than one GPU.
 - `Open Display Settings`: opens Windows display settings
 - `Open Config`: opens `%APPDATA%\screen-mirror\config.toml`
@@ -113,12 +126,16 @@ monitor_index = -1
 gpu = "auto"
 fps = 30
 bitrate = 8000
+fec_percentage = 0
+encoder = "auto"
 mtu = 1200
 udp_buffer_size = 1048576
 qos_dscp = -1
 allow_software_encoder = false
 nvidia_tuning = "auto"
+capture_api = "dxgi"
 zero_copy = true
+show_cursor = true
 
 [recv]
 gpu = "auto"
@@ -135,6 +152,12 @@ fullscreen = true
 sampling = "auto"
 ```
 
+`fec_percentage` is disabled by default. With `host = "auto"`, the sender enables the selected
+RFC 5109 ULP-FEC overhead only when every selected receiver advertises desktop FEC support; an
+Android or older receiver therefore keeps the normal H.264 RTP path. An explicit host list is
+treated as an operator assertion that the peers support FEC. FEC improves recovery from isolated
+packet loss at the cost of the configured percentage of additional video traffic.
+
 ## PIN Pairing
 
 - PIN values must be exactly four numeric digits.
@@ -142,6 +165,7 @@ sampling = "auto"
 - The tray app reloads `%APPDATA%\screen-mirror\config.toml` before starting sender or receiver mode, so a changed PIN is applied on the next start.
 - Android stores the PIN from the app input field and reuses it on the next launch.
 - Auto discovery ignores receivers with a different PIN hash, so mismatched devices do not auto-connect.
+- Windows-to-Windows feedback uses the same PIN-protected control port as touch events and a separate message protocol. Android receivers remain wire-compatible and simply do not send adaptive feedback.
 - This is pairing protection for trusted LAN use, not strong encryption. RTP/H.264 video is still sent over plain UDP.
 
 ## Virtual Display Mode

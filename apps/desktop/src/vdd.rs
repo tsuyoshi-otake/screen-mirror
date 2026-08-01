@@ -191,12 +191,11 @@ mod win {
         SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
         SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
         SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, SetupDiGetINFClassW,
-        SetupDiSetClassInstallParamsW,
-        SetupDiSetDeviceRegistryPropertyW, UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID,
-        DICS_DISABLE, DICS_ENABLE, DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIF_REGISTERDEVICE,
-        DIF_REMOVE, DIGCF_ALLCLASSES, DIGCF_PRESENT, DI_REMOVEDEVICE_GLOBAL, HDEVINFO,
-        INSTALLFLAG_FORCE, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS,
-        SP_REMOVEDEVICE_PARAMS,
+        SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW,
+        UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID, DICS_DISABLE, DICS_ENABLE,
+        DICS_FLAG_GLOBAL, DIF_PROPERTYCHANGE, DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_ALLCLASSES,
+        DIGCF_PRESENT, DI_REMOVEDEVICE_GLOBAL, HDEVINFO, INSTALLFLAG_FORCE, SP_CLASSINSTALL_HEADER,
+        SP_DEVINFO_DATA, SP_PROPCHANGE_PARAMS, SP_REMOVEDEVICE_PARAMS,
     };
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::{
@@ -299,12 +298,7 @@ mod win {
             flags |= DIGCF_PRESENT;
         }
         let handle = unsafe {
-            SetupDiGetClassDevsW(
-                std::ptr::null(),
-                wide.as_ptr(),
-                std::ptr::null_mut(),
-                flags,
-            )
+            SetupDiGetClassDevsW(std::ptr::null(), wide.as_ptr(), std::ptr::null_mut(), flags)
         };
         if handle == INVALID_DEVICE_LIST {
             return Err(anyhow!(

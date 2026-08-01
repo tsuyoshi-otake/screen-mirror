@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -7,7 +8,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::autostart;
-use crate::config::{AppConfig, ConfigSampling, StartupMode};
+use crate::config::{AppConfig, ConfigEncoder, ConfigNvidiaTuning, ConfigSampling, StartupMode};
 use crate::pipeline::{self, PipelineHandle};
 
 const ID_START_SENDER: &str = "start-sender";
@@ -18,6 +19,12 @@ const ID_GPU_SEND_PREFIX: &str = "gpu-send:";
 const ID_GPU_RECV_PREFIX: &str = "gpu-recv:";
 const ID_FRAME_RATE_PREFIX: &str = "fps:";
 const ID_SAMPLING_PREFIX: &str = "sampling:";
+const ID_ENCODER_PREFIX: &str = "encoder:";
+const ID_QUALITY_PREFIX: &str = "quality:";
+const ID_BITRATE_PREFIX: &str = "bitrate:";
+const ID_FEC_PREFIX: &str = "fec:";
+const ID_RESOLUTION_PREFIX: &str = "resolution:";
+const ID_NVIDIA_TUNING_PREFIX: &str = "nvidia-tuning:";
 const ID_AUTOSTART: &str = "autostart";
 const ID_CHECK_UPDATE: &str = "check-update";
 const ID_RUN_DIAGNOSTICS: &str = "run-diagnostics";
@@ -118,6 +125,8 @@ struct TrayApp {
     audio_pipeline: Option<PipelineHandle>,
     sender_supervisor: Option<crate::lan::SenderSupervisor>,
     control_server: Option<crate::control::ControlServer>,
+    feedback_sender: Option<crate::lan::FeedbackSender>,
+    receiver_stats: Option<Arc<Mutex<pipeline::ReceiverStreamStats>>>,
     diagnostics_server: Option<crate::diagnostics::DiagnosticsServer>,
     announcer: Option<crate::lan::Announcer>,
     sleep_guard: Option<crate::power::SleepGuard>,
@@ -142,6 +151,12 @@ struct TrayItems {
     gpu_recv: Vec<GpuMenuChoice>,
     frame_rates: Vec<FrameRateMenuChoice>,
     sampling: Vec<SamplingMenuChoice>,
+    encoders: Vec<EncoderMenuChoice>,
+    qualities: Vec<QualityMenuChoice>,
+    bitrates: Vec<BitrateMenuChoice>,
+    fec: Vec<FecMenuChoice>,
+    resolutions: Vec<ResolutionMenuChoice>,
+    nvidia_tuning: Vec<NvidiaTuningMenuChoice>,
 }
 
 struct GpuMenuChoice {
@@ -171,6 +186,102 @@ struct SamplingMenuChoice {
     item: CheckMenuItem,
 }
 
+struct EncoderMenuChoice {
+    encoder: ConfigEncoder,
+    item: CheckMenuItem,
+}
+
+struct QualityMenuChoice {
+    preset: QualityPreset,
+    item: CheckMenuItem,
+}
+
+struct BitrateMenuChoice {
+    bitrate: u32,
+    item: CheckMenuItem,
+}
+
+struct FecMenuChoice {
+    percentage: u32,
+    item: CheckMenuItem,
+}
+
+struct ResolutionMenuChoice {
+    width: Option<u32>,
+    height: Option<u32>,
+    item: CheckMenuItem,
+}
+
+struct NvidiaTuningMenuChoice {
+    tuning: ConfigNvidiaTuning,
+    item: CheckMenuItem,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum QualityPreset {
+    Economy,
+    Balanced,
+    High,
+    Maximum,
+    Custom,
+}
+
+impl QualityPreset {
+    const ALL: [Self; 5] = [
+        Self::Economy,
+        Self::Balanced,
+        Self::High,
+        Self::Maximum,
+        Self::Custom,
+    ];
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Economy => "economy",
+            Self::Balanced => "balanced",
+            Self::High => "high",
+            Self::Maximum => "maximum",
+            Self::Custom => "custom",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Economy => "Economy (3 Mbps / low latency)",
+            Self::Balanced => "Balanced (8 Mbps)",
+            Self::High => "High (16 Mbps / NVENC AQ)",
+            Self::Maximum => "Maximum (24 Mbps / NVENC AQ)",
+            Self::Custom => "Custom (manual bitrate/tuning)",
+        }
+    }
+
+    const fn settings(self) -> Option<(u32, ConfigNvidiaTuning)> {
+        match self {
+            Self::Economy => Some((3_000, ConfigNvidiaTuning::LowLatency)),
+            Self::Balanced => Some((8_000, ConfigNvidiaTuning::Auto)),
+            Self::High => Some((16_000, ConfigNvidiaTuning::Rtx)),
+            Self::Maximum => Some((24_000, ConfigNvidiaTuning::Rtx)),
+            Self::Custom => None,
+        }
+    }
+
+    fn from_settings(bitrate: u32, tuning: ConfigNvidiaTuning) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.settings() == Some((bitrate, tuning)))
+            .unwrap_or(Self::Custom)
+    }
+}
+
+const VIDEO_BITRATES: [u32; 6] = [3_000, 5_000, 8_000, 12_000, 16_000, 24_000];
+const OUTPUT_RESOLUTIONS: [(Option<u32>, Option<u32>, &str); 5] = [
+    (None, None, "Native monitor resolution"),
+    (Some(1280), Some(720), "1280 × 720"),
+    (Some(1920), Some(1080), "1920 × 1080"),
+    (Some(2560), Some(1440), "2560 × 1440"),
+    (Some(3840), Some(2160), "3840 × 2160"),
+];
+
 /// Scaling filters offered in the tray, in menu order, with the label each is shown under.
 ///
 /// The words are the effect, not the filter: nobody picks a mirrored screen by whether the sampler
@@ -198,6 +309,8 @@ impl TrayApp {
             audio_pipeline: None,
             sender_supervisor: None,
             control_server: None,
+            feedback_sender: None,
+            receiver_stats: None,
             diagnostics_server: None,
             announcer: None,
             sleep_guard: None,
@@ -270,6 +383,12 @@ impl TrayApp {
         menu.append(&items.audio)?;
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&frame_rate_submenu(&items.frame_rates)?)?;
+        menu.append(&encoder_submenu(&items.encoders)?)?;
+        menu.append(&quality_submenu(&items.qualities)?)?;
+        menu.append(&bitrate_submenu(&items.bitrates)?)?;
+        menu.append(&fec_submenu(&items.fec)?)?;
+        menu.append(&resolution_submenu(&items.resolutions)?)?;
+        menu.append(&nvidia_tuning_submenu(&items.nvidia_tuning)?)?;
         menu.append(&sampling_submenu(&items.sampling)?)?;
         if !items.gpu_send.is_empty() {
             menu.append(&gpu_submenu("Sender GPU", &items.gpu_send)?)?;
@@ -352,6 +471,12 @@ impl TrayApp {
             id if id.starts_with(ID_GPU_SEND_PREFIX) => self.select_gpu(GpuSide::Sender, id),
             id if id.starts_with(ID_GPU_RECV_PREFIX) => self.select_gpu(GpuSide::Receiver, id),
             id if id.starts_with(ID_FRAME_RATE_PREFIX) => self.select_frame_rate(id),
+            id if id.starts_with(ID_ENCODER_PREFIX) => self.select_encoder(id),
+            id if id.starts_with(ID_QUALITY_PREFIX) => self.select_quality(id),
+            id if id.starts_with(ID_BITRATE_PREFIX) => self.select_bitrate(id),
+            id if id.starts_with(ID_FEC_PREFIX) => self.select_fec(id),
+            id if id.starts_with(ID_RESOLUTION_PREFIX) => self.select_resolution(id),
+            id if id.starts_with(ID_NVIDIA_TUNING_PREFIX) => self.select_nvidia_tuning(id),
             id if id.starts_with(ID_SAMPLING_PREFIX) => self.select_sampling(id),
             ID_AUTOSTART => self.toggle_autostart(),
             ID_CHECK_UPDATE => self.check_for_updates(),
@@ -440,13 +565,18 @@ impl TrayApp {
         }
 
         let args = self.config.send_args();
-        match crate::control::ControlServer::start(&self.config.security.pin) {
-            Ok(server) => self.control_server = Some(server),
+        let feedback = match crate::control::ControlServer::start(&self.config.security.pin) {
+            Ok(server) => {
+                let feedback = server.feedback();
+                self.control_server = Some(server);
+                feedback
+            }
             Err(error) => {
                 crate::logging::append(format!("touch control server failed: {error:#}"));
                 eprintln!("touch control server failed: {error:#}");
+                crate::control::FeedbackStore::default()
             }
-        }
+        };
         match crate::lan::Announcer::sender(
             self.config.send.port,
             Some(self.config.send.audio_port),
@@ -463,6 +593,7 @@ impl TrayApp {
             self.sender_supervisor = Some(crate::lan::SenderSupervisor::start(
                 args,
                 self.status_tx.clone(),
+                feedback,
             ));
             self.active_mode = ActiveMode::Sender;
             self.config.startup_mode = StartupMode::Sender;
@@ -500,9 +631,10 @@ impl TrayApp {
 
         eprintln!("sender video pipeline: {video_description}");
         crate::logging::append(format!("sender pipeline started: target={}", args.host));
-        self.pipeline = Some(pipeline::spawn_sender_pipeline(
+        self.pipeline = Some(pipeline::spawn_sender_pipeline_with_feedback(
             video_description,
             args.bitrate,
+            Some(feedback),
         ));
         if let Some(description) = audio_description {
             crate::logging::append(format!(
@@ -553,13 +685,30 @@ impl TrayApp {
         eprintln!("receiver video pipeline: {}", video_plan.primary());
         // Announced below so senders can scale to it; read before the plan is handed to the thread.
         let decode_limits = video_plan.decode_limits();
-        self.pipeline = Some(pipeline::spawn_receiver_pipeline(video_plan));
+        let receiver_stats = Arc::new(Mutex::new(pipeline::ReceiverStreamStats::default()));
+        self.receiver_stats = Some(Arc::clone(&receiver_stats));
+        self.pipeline = Some(pipeline::spawn_receiver_pipeline_with_stats(
+            video_plan,
+            Some(Arc::clone(&receiver_stats)),
+        ));
         if let Some(description) = audio_description {
             crate::logging::append(format!("receiver audio pipeline: {description}"));
             self.audio_pipeline = Some(pipeline::spawn_pipeline(description));
         }
         self.sleep_guard = Some(crate::power::SleepGuard::receiver());
-        self.render_window = Some(crate::receiver_window::RenderWindowGuard::start());
+        self.render_window = Some(crate::receiver_window::RenderWindowGuard::start(Some(
+            Arc::clone(&receiver_stats),
+        )));
+        match crate::lan::FeedbackSender::start(
+            self.config.security.pin.clone(),
+            Arc::clone(&receiver_stats),
+        ) {
+            Ok(sender) => self.feedback_sender = Some(sender),
+            Err(error) => {
+                crate::logging::append(format!("receiver feedback sender failed: {error:#}"));
+                eprintln!("receiver feedback sender failed: {error:#}");
+            }
+        }
         match crate::lan::Announcer::receiver(
             self.config.recv.port,
             Some(self.config.recv.audio_port),
@@ -622,10 +771,14 @@ impl TrayApp {
         if let Some(server) = self.control_server.take() {
             server.stop();
         }
+        if let Some(sender) = self.feedback_sender.take() {
+            sender.stop();
+        }
         if let Some(announcer) = self.announcer.take() {
             announcer.stop();
         }
         self.render_window = None;
+        self.receiver_stats = None;
         self.sleep_guard = None;
         self.active_mode = ActiveMode::Idle;
         self.sync_menu();
@@ -657,7 +810,10 @@ impl TrayApp {
                         "receiver stream disconnected; fullscreen closed and listener restarted",
                     );
                     crate::logging::append(format!("receiver pipeline: {}", plan.primary()));
-                    self.pipeline = Some(pipeline::spawn_receiver_pipeline(plan));
+                    self.pipeline = Some(pipeline::spawn_receiver_pipeline_with_stats(
+                        plan,
+                        self.receiver_stats.clone(),
+                    ));
                     self.sync_menu();
                     return;
                 }
@@ -679,6 +835,9 @@ impl TrayApp {
         if let Some(server) = self.control_server.take() {
             server.stop();
         }
+        if let Some(sender) = self.feedback_sender.take() {
+            sender.stop();
+        }
         if let Some(announcer) = self.announcer.take() {
             announcer.stop();
         }
@@ -691,6 +850,7 @@ impl TrayApp {
         // under a running pipeline.
         self.release_sender_virtual_displays(self.active_mode, "sender pipeline stopped");
         self.render_window = None;
+        self.receiver_stats = None;
         self.sleep_guard = None;
         self.active_mode = ActiveMode::Idle;
         self.config.startup_mode = StartupMode::Idle;
@@ -789,6 +949,151 @@ impl TrayApp {
         crate::logging::append(format!("sender capture frame rate set to {fps} fps"));
         self.sync_menu();
 
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Applies the sender encoder selected from the tray and restarts the sender when needed.
+    fn select_encoder(&mut self, id: &str) {
+        let Some(encoder) = self
+            .items
+            .as_ref()
+            .and_then(|items| {
+                items
+                    .encoders
+                    .iter()
+                    .find(|choice| choice.item.id().as_ref() == id)
+            })
+            .map(|choice| choice.encoder)
+        else {
+            return;
+        };
+        if self.config.send.encoder == encoder {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.encoder = encoder;
+        self.save_config();
+        crate::logging::append(format!("sender encoder set to {}", encoder.key()));
+        self.sync_menu();
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Applies a quality preset by changing the existing bitrate and NVIDIA tuning settings as a
+    /// bundle. The encoder family itself is left untouched so a preset remains safe on AMD, Intel,
+    /// and CPU-only machines; NVIDIA tuning is simply ignored by other encoder families.
+    fn select_quality(&mut self, id: &str) {
+        let Some(preset) = quality_for_menu_id(id) else {
+            return;
+        };
+        let Some((bitrate, tuning)) = preset.settings() else {
+            self.sync_menu();
+            return;
+        };
+        if self.config.send.bitrate == bitrate && self.config.send.nvidia_tuning == tuning {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.bitrate = bitrate;
+        self.config.send.nvidia_tuning = tuning;
+        self.save_config();
+        crate::logging::append(format!(
+            "sender video quality preset set to {}",
+            preset.key()
+        ));
+        self.sync_menu();
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Applies a sender bitrate in kbit/s. The pacer and encoder are rebuilt together so the
+    /// network pacing follows the selected quality instead of bursting at the old rate.
+    fn select_bitrate(&mut self, id: &str) {
+        let Some(bitrate) = bitrate_for_menu_id(id) else {
+            return;
+        };
+        if self.config.send.bitrate == bitrate {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.bitrate = bitrate;
+        self.save_config();
+        crate::logging::append(format!("sender video bitrate set to {bitrate} kbit/s"));
+        self.sync_menu();
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Applies RFC 5109 video packet-loss protection and restarts a running sender so the new
+    /// redundancy stream is negotiated with the selected receivers.
+    fn select_fec(&mut self, id: &str) {
+        let Some(percentage) = fec_for_menu_id(id) else {
+            return;
+        };
+        if self.config.send.fec_percentage == percentage {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.fec_percentage = percentage;
+        self.save_config();
+        crate::logging::append(format!(
+            "sender video packet-loss protection set to {percentage}% FEC overhead"
+        ));
+        self.sync_menu();
+
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Applies an output size. Native resolution keeps the existing monitor dimensions; fixed
+    /// sizes reduce the encoded pixels before the encoder and are useful on slower links.
+    fn select_resolution(&mut self, id: &str) {
+        let Some((width, height)) = resolution_for_menu_id(id) else {
+            return;
+        };
+        if self.config.send.width == width && self.config.send.height == height {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.width = width;
+        self.config.send.height = height;
+        self.save_config();
+        crate::logging::append(format!(
+            "sender output resolution set to {}",
+            resolution_label(width, height)
+        ));
+        self.sync_menu();
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Selects the NVIDIA encoder tuning profile. The setting is harmless on other encoder
+    /// families and becomes active automatically if the encoder is later switched to NVENC.
+    fn select_nvidia_tuning(&mut self, id: &str) {
+        let Some(tuning) = nvidia_tuning_for_menu_id(id) else {
+            return;
+        };
+        if self.config.send.nvidia_tuning == tuning {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.nvidia_tuning = tuning;
+        self.save_config();
+        crate::logging::append(format!("NVIDIA tuning set to {}", tuning.key()));
+        self.sync_menu();
         if self.active_mode == ActiveMode::Sender {
             self.start_sender();
         }
@@ -1165,6 +1470,36 @@ impl TrayApp {
         for choice in &items.frame_rates {
             choice.item.set_checked(choice.fps == self.config.send.fps);
         }
+        for choice in &items.encoders {
+            choice
+                .item
+                .set_checked(choice.encoder == self.config.send.encoder);
+        }
+        let quality =
+            QualityPreset::from_settings(self.config.send.bitrate, self.config.send.nvidia_tuning);
+        for choice in &items.qualities {
+            choice.item.set_checked(choice.preset == quality);
+        }
+        for choice in &items.bitrates {
+            choice
+                .item
+                .set_checked(choice.bitrate == self.config.send.bitrate);
+        }
+        for choice in &items.fec {
+            choice
+                .item
+                .set_checked(choice.percentage == self.config.send.fec_percentage);
+        }
+        for choice in &items.resolutions {
+            choice.item.set_checked(
+                choice.width == self.config.send.width && choice.height == self.config.send.height,
+            );
+        }
+        for choice in &items.nvidia_tuning {
+            choice
+                .item
+                .set_checked(choice.tuning == self.config.send.nvidia_tuning);
+        }
         for choice in &items.sampling {
             choice
                 .item
@@ -1246,6 +1581,12 @@ impl TrayItems {
             gpu_recv,
             frame_rates: frame_rate_choices(config.send.fps),
             sampling: sampling_choices(config.recv.sampling),
+            encoders: encoder_choices(config.send.encoder),
+            qualities: quality_choices(config.send.bitrate, config.send.nvidia_tuning),
+            bitrates: bitrate_choices(config.send.bitrate),
+            fec: fec_choices(config.send.fec_percentage),
+            resolutions: resolution_choices(config.send.width, config.send.height),
+            nvidia_tuning: nvidia_tuning_choices(config.send.nvidia_tuning),
         })
     }
 }
@@ -1289,6 +1630,242 @@ fn frame_rate_menu_rates(configured: u32) -> Vec<u32> {
 
 fn frame_rate_for_menu_id(id: &str) -> Option<u32> {
     id.strip_prefix(ID_FRAME_RATE_PREFIX)?.parse().ok()
+}
+
+fn encoder_submenu(choices: &[EncoderMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Video Encoder", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn encoder_choices(configured: ConfigEncoder) -> Vec<EncoderMenuChoice> {
+    ConfigEncoder::ALL
+        .into_iter()
+        .map(|encoder| EncoderMenuChoice {
+            encoder,
+            item: CheckMenuItem::with_id(
+                format!("{ID_ENCODER_PREFIX}{}", encoder.key()),
+                encoder.label(),
+                true,
+                encoder == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn quality_submenu(choices: &[QualityMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Video Quality Preset", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn quality_choices(
+    configured_bitrate: u32,
+    configured_tuning: ConfigNvidiaTuning,
+) -> Vec<QualityMenuChoice> {
+    let configured = QualityPreset::from_settings(configured_bitrate, configured_tuning);
+    QualityPreset::ALL
+        .into_iter()
+        .map(|preset| QualityMenuChoice {
+            preset,
+            item: CheckMenuItem::with_id(
+                format!("{ID_QUALITY_PREFIX}{}", preset.key()),
+                preset.label(),
+                preset != QualityPreset::Custom,
+                preset == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn quality_for_menu_id(id: &str) -> Option<QualityPreset> {
+    let key = id.strip_prefix(ID_QUALITY_PREFIX)?;
+    QualityPreset::ALL
+        .into_iter()
+        .find(|preset| preset.key() == key)
+}
+
+fn bitrate_submenu(choices: &[BitrateMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Video Bitrate", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn bitrate_choices(configured: u32) -> Vec<BitrateMenuChoice> {
+    let mut rates = VIDEO_BITRATES.to_vec();
+    if configured > 0 && !rates.contains(&configured) {
+        rates.push(configured);
+        rates.sort_unstable();
+    }
+    rates
+        .into_iter()
+        .map(|bitrate| BitrateMenuChoice {
+            bitrate,
+            item: CheckMenuItem::with_id(
+                format!("{ID_BITRATE_PREFIX}{bitrate}"),
+                format!("{:.1} Mbps", bitrate as f32 / 1_000.0),
+                true,
+                bitrate == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn bitrate_for_menu_id(id: &str) -> Option<u32> {
+    id.strip_prefix(ID_BITRATE_PREFIX)?.parse().ok()
+}
+
+fn fec_submenu(choices: &[FecMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Packet Loss Protection", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+const FEC_PERCENTAGES: [u32; 4] = [0, 10, 25, 50];
+
+fn fec_choices(configured: u32) -> Vec<FecMenuChoice> {
+    let mut percentages = FEC_PERCENTAGES.to_vec();
+    if configured <= 100 && !percentages.contains(&configured) {
+        percentages.push(configured);
+        percentages.sort_unstable();
+    }
+    percentages
+        .into_iter()
+        .map(|percentage| FecMenuChoice {
+            percentage,
+            item: CheckMenuItem::with_id(
+                format!("{ID_FEC_PREFIX}{percentage}"),
+                if percentage == 0 {
+                    "Off".to_string()
+                } else {
+                    format!("{percentage}% overhead")
+                },
+                true,
+                percentage == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn fec_for_menu_id(id: &str) -> Option<u32> {
+    let percentage = id.strip_prefix(ID_FEC_PREFIX)?.parse().ok()?;
+    (percentage <= 100).then_some(percentage)
+}
+
+fn resolution_submenu(choices: &[ResolutionMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("Output Resolution", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn resolution_choices(
+    configured_width: Option<u32>,
+    configured_height: Option<u32>,
+) -> Vec<ResolutionMenuChoice> {
+    let mut choices = OUTPUT_RESOLUTIONS
+        .into_iter()
+        .map(|(width, height, label)| ResolutionMenuChoice {
+            width,
+            height,
+            item: CheckMenuItem::with_id(
+                format!("{ID_RESOLUTION_PREFIX}{}", resolution_key(width, height)),
+                label,
+                true,
+                width == configured_width && height == configured_height,
+                None,
+            ),
+        })
+        .collect::<Vec<_>>();
+
+    if !choices
+        .iter()
+        .any(|choice| choice.width == configured_width && choice.height == configured_height)
+    {
+        let label = resolution_label(configured_width, configured_height);
+        choices.push(ResolutionMenuChoice {
+            width: configured_width,
+            height: configured_height,
+            item: CheckMenuItem::with_id(
+                format!(
+                    "{ID_RESOLUTION_PREFIX}{}",
+                    resolution_key(configured_width, configured_height)
+                ),
+                label,
+                true,
+                true,
+                None,
+            ),
+        });
+    }
+    choices
+}
+
+fn resolution_key(width: Option<u32>, height: Option<u32>) -> String {
+    match (width, height) {
+        (Some(width), Some(height)) => format!("{width}x{height}"),
+        _ => "native".to_string(),
+    }
+}
+
+fn resolution_label(width: Option<u32>, height: Option<u32>) -> String {
+    match (width, height) {
+        (Some(width), Some(height)) => format!("{width} × {height}"),
+        _ => "Native monitor resolution".to_string(),
+    }
+}
+
+fn resolution_for_menu_id(id: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let key = id.strip_prefix(ID_RESOLUTION_PREFIX)?;
+    if key == "native" {
+        return Some((None, None));
+    }
+    let (width, height) = key.split_once('x')?;
+    Some((Some(width.parse().ok()?), Some(height.parse().ok()?)))
+}
+
+fn nvidia_tuning_submenu(choices: &[NvidiaTuningMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("NVIDIA Tuning", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn nvidia_tuning_choices(configured: ConfigNvidiaTuning) -> Vec<NvidiaTuningMenuChoice> {
+    ConfigNvidiaTuning::ALL
+        .into_iter()
+        .map(|tuning| NvidiaTuningMenuChoice {
+            tuning,
+            item: CheckMenuItem::with_id(
+                format!("{ID_NVIDIA_TUNING_PREFIX}{}", tuning.key()),
+                tuning.label(),
+                true,
+                tuning == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn nvidia_tuning_for_menu_id(id: &str) -> Option<ConfigNvidiaTuning> {
+    let key = id.strip_prefix(ID_NVIDIA_TUNING_PREFIX)?;
+    ConfigNvidiaTuning::ALL
+        .into_iter()
+        .find(|tuning| tuning.key() == key)
 }
 
 fn sampling_submenu(choices: &[SamplingMenuChoice]) -> Result<Submenu> {
@@ -1501,6 +2078,128 @@ mod tests {
     fn menu_ids_from_other_submenus_are_not_read_as_frame_rates() {
         assert_eq!(frame_rate_for_menu_id("gpu-send:0"), None);
         assert_eq!(frame_rate_for_menu_id("fps:auto"), None);
+    }
+
+    #[test]
+    fn encoder_menu_ids_round_trip_to_the_configured_encoders() {
+        let choices = encoder_choices(ConfigEncoder::Auto);
+
+        assert_eq!(choices.len(), ConfigEncoder::ALL.len());
+        for choice in &choices {
+            assert!(choice.item.id().as_ref().starts_with(ID_ENCODER_PREFIX));
+            assert_eq!(
+                choice.encoder.key(),
+                choice.item.id().as_ref().split(':').nth(1).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn bitrate_menu_keeps_a_hand_edited_value_visible() {
+        let choices = bitrate_choices(10_000);
+
+        assert_eq!(
+            choices
+                .iter()
+                .filter(|choice| choice.bitrate == 10_000)
+                .count(),
+            1
+        );
+        for choice in &choices {
+            assert_eq!(
+                bitrate_for_menu_id(choice.item.id().as_ref()),
+                Some(choice.bitrate)
+            );
+        }
+        assert_eq!(bitrate_for_menu_id("encoder:auto"), None);
+    }
+
+    #[test]
+    fn fec_menu_defaults_and_hand_edited_values_round_trip() {
+        let choices = fec_choices(25);
+
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.percentage)
+                .collect::<Vec<_>>(),
+            vec![0, 10, 25, 50]
+        );
+        for choice in &choices {
+            assert_eq!(
+                fec_for_menu_id(choice.item.id().as_ref()),
+                Some(choice.percentage)
+            );
+        }
+
+        let custom = fec_choices(40);
+        assert_eq!(
+            custom
+                .iter()
+                .map(|choice| choice.percentage)
+                .collect::<Vec<_>>(),
+            vec![0, 10, 25, 40, 50]
+        );
+        assert_eq!(fec_for_menu_id("bitrate:8000"), None);
+        assert_eq!(fec_for_menu_id("fec:101"), None);
+    }
+
+    #[test]
+    fn quality_presets_round_trip_and_mark_manual_values_custom() {
+        let choices = quality_choices(8_000, ConfigNvidiaTuning::Auto);
+
+        assert_eq!(choices.len(), QualityPreset::ALL.len());
+        for choice in &choices {
+            assert_eq!(
+                quality_for_menu_id(choice.item.id().as_ref()),
+                Some(choice.preset)
+            );
+        }
+        assert_eq!(
+            QualityPreset::from_settings(8_000, ConfigNvidiaTuning::Auto),
+            QualityPreset::Balanced
+        );
+        assert_eq!(
+            QualityPreset::from_settings(10_000, ConfigNvidiaTuning::Auto),
+            QualityPreset::Custom
+        );
+        assert_eq!(quality_for_menu_id("bitrate:8000"), None);
+    }
+
+    #[test]
+    fn resolution_menu_round_trips_native_and_fixed_sizes() {
+        let choices = resolution_choices(Some(1600), Some(900));
+
+        assert_eq!(
+            choices
+                .iter()
+                .filter(|choice| choice.width == Some(1600))
+                .count(),
+            1
+        );
+        assert_eq!(
+            resolution_for_menu_id("resolution:native"),
+            Some((None, None))
+        );
+        assert_eq!(
+            resolution_for_menu_id("resolution:1920x1080"),
+            Some((Some(1920), Some(1080)))
+        );
+        assert_eq!(resolution_for_menu_id("resolution:bad"), None);
+    }
+
+    #[test]
+    fn nvidia_tuning_menu_ids_round_trip_to_profiles() {
+        let choices = nvidia_tuning_choices(ConfigNvidiaTuning::Auto);
+
+        assert_eq!(choices.len(), ConfigNvidiaTuning::ALL.len());
+        for choice in &choices {
+            assert_eq!(
+                nvidia_tuning_for_menu_id(choice.item.id().as_ref()),
+                Some(choice.tuning)
+            );
+        }
+        assert_eq!(nvidia_tuning_for_menu_id("nvidia-tuning:unknown"), None);
     }
 
     #[test]

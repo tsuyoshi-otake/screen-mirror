@@ -1,3 +1,4 @@
+use crate::control::{FeedbackHealth, FeedbackStore};
 use anyhow::{anyhow, Context, Result};
 use clap::{ArgAction, Args, ValueEnum};
 use gst::prelude::*;
@@ -24,6 +25,9 @@ const RECEIVER_PACKET_TIMEOUT: Duration = Duration::from_secs(8);
 const RECEIVER_VIDEO_DECODER_NAME: &str = "receiver_video_decoder";
 const RECEIVER_VIDEO_SINK_NAME: &str = "receiver_video_sink";
 const RECEIVER_VIDEO_JITTER_NAME: &str = "receiver_video_jitter";
+const RECEIVER_VIDEO_STORAGE_NAME: &str = "receiver_video_storage";
+const RECEIVER_VIDEO_FEC_NAME: &str = "receiver_video_fec";
+const ADAPTIVE_BITRATE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the receiver records what the stream is actually doing.
 ///
 /// Long enough that one slow frame does not read as a collapse, short enough that a stutter the user
@@ -87,6 +91,10 @@ pub struct SendArgs {
     /// Target bitrate in kbit/sec.
     #[arg(long, default_value_t = 8_000)]
     pub bitrate: u32,
+
+    /// RFC 5109 ULP-FEC overhead percentage. Auto-discovered Android receivers disable it.
+    #[arg(long, default_value_t = 0)]
+    pub fec_percentage: u32,
 
     /// RTP MTU. 1200 is safe for Wi-Fi and VPN-ish paths.
     #[arg(long, default_value_t = 1200)]
@@ -204,6 +212,21 @@ pub struct RecvArgs {
     /// GPU to decode and render on: "auto", a DXGI adapter index, or part of the adapter name.
     #[arg(long, default_value = crate::gpu::AUTO)]
     pub gpu: String,
+}
+
+/// A short receiver-side snapshot shared by the stats overlay and the feedback sender.
+#[derive(Clone, Debug, Default)]
+pub struct ReceiverStreamStats {
+    pub window_ms: u64,
+    pub received_packets: u64,
+    pub lost_packets: u64,
+    pub late_packets: u64,
+    pub duplicate_packets: u64,
+    pub decoded_frames: u64,
+    pub displayed_frames: u64,
+    pub decoded_fps: f32,
+    pub displayed_fps: f32,
+    pub jitter_ms: u32,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -338,13 +361,15 @@ struct SenderPacketPacer {
 
 impl SenderPacketPacer {
     fn new(bitrate_kbit: u32) -> Self {
-        let bits_per_second = u64::from(bitrate_kbit)
-            .saturating_mul(1_000)
-            .saturating_mul(SENDER_PACING_RATE_MULTIPLIER);
         Self {
-            bytes_per_second: (bits_per_second / 8).max(1),
+            bytes_per_second: paced_bytes_per_second(bitrate_kbit),
             next_send: Instant::now(),
         }
+    }
+
+    fn set_bitrate(&mut self, bitrate_kbit: u32) {
+        self.bytes_per_second = paced_bytes_per_second(bitrate_kbit);
+        self.next_send = Instant::now();
     }
 
     fn wait_for_packet(&mut self, packet_size: usize) {
@@ -365,6 +390,13 @@ impl SenderPacketPacer {
             .min(u128::from(u64::MAX)) as u64;
         self.next_send = Instant::now() + Duration::from_nanos(nanos.max(1));
     }
+}
+
+fn paced_bytes_per_second(bitrate_kbit: u32) -> u64 {
+    let bits_per_second = u64::from(bitrate_kbit)
+        .saturating_mul(1_000)
+        .saturating_mul(SENDER_PACING_RATE_MULTIPLIER);
+    (bits_per_second / 8).max(1)
 }
 
 fn attach_sender_packet_pacer(
@@ -504,24 +536,31 @@ impl Drop for PipelineHandle {
 }
 
 pub fn spawn_pipeline(description: String) -> PipelineHandle {
-    spawn_pipeline_with_pacer(description, None)
+    spawn_pipeline_with_pacer(description, None, None)
 }
 
-/// Starts a sender pipeline with a small amount of network shaping on the RTP payloader output.
-///
-/// Hardware encoders commonly produce a whole frame in one scheduler turn.  With UDP that turns
-/// one frame into a short packet burst, which can overflow a Wi-Fi/AP queue even when the average
-/// bitrate is well below link capacity.  Sunshine uses the same basic idea in its network flow
-/// control: pace video packets, while keeping the rate high enough that the added latency stays
-/// below a frame.
-pub fn spawn_sender_pipeline(description: String, bitrate_kbit: u32) -> PipelineHandle {
-    spawn_pipeline_with_pacer(description, Some(bitrate_kbit))
+pub fn spawn_sender_pipeline_with_feedback(
+    description: String,
+    bitrate_kbit: u32,
+    feedback: Option<FeedbackStore>,
+) -> PipelineHandle {
+    spawn_pipeline_with_pacer(description, Some(bitrate_kbit), feedback)
 }
 
-fn spawn_pipeline_with_pacer(description: String, bitrate_kbit: Option<u32>) -> PipelineHandle {
+fn spawn_pipeline_with_pacer(
+    description: String,
+    bitrate_kbit: Option<u32>,
+    feedback: Option<FeedbackStore>,
+) -> PipelineHandle {
     let (stop, stop_rx) = mpsc::channel();
     let thread = thread::spawn(move || {
-        let result = run_pipeline_until_stop_with_pacer(&description, &stop_rx, bitrate_kbit);
+        let result = run_pipeline_until_stop_with_pacer(
+            &description,
+            &stop_rx,
+            bitrate_kbit,
+            feedback,
+            None,
+        );
         if let Err(error) = &result {
             crate::logging::append(format!("pipeline failed: {error:#}"));
         }
@@ -533,10 +572,13 @@ fn spawn_pipeline_with_pacer(description: String, bitrate_kbit: Option<u32>) -> 
     }
 }
 
-pub fn spawn_receiver_pipeline(plan: ReceiverPipelinePlan) -> PipelineHandle {
+pub fn spawn_receiver_pipeline_with_stats(
+    plan: ReceiverPipelinePlan,
+    stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
+) -> PipelineHandle {
     let (stop, stop_rx) = mpsc::channel();
     let thread = thread::spawn(move || {
-        let result = run_receiver_pipeline_plan_until_stop(plan, &stop_rx);
+        let result = run_receiver_pipeline_plan_until_stop(plan, &stop_rx, stats);
         if let Err(error) = &result {
             crate::logging::append(format!("receiver pipeline failed: {error:#}"));
         }
@@ -575,6 +617,7 @@ pub fn build_sender_video_pipeline_for(
     ensure_positive("udp-buffer-size", args.udp_buffer_size)?;
     ensure_positive("max-receivers", args.max_receivers)?;
     validate_qos_dscp(args.qos_dscp)?;
+    validate_fec_percentage(args.fec_percentage)?;
 
     if args.width.is_some() != args.height.is_some() {
         return Err(anyhow!("--width and --height must be specified together"));
@@ -678,6 +721,7 @@ pub fn build_sender_video_pipeline_for(
     ));
     let caps = video_caps(args.fps, args.width, args.height, use_d3d11_memory);
     let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
+    let fec_chain = sender_fec_chain(args.fec_percentage)?;
 
     let video = format!(
         "{source} ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
@@ -685,6 +729,7 @@ pub fn build_sender_video_pipeline_for(
          ! {encoder_chain} \
          ! h264parse config-interval=-1 \
          ! rtph264pay name={SENDER_RTP_PAY_NAME} pt=96 mtu={} config-interval=-1 aggregate-mode=zero-latency \
+         {fec_chain}\
          ! multiudpsink clients={} sync=false async=false buffer-size={} qos-dscp={} send-duplicates=false ttl=1",
         args.mtu,
         gst_string_literal(&clients),
@@ -693,6 +738,14 @@ pub fn build_sender_video_pipeline_for(
     );
 
     Ok(video)
+}
+
+fn sender_fec_chain(percentage: u32) -> Result<String> {
+    if percentage == 0 {
+        return Ok(String::new());
+    }
+    require_element("rtpulpfecenc", ())?;
+    Ok(format!(" ! rtpulpfecenc percentage={percentage} pt=122"))
 }
 
 pub fn build_sender_audio_pipeline(args: &SendArgs) -> Result<String> {
@@ -970,23 +1023,40 @@ fn receiver_video_pipeline(args: &RecvArgs, route: &ReceiverVideoRoute) -> Resul
     // negotiated so GStreamer can choose a system-memory bridge instead of crossing GPU textures.
     let output_caps = route.decoder.output_caps_for(&route.sink);
     let sink = &route.sink;
+    let media_caps = "application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1";
+    let jitter = format!(
+        "rtpjitterbuffer name={RECEIVER_VIDEO_JITTER_NAME} latency={} drop-on-latency=true do-lost=true faststart-min-packets={} max-dropout-time={} max-misorder-time={}",
+        args.jitter_ms,
+        args.jitter_faststart_packets,
+        args.jitter_max_dropout_ms,
+        args.jitter_max_misorder_ms,
+    );
+    let ingress = if fec_supported() {
+        let storage_time_ns = u64::from(args.jitter_ms.saturating_add(50)) * 1_000_000;
+        format!(
+            "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"{media_caps}\" \
+             ! rtpstorage name={RECEIVER_VIDEO_STORAGE_NAME} size-time={storage_time_ns} \
+             ! rtpssrcdemux name=receiver_video_ssrc_demux \
+             ! {media_caps} ! {jitter} \
+             ! rtpulpfecdec name={RECEIVER_VIDEO_FEC_NAME} pt=122",
+            args.port, args.udp_buffer_size, args.mtu
+        )
+    } else {
+        format!(
+            "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"{media_caps}\" \
+             ! {jitter}",
+            args.port, args.udp_buffer_size, args.mtu
+        )
+    };
 
     Ok(format!(
-        "udpsrc name=receiver_video_src port={} buffer-size={} mtu={} retrieve-sender-address=false timeout=0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96,packetization-mode=(string)1\" \
-         ! rtpjitterbuffer name={RECEIVER_VIDEO_JITTER_NAME} latency={} drop-on-latency=true do-lost=true faststart-min-packets={} max-dropout-time={} max-misorder-time={} \
+        "{ingress} \
          ! rtph264depay wait-for-keyframe=true \
          ! h264parse disable-passthrough=true \
          ! queue max-size-buffers=4 max-size-time=0 max-size-bytes=0 \
          ! {}{} \
          ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {sink}",
-        args.port,
-        args.udp_buffer_size,
-        args.mtu,
-        args.jitter_ms,
-        args.jitter_faststart_packets,
-        args.jitter_max_dropout_ms,
-        args.jitter_max_misorder_ms,
         route.decoder.pipeline_element(),
         output_caps,
     ))
@@ -1049,22 +1119,36 @@ pub fn run_pipeline(description: &str) -> Result<()> {
     run_pipeline_until_stop(description, &stop_rx)
 }
 
-pub fn run_receiver_pipeline_plan(plan: ReceiverPipelinePlan) -> Result<()> {
+pub fn run_sender_pipeline(
+    description: &str,
+    bitrate_kbit: u32,
+    feedback: Option<FeedbackStore>,
+) -> Result<()> {
     let (_stop, stop_rx) = mpsc::channel();
-    run_receiver_pipeline_plan_until_stop(plan, &stop_rx)
+    run_pipeline_until_stop_with_pacer(description, &stop_rx, Some(bitrate_kbit), feedback, None)
+}
+
+pub fn run_receiver_pipeline_plan_with_stats(
+    plan: ReceiverPipelinePlan,
+    stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
+) -> Result<()> {
+    let (_stop, stop_rx) = mpsc::channel();
+    run_receiver_pipeline_plan_until_stop(plan, &stop_rx, stats)
 }
 
 fn run_receiver_pipeline_plan_until_stop(
     plan: ReceiverPipelinePlan,
     stop_rx: &mpsc::Receiver<()>,
+    stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
 ) -> Result<()> {
     let ReceiverPipelinePlan {
         primary, fallbacks, ..
     } = plan;
-    let primary_error = match run_pipeline_until_stop(&primary, stop_rx) {
-        Err(error) => error,
-        result => return result,
-    };
+    let primary_error =
+        match run_pipeline_until_stop_with_pacer(&primary, stop_rx, None, None, stats.clone()) {
+            Err(error) => error,
+            result => return result,
+        };
 
     let mut last_error = primary_error;
     for (index, route) in fallbacks.iter().enumerate() {
@@ -1080,7 +1164,13 @@ fn run_receiver_pipeline_plan_until_stop(
             "receiver fallback pipeline ({}): {}",
             route.label, route.description
         ));
-        match run_pipeline_until_stop(&route.description, stop_rx) {
+        match run_pipeline_until_stop_with_pacer(
+            &route.description,
+            stop_rx,
+            None,
+            None,
+            stats.clone(),
+        ) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = error;
@@ -1100,28 +1190,35 @@ fn run_receiver_pipeline_plan_until_stop(
 }
 
 fn run_pipeline_until_stop(description: &str, stop_rx: &mpsc::Receiver<()>) -> Result<()> {
-    run_pipeline_until_stop_with_pacer(description, stop_rx, None)
+    run_pipeline_until_stop_with_pacer(description, stop_rx, None, None, None)
 }
 
 fn run_pipeline_until_stop_with_pacer(
     description: &str,
     stop_rx: &mpsc::Receiver<()>,
     bitrate_kbit: Option<u32>,
+    feedback: Option<FeedbackStore>,
+    receiver_stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
 ) -> Result<()> {
     let element = gst::parse::launch(description).context("failed to parse GStreamer pipeline")?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("pipeline description did not create a GstPipeline"))?;
     let bus = pipeline.bus().context("pipeline has no bus")?;
+    attach_receiver_fec_storage(&pipeline);
     arm_receiver_timeout_after_first_packet(&pipeline);
-    let _sender_pacer =
+    let sender_pacer =
         bitrate_kbit.and_then(|bitrate| attach_sender_packet_pacer(&pipeline, bitrate));
+    let mut adaptive_bitrate = bitrate_kbit
+        .zip(feedback)
+        .map(|(ceiling, feedback)| AdaptiveBitrateController::new(ceiling, feedback));
 
     pipeline
         .set_state(gst::State::Playing)
         .context("failed to set pipeline to Playing")?;
     let mut key_unit_requester = SenderKeyUnitRequester::attach(&pipeline);
-    let mut stream_report = ReceiverStreamReport::attach(&pipeline, Instant::now());
+    let mut stream_report =
+        ReceiverStreamReport::attach_with_stats(&pipeline, Instant::now(), receiver_stats);
     let mut receiver_runtime_logged = pipeline
         .by_name(RECEIVER_VIDEO_DECODER_NAME)
         .is_some()
@@ -1138,6 +1235,10 @@ fn run_pipeline_until_stop_with_pacer(
 
         if let Some(report) = stream_report.as_mut() {
             report.report_if_due(Instant::now());
+        }
+
+        if let Some(controller) = adaptive_bitrate.as_mut() {
+            controller.update(Instant::now(), &pipeline, sender_pacer.as_ref());
         }
 
         if let Some(logged) = receiver_runtime_logged.as_mut() {
@@ -1198,6 +1299,139 @@ fn run_pipeline_until_stop_with_pacer(
     result
 }
 
+/// `rtpulpfecdec` needs the packet history owned by the upstream `rtpstorage`. The property is an
+/// object reference, so keeping both elements in the textual pipeline is not enough; connect them
+/// after parsing and before the pipeline enters Playing.
+fn attach_receiver_fec_storage(pipeline: &gst::Pipeline) {
+    let Some(storage) = pipeline.by_name(RECEIVER_VIDEO_STORAGE_NAME) else {
+        return;
+    };
+    let Some(fec) = pipeline.by_name(RECEIVER_VIDEO_FEC_NAME) else {
+        return;
+    };
+    if fec.find_property("storage").is_some() {
+        fec.set_property("storage", storage);
+        crate::logging::append("receiver ULP-FEC storage attached");
+    }
+}
+
+/// Converts receiver health into small, reversible bitrate steps.
+///
+/// The sender keeps the configured bitrate as a ceiling. A short loss spike reduces the rate
+/// quickly, while recovery needs three clean windows so a transient radio improvement does not
+/// immediately recreate the burst that caused the drop.
+struct AdaptiveBitrateController {
+    feedback: FeedbackStore,
+    ceiling: u32,
+    floor: u32,
+    current: u32,
+    stable_windows: u8,
+    next_update: Instant,
+}
+
+impl AdaptiveBitrateController {
+    fn new(ceiling: u32, feedback: FeedbackStore) -> Self {
+        Self {
+            feedback,
+            ceiling,
+            floor: (ceiling / 2).max(1_000),
+            current: ceiling,
+            stable_windows: 0,
+            next_update: Instant::now(),
+        }
+    }
+
+    fn update(
+        &mut self,
+        now: Instant,
+        pipeline: &gst::Pipeline,
+        sender_pacer: Option<&Arc<Mutex<SenderPacketPacer>>>,
+    ) {
+        if now < self.next_update {
+            return;
+        }
+        self.next_update = now + ADAPTIVE_BITRATE_INTERVAL;
+
+        let health = self.feedback.health();
+        let Some(target) = self.next_target(health) else {
+            return;
+        };
+        if target == self.current {
+            return;
+        }
+
+        let previous = self.current;
+        self.current = target;
+        if let Some(pacer) = sender_pacer {
+            if let Ok(mut pacer) = pacer.lock() {
+                pacer.set_bitrate(target);
+            }
+        }
+
+        let encoder_updated = pipeline
+            .by_name(SENDER_VIDEO_ENCODER_NAME)
+            .map(|encoder| set_encoder_bitrate(&encoder, target))
+            .unwrap_or(false);
+        crate::logging::append(format!(
+            "adaptive sender bitrate: {previous} -> {target} kbit/s (receivers={}, loss={:.2}%, late={:.2}%, jitter={}ms, encoder_property={encoder_updated})",
+            health.receiver_count,
+            health.loss_ratio * 100.0,
+            health.late_ratio * 100.0,
+            health.jitter_ms.round() as u32,
+        ));
+    }
+
+    fn next_target(&mut self, health: FeedbackHealth) -> Option<u32> {
+        if health.receiver_count == 0 {
+            self.stable_windows = 0;
+            return None;
+        }
+
+        let congested =
+            health.loss_ratio >= 0.02 || health.late_ratio >= 0.05 || health.jitter_ms >= 60.0;
+        if congested {
+            self.stable_windows = 0;
+            return Some(
+                self.current
+                    .saturating_mul(80)
+                    .div_euclid(100)
+                    .max(self.floor),
+            );
+        }
+
+        let healthy =
+            health.loss_ratio <= 0.005 && health.late_ratio <= 0.01 && health.jitter_ms <= 30.0;
+        if healthy {
+            self.stable_windows = self.stable_windows.saturating_add(1);
+            if self.stable_windows >= 3 {
+                self.stable_windows = 0;
+                return Some(
+                    self.current
+                        .saturating_mul(105)
+                        .div_euclid(100)
+                        .min(self.ceiling),
+                );
+            }
+        } else {
+            self.stable_windows = 0;
+        }
+        Some(self.current)
+    }
+}
+
+fn set_encoder_bitrate(encoder: &gst::Element, bitrate_kbit: u32) -> bool {
+    let mut changed = false;
+    if encoder.find_property("bitrate").is_some() {
+        encoder.set_property("bitrate", bitrate_kbit);
+        changed = true;
+    }
+    if encoder.find_property("max-bitrate").is_some() {
+        encoder.set_property("max-bitrate", bitrate_kbit);
+        changed = true;
+    }
+    changed
+}
+
 /// Records how many frames the receiver decoded and how many of them reached the screen.
 ///
 /// "The framerate is low" has three different causes that look identical on screen, and telling them
@@ -1210,12 +1444,20 @@ struct ReceiverStreamReport {
     displayed: Arc<AtomicU64>,
     jitter: Option<gst::Element>,
     jitter_total: JitterCounts,
-    window_started: Instant,
+    stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
+    feedback_window_started: Instant,
+    report_window_started: Instant,
+    report_displayed: u64,
+    report_decoded: Option<u64>,
+    report_jitter: JitterCounts,
 }
 
 impl ReceiverStreamReport {
-    /// Attaches to a receiver pipeline, and to nothing else: a sender has no video sink to count at.
-    fn attach(pipeline: &gst::Pipeline, now: Instant) -> Option<Self> {
+    fn attach_with_stats(
+        pipeline: &gst::Pipeline,
+        now: Instant,
+        stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
+    ) -> Option<Self> {
         let sink = pipeline.by_name(RECEIVER_VIDEO_SINK_NAME)?;
         let displayed = count_buffers_on(&sink, "sink")?;
         // `decodebin` exposes no static source pad, so its frames are counted at the sink only.
@@ -1226,21 +1468,27 @@ impl ReceiverStreamReport {
             .by_name(RECEIVER_VIDEO_JITTER_NAME)
             .filter(|jitter| jitter.find_property("stats").is_some());
         let jitter_total = jitter.as_ref().map(jitter_counts).unwrap_or_default();
+        let report_decoded = decoded.as_ref().map(|_| 0);
         Some(Self {
             decoded,
             displayed,
             jitter,
             jitter_total,
-            window_started: now,
+            stats,
+            feedback_window_started: now,
+            report_window_started: now,
+            report_displayed: 0,
+            report_decoded,
+            report_jitter: JitterCounts::default(),
         })
     }
 
     fn report_if_due(&mut self, now: Instant) {
-        let window = now.duration_since(self.window_started);
-        if window < RECEIVER_STREAM_REPORT_INTERVAL {
+        let feedback_window = now.duration_since(self.feedback_window_started);
+        if feedback_window < Duration::from_secs(1) {
             return;
         }
-        self.window_started = now;
+        self.feedback_window_started = now;
 
         let jitter = self.jitter.as_ref().map(jitter_counts);
         let since_last_report = jitter.map(|counts| counts.since(self.jitter_total));
@@ -1248,12 +1496,58 @@ impl ReceiverStreamReport {
             self.jitter_total = counts;
         }
 
+        let displayed = take_count(&self.displayed);
+        let decoded = self.decoded.as_ref().map(take_count);
+        if let Some(stats) = self.stats.as_ref() {
+            if let Ok(mut stats) = stats.lock() {
+                let seconds = feedback_window.as_secs_f32().max(f32::EPSILON);
+                let jitter_ms = jitter.map(|counts| counts.jitter_ms).unwrap_or_default();
+                *stats = ReceiverStreamStats {
+                    window_ms: feedback_window.as_millis().min(u128::from(u64::MAX)) as u64,
+                    received_packets: since_last_report
+                        .map(|counts| counts.pushed)
+                        .unwrap_or_default(),
+                    lost_packets: since_last_report
+                        .map(|counts| counts.lost)
+                        .unwrap_or_default(),
+                    late_packets: since_last_report
+                        .map(|counts| counts.late)
+                        .unwrap_or_default(),
+                    duplicate_packets: since_last_report
+                        .map(|counts| counts.duplicates)
+                        .unwrap_or_default(),
+                    decoded_frames: decoded.unwrap_or_default(),
+                    displayed_frames: displayed,
+                    decoded_fps: decoded.unwrap_or_default() as f32 / seconds,
+                    displayed_fps: displayed as f32 / seconds,
+                    jitter_ms,
+                };
+            }
+        }
+
+        self.report_displayed = self.report_displayed.saturating_add(displayed);
+        if let (Some(total), Some(decoded)) = (self.report_decoded.as_mut(), decoded) {
+            *total = total.saturating_add(decoded);
+        }
+        if let Some(jitter) = since_last_report {
+            self.report_jitter = self.report_jitter.saturating_add(jitter);
+        }
+
+        let report_window = now.duration_since(self.report_window_started);
+        if report_window < RECEIVER_STREAM_REPORT_INTERVAL {
+            return;
+        }
+        self.report_window_started = now;
+
         crate::logging::append(stream_report_line(
-            window,
-            take_count(&self.displayed),
-            self.decoded.as_ref().map(take_count),
-            since_last_report,
+            report_window,
+            self.report_displayed,
+            self.report_decoded,
+            self.jitter.as_ref().map(|_| self.report_jitter),
         ));
+        self.report_displayed = 0;
+        self.report_decoded = self.decoded.as_ref().map(|_| 0);
+        self.report_jitter = JitterCounts::default();
     }
 }
 
@@ -1279,6 +1573,7 @@ struct JitterCounts {
     lost: u64,
     late: u64,
     duplicates: u64,
+    jitter_ms: u32,
 }
 
 impl JitterCounts {
@@ -1288,6 +1583,17 @@ impl JitterCounts {
             lost: self.lost.saturating_sub(earlier.lost),
             late: self.late.saturating_sub(earlier.late),
             duplicates: self.duplicates.saturating_sub(earlier.duplicates),
+            jitter_ms: self.jitter_ms,
+        }
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            pushed: self.pushed.saturating_add(other.pushed),
+            lost: self.lost.saturating_add(other.lost),
+            late: self.late.saturating_add(other.late),
+            duplicates: self.duplicates.saturating_add(other.duplicates),
+            jitter_ms: other.jitter_ms,
         }
     }
 }
@@ -1302,6 +1608,14 @@ fn jitter_counts(jitter: &gst::Element) -> JitterCounts {
         lost: count("num-lost"),
         late: count("num-late"),
         duplicates: count("num-duplicates"),
+        jitter_ms: stats
+            .get::<u64>("avg-jitter")
+            .map(|nanoseconds| {
+                nanoseconds
+                    .saturating_div(1_000_000)
+                    .min(u64::from(u32::MAX)) as u32
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -2279,6 +2593,15 @@ pub fn probe_elements() {
     }
 }
 
+/// Returns whether this runtime has the complete GStreamer ULP-FEC receiver path. The sender and
+/// discovery layer use the same check so a receiver never advertises support it cannot actually
+/// use.
+pub fn fec_supported() -> bool {
+    ["rtpstorage", "rtpssrcdemux", "rtpulpfecdec"]
+        .into_iter()
+        .all(has_element)
+}
+
 /// What `probe` reports on, in the order a reader scans it.
 fn probed_elements() -> Vec<(&'static str, &'static str)> {
     let mut elements = vec![
@@ -2289,6 +2612,10 @@ fn probed_elements() -> Vec<(&'static str, &'static str)> {
         ("qsv encode", "qsvh264enc"),
         ("cpu encode", "x264enc"),
         ("rtp pay", "rtph264pay"),
+        ("rtp FEC encode", "rtpulpfecenc"),
+        ("rtp FEC decode", "rtpulpfecdec"),
+        ("rtp storage", "rtpstorage"),
+        ("rtp SSRC demux", "rtpssrcdemux"),
         ("opus encode", "opusenc"),
         ("opus decode", "opusdec"),
         ("audio capture", "wasapi2src"),
@@ -2322,6 +2649,14 @@ fn validate_qos_dscp(value: i32) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!("--qos-dscp must be -1 or 0..63"))
+    }
+}
+
+fn validate_fec_percentage(value: u32) -> Result<()> {
+    if value <= 100 {
+        Ok(())
+    } else {
+        Err(anyhow!("--fec-percentage must be 0..100"))
     }
 }
 
@@ -2406,6 +2741,14 @@ mod tests {
                 "probe never mentions {decoder}, so a build that ships it looks like it cannot decode on the CPU"
             );
         }
+    }
+
+    #[test]
+    fn fec_is_disabled_by_default_and_percentage_is_bounded() {
+        assert_eq!(sender_fec_chain(0).unwrap(), "");
+        assert!(validate_fec_percentage(0).is_ok());
+        assert!(validate_fec_percentage(100).is_ok());
+        assert!(validate_fec_percentage(101).is_err());
     }
 
     fn h264_nal_types_from_rtp(packet: &[u8]) -> Vec<u8> {
@@ -2531,6 +2874,7 @@ mod tests {
                 lost: 12,
                 late: 4,
                 duplicates: 0,
+                jitter_ms: 0,
             }),
         );
 
@@ -2548,6 +2892,46 @@ mod tests {
         assert_eq!(line, "receiver stream 5.0s: displayed=150 (30.0 fps)");
     }
 
+    #[test]
+    fn adaptive_bitrate_reduces_fast_but_recovers_after_three_clean_windows() {
+        let mut controller = AdaptiveBitrateController::new(8_000, FeedbackStore::default());
+        let congested = FeedbackHealth {
+            receiver_count: 1,
+            loss_ratio: 0.03,
+            late_ratio: 0.01,
+            jitter_ms: 10.0,
+        };
+        assert_eq!(controller.next_target(congested), Some(6_400));
+        controller.current = 6_400;
+
+        let healthy = FeedbackHealth {
+            receiver_count: 1,
+            loss_ratio: 0.0,
+            late_ratio: 0.0,
+            jitter_ms: 0.0,
+        };
+        assert_eq!(controller.next_target(healthy), Some(6_400));
+        assert_eq!(controller.next_target(healthy), Some(6_400));
+        assert_eq!(controller.next_target(healthy), Some(6_720));
+    }
+
+    #[test]
+    fn adaptive_bitrate_never_drops_below_half_of_the_configured_ceiling() {
+        let mut controller = AdaptiveBitrateController::new(3_000, FeedbackStore::default());
+        let congested = FeedbackHealth {
+            receiver_count: 1,
+            loss_ratio: 1.0,
+            late_ratio: 1.0,
+            jitter_ms: 100.0,
+        };
+        for _ in 0..10 {
+            if let Some(target) = controller.next_target(congested) {
+                controller.current = target;
+            }
+        }
+        assert_eq!(controller.current, 1_500);
+    }
+
     /// The jitter buffer reports running totals, so a report window has to subtract the last one.
     /// Reporting the totals instead made every window look worse than the one before it.
     #[test]
@@ -2557,12 +2941,14 @@ mod tests {
             lost: 5,
             late: 2,
             duplicates: 1,
+            jitter_ms: 8,
         };
         let now = JitterCounts {
             pushed: 4_500,
             lost: 5,
             late: 9,
             duplicates: 1,
+            jitter_ms: 12,
         };
 
         assert_eq!(
@@ -2572,6 +2958,7 @@ mod tests {
                 lost: 0,
                 late: 7,
                 duplicates: 0,
+                jitter_ms: 12,
             }
         );
     }
@@ -2585,6 +2972,7 @@ mod tests {
             lost: 5,
             late: 9,
             duplicates: 1,
+            jitter_ms: 12,
         });
 
         assert_eq!(after_reset, JitterCounts::default());
@@ -2771,7 +3159,8 @@ mod tests {
             decode_limits: None,
         };
 
-        run_receiver_pipeline_plan(plan).expect("compatible receiver fallback should reach EOS");
+        run_receiver_pipeline_plan_with_stats(plan, None)
+            .expect("compatible receiver fallback should reach EOS");
     }
 
     #[test]

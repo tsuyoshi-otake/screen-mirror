@@ -20,8 +20,9 @@ mod vdd;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use std::sync::{Arc, Mutex};
 
-use crate::pipeline::{probe_elements, run_pipeline};
+use crate::pipeline::{probe_elements, run_pipeline, run_sender_pipeline};
 
 #[derive(Parser, Debug)]
 #[command(name = "screen-mirror")]
@@ -118,10 +119,19 @@ fn main() -> Result<()> {
         Command::Tray => tray_app::run(),
         Command::Send(args) => {
             let (args, capture_target) = lan::resolve_sender_args(args)?;
-            let _control = control::ControlServer::start(&args.pin)?;
+            let control = control::ControlServer::start(&args.pin)?;
+            let feedback = control.feedback();
+            let _announcer =
+                match lan::Announcer::sender(args.port, Some(args.audio_port), &args.pin) {
+                    Ok(announcer) => Some(announcer),
+                    Err(error) => {
+                        eprintln!("sender discovery announce failed: {error:#}");
+                        None
+                    }
+                };
             let pipeline = pipeline::build_sender_pipeline_for(&args, capture_target.as_ref())?;
             eprintln!("pipeline: {pipeline}");
-            let result = run_pipeline(&pipeline);
+            let result = run_sender_pipeline(&pipeline, args.bitrate, Some(feedback));
             // The virtual display exists for this session only; the desktop must not keep it once
             // the stream is over.
             if args.enable_virtual_display {
@@ -131,10 +141,33 @@ fn main() -> Result<()> {
         }
         Command::Recv(args) => {
             let _sleep_guard = power::SleepGuard::receiver();
-            let _render_window = receiver_window::RenderWindowGuard::start();
             let plan = pipeline::build_receiver_pipeline_plan(&args)?;
             eprintln!("pipeline: {}", plan.primary());
-            pipeline::run_receiver_pipeline_plan(plan)
+            let decode_limits = plan.decode_limits();
+            let stats = Arc::new(Mutex::new(pipeline::ReceiverStreamStats::default()));
+            let _render_window =
+                receiver_window::RenderWindowGuard::start(Some(Arc::clone(&stats)));
+            let _feedback_sender =
+                match lan::FeedbackSender::start(args.pin.clone(), Arc::clone(&stats)) {
+                    Ok(sender) => Some(sender),
+                    Err(error) => {
+                        eprintln!("receiver feedback sender failed: {error:#}");
+                        None
+                    }
+                };
+            let _announcer = match lan::Announcer::receiver(
+                args.port,
+                Some(args.audio_port),
+                &args.pin,
+                decode_limits,
+            ) {
+                Ok(announcer) => Some(announcer),
+                Err(error) => {
+                    eprintln!("receiver discovery announce failed: {error:#}");
+                    None
+                }
+            };
+            pipeline::run_receiver_pipeline_plan_with_stats(plan, Some(stats))
         }
         Command::Probe => {
             probe_elements();

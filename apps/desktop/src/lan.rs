@@ -1,14 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use sm_core::{
+    control::{StreamFeedback, CONTROL_PORT},
     diagnostics::DIAGNOSTICS_PORT,
     discovery::{self, DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole},
 };
 use std::collections::HashSet;
+use std::net::{SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::pipeline::{self, PipelineHandle, SendArgs};
+use crate::control::FeedbackStore;
+use crate::pipeline::{self, PipelineHandle, ReceiverStreamStats, SendArgs};
 
 const AUTO_HOST: &str = "auto";
 const RECEIVER_LOSS_GRACE: Duration = Duration::from_secs(75);
@@ -18,6 +22,84 @@ const PREPARE_FAILURES_BEFORE_ALERT: u32 = 3;
 pub struct Announcer {
     stop: Sender<()>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Periodically sends the receiver's recent health to every paired desktop sender.
+///
+/// This is intentionally a small side channel rather than a change to RTP. Android receivers do
+/// not run it, so they remain compatible and simply leave the sender at its configured ceiling.
+pub struct FeedbackSender {
+    stop: Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl FeedbackSender {
+    pub fn start(pin: String, stats: Arc<Mutex<ReceiverStreamStats>>) -> Result<Self> {
+        let socket = UdpSocket::bind("0.0.0.0:0").context("failed to bind feedback socket")?;
+        let (stop, stop_rx) = mpsc::channel();
+        let thread = thread::spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            let feedback = match stats.lock() {
+                Ok(stats) => StreamFeedback::with_pin(
+                    &pin,
+                    unix_timestamp_ms(),
+                    stats.window_ms,
+                    stats.received_packets,
+                    stats.lost_packets,
+                    stats.late_packets,
+                    stats.duplicate_packets,
+                    stats.decoded_frames,
+                    stats.displayed_frames,
+                    stats.jitter_ms,
+                ),
+                Err(_) => continue,
+            };
+            let Ok(feedback) = feedback.and_then(|feedback| feedback.encode()) else {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            };
+
+            if let Ok(peers) = discover_senders_with_pin(Duration::from_millis(350), &pin) {
+                for peer in peers {
+                    let target = SocketAddrV4::new(peer.address, CONTROL_PORT);
+                    let _ = socket.send_to(&feedback, target);
+                }
+            }
+
+            match stop_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        });
+
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn stop(mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for FeedbackSender {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 pub struct SenderSupervisor {
@@ -38,6 +120,7 @@ struct ResolvedSender {
 struct ReceiverTarget {
     host: String,
     display: Option<DisplayInfo>,
+    supports_fec: bool,
 }
 
 #[derive(Default)]
@@ -60,7 +143,7 @@ impl SenderPreparationState {
 }
 
 impl SenderSupervisor {
-    pub fn start(args: SendArgs, status: Sender<String>) -> Self {
+    pub fn start(args: SendArgs, status: Sender<String>, feedback: FeedbackStore) -> Self {
         let (command, command_rx) = mpsc::channel();
         let thread = thread::spawn(move || {
             log_sender("sender supervisor started; waiting for matching receivers");
@@ -146,7 +229,7 @@ impl SenderSupervisor {
                                     prepare_sender_environment(&resolved)?;
                                     preparation.mark_prepared(&receiver_key);
                                 }
-                                spawn_receiver_video_pipelines(&resolved)
+                                spawn_receiver_video_pipelines(&resolved, &feedback)
                             })();
 
                             match start_result {
@@ -380,7 +463,10 @@ impl Announcer {
             PeerAnnouncement::new(instance_id(), device_name(), role, stream_port)
                 .with_pin(pin)?
                 .with_audio_port(audio_port)
-                .with_diagnostics_port(DIAGNOSTICS_PORT);
+                .with_diagnostics_port(DIAGNOSTICS_PORT)
+                .with_fec_support(
+                    matches!(role, PeerRole::Receiver) && crate::pipeline::fec_supported(),
+                );
         if let Some(display) = crate::monitors::primary_display_info() {
             announcement = announcement.with_display(display.with_decode_limits(decode_limits));
         }
@@ -501,6 +587,9 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
             .map(|host| ReceiverTarget {
                 host: host.to_string(),
                 display: None,
+                // An explicit host is an operator assertion that the peer understands the
+                // optional FEC stream. Auto-discovery below is conservative and negotiates it.
+                supports_fec: true,
             })
             .collect();
         return Ok(ResolvedSender { args, receivers });
@@ -529,6 +618,7 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         .map(|peer| ReceiverTarget {
             host: format!("{}:{}", peer.address, peer.announcement.stream_port),
             display: peer.announcement.display.clone(),
+            supports_fec: peer.announcement.supports_fec,
         })
         .collect();
     args.host = selected
@@ -536,6 +626,13 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         .map(|receiver| receiver.host.as_str())
         .collect::<Vec<_>>()
         .join(",");
+    if args.fec_percentage > 0 && !selected.iter().all(|receiver| receiver.supports_fec) {
+        log_sender(format!(
+            "disabling {}% video FEC: one or more discovered receivers do not advertise FEC support",
+            args.fec_percentage
+        ));
+        args.fec_percentage = 0;
+    }
     Ok(ResolvedSender {
         args,
         receivers: selected,
@@ -568,7 +665,7 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
         .iter()
         .map(|receiver| match receiver.display.as_ref() {
             Some(display) => format!(
-                "{}@{}x{}@{}@{}",
+                "{}@{}x{}@{}@{}@{}",
                 receiver.host,
                 display.width,
                 display.height,
@@ -578,9 +675,22 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
                 match display.decode_limits() {
                     Some((width, height)) => format!("{width}x{height}"),
                     None => "unlimited".to_string(),
+                },
+                if receiver.supports_fec {
+                    "fec"
+                } else {
+                    "no-fec"
                 }
             ),
-            None => format!("{}@unknown", receiver.host),
+            None => format!(
+                "{}@unknown@{}",
+                receiver.host,
+                if receiver.supports_fec {
+                    "fec"
+                } else {
+                    "no-fec"
+                }
+            ),
         })
         .collect::<Vec<_>>()
         .join("|")
@@ -688,7 +798,10 @@ fn ensure_virtual_target_count(required: usize, available: usize) -> Result<()> 
 }
 
 /// Validate every receiver route before starting any pipeline.
-fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Result<Vec<PipelineHandle>> {
+fn spawn_receiver_video_pipelines(
+    resolved: &ResolvedSender,
+    feedback: &FeedbackStore,
+) -> Result<Vec<PipelineHandle>> {
     let assignments = assign_receiver_displays(resolved)?;
     let mut descriptions = Vec::with_capacity(resolved.receivers.len());
     for (receiver, target) in resolved.receivers.iter().zip(assignments) {
@@ -717,7 +830,13 @@ fn spawn_receiver_video_pipelines(resolved: &ResolvedSender) -> Result<Vec<Pipel
     let bitrate = resolved.args.bitrate;
     Ok(descriptions
         .into_iter()
-        .map(|description| pipeline::spawn_sender_pipeline(description, bitrate))
+        .map(|description| {
+            pipeline::spawn_sender_pipeline_with_feedback(
+                description,
+                bitrate,
+                Some(feedback.clone()),
+            )
+        })
         .collect())
 }
 
@@ -804,6 +923,7 @@ mod tests {
         let mut receivers = vec![ReceiverTarget {
             host: "10.0.0.2:5004".to_string(),
             display: Some(DisplayInfo::new(1366, 768, Some(60))),
+            supports_fec: false,
         }];
         let initial = receiver_set_key(&receivers);
         receivers[0].display = Some(DisplayInfo::new(1920, 1080, Some(60)));
@@ -815,6 +935,11 @@ mod tests {
         receivers[0].display =
             Some(DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088))));
         assert_ne!(resized, receiver_set_key(&receivers));
+
+        receivers[0].supports_fec = true;
+        let fec = receiver_set_key(&receivers);
+        receivers[0].supports_fec = false;
+        assert_ne!(fec, receiver_set_key(&receivers));
     }
 
     #[test]

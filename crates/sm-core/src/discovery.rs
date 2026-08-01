@@ -28,6 +28,11 @@ pub struct PeerAnnouncement {
     pub pin_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayInfo>,
+    /// Whether this receiver can recover RFC 5109 ULP-FEC packets on the video stream. Older
+    /// peers omit the field and are treated as unsupported so a sender never injects packets they
+    /// cannot understand into a mixed receiver set.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_fec: bool,
     pub timestamp_ms: u64,
 }
 
@@ -192,6 +197,7 @@ impl PeerAnnouncement {
             diagnostics_port: None,
             pin_hash: None,
             display: None,
+            supports_fec: false,
             timestamp_ms: now_ms(),
         }
     }
@@ -213,6 +219,11 @@ impl PeerAnnouncement {
 
     pub fn with_display(mut self, display: DisplayInfo) -> Self {
         self.display = Some(display);
+        self
+    }
+
+    pub fn with_fec_support(mut self, supports_fec: bool) -> Self {
+        self.supports_fec = supports_fec;
         self
     }
 
@@ -544,6 +555,10 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -647,16 +662,20 @@ mod tests {
         let announced = PeerAnnouncement::new("receiver-1", "receiver", PeerRole::Receiver, 5004)
             .with_display(
                 DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088))),
-            );
+            )
+            .with_fec_support(true);
         let decoded = PeerAnnouncement::decode(&announced.encode().unwrap()).unwrap();
         assert_eq!(decoded.display.unwrap().decode_limits(), Some((1920, 1088)));
+        assert!(decoded.supports_fec);
 
         let older = PeerAnnouncement::new("receiver-2", "receiver", PeerRole::Receiver, 5004)
             .with_display(DisplayInfo::new(1920, 1080, Some(60)));
         let encoded = String::from_utf8(older.encode().unwrap()).unwrap();
         assert!(!encoded.contains("max_decode"));
+        assert!(!encoded.contains("supports_fec"));
         let decoded = PeerAnnouncement::decode(encoded.as_bytes()).unwrap();
         assert_eq!(decoded.display.unwrap().decode_limits(), None);
+        assert!(!decoded.supports_fec);
     }
 
     #[test]

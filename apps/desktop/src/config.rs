@@ -69,6 +69,9 @@ pub struct SendConfig {
     pub monitor_index: i32,
     pub fps: u32,
     pub bitrate: u32,
+    /// RFC 5109 video FEC overhead percentage. Zero disables FEC.
+    #[serde(default)]
+    pub fec_percentage: u32,
     pub mtu: u32,
     #[serde(default = "default_udp_buffer_size")]
     pub udp_buffer_size: u32,
@@ -194,7 +197,7 @@ pub struct RecvConfig {
     pub gpu: String,
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfigEncoder {
     Auto,
@@ -205,7 +208,40 @@ pub enum ConfigEncoder {
     X264,
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+impl ConfigEncoder {
+    pub const ALL: [Self; 6] = [
+        Self::Auto,
+        Self::Nvidia,
+        Self::Amf,
+        Self::MediaFoundation,
+        Self::QuickSync,
+        Self::X264,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvidia => "nvidia",
+            Self::Amf => "amf",
+            Self::MediaFoundation => "media-foundation",
+            Self::QuickSync => "quick-sync",
+            Self::X264 => "x264",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic (GPU)",
+            Self::Nvidia => "NVIDIA NVENC",
+            Self::Amf => "AMD AMF",
+            Self::MediaFoundation => "Media Foundation",
+            Self::QuickSync => "Intel QuickSync",
+            Self::X264 => "CPU x264",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfigNvidiaTuning {
     #[default]
@@ -213,6 +249,28 @@ pub enum ConfigNvidiaTuning {
     Gtx,
     Rtx,
     LowLatency,
+}
+
+impl ConfigNvidiaTuning {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::LowLatency, Self::Gtx, Self::Rtx];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gtx => "gtx",
+            Self::Rtx => "rtx",
+            Self::LowLatency => "low-latency",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic",
+            Self::Gtx => "GTX",
+            Self::Rtx => "RTX (quality)",
+            Self::LowLatency => "Low latency",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize)]
@@ -295,6 +353,7 @@ impl Default for SendConfig {
             monitor_index: -1,
             fps: 30,
             bitrate: 8_000,
+            fec_percentage: 0,
             mtu: default_mtu(),
             udp_buffer_size: default_udp_buffer_size(),
             qos_dscp: default_qos_dscp(),
@@ -398,6 +457,7 @@ impl From<SendConfig> for SendArgs {
             monitor_index: config.monitor_index,
             fps: config.fps,
             bitrate: config.bitrate,
+            fec_percentage: config.fec_percentage,
             mtu: config.mtu,
             udp_buffer_size: config.udp_buffer_size,
             qos_dscp: config.qos_dscp,

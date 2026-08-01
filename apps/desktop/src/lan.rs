@@ -821,16 +821,23 @@ fn spawn_receiver_video_pipelines(
                         receiver.host
                     )
                 })?;
-        descriptions.push(description);
+        descriptions.push((receiver.host.clone(), description));
     }
     anyhow::ensure!(
         !descriptions.is_empty(),
         "no receiver video pipelines were prepared"
     );
+    // Pipeline threads report parse errors asynchronously. Preflight every complete description
+    // here so the supervisor cannot log "targets updated" for a route that never reached GStreamer.
+    for (host, description) in &descriptions {
+        pipeline::validate_pipeline_description(description).with_context(|| {
+            format!("sender video pipeline for {host} failed preflight validation")
+        })?;
+    }
     let bitrate = resolved.args.bitrate;
     Ok(descriptions
         .into_iter()
-        .map(|description| {
+        .map(|(_, description)| {
             pipeline::spawn_sender_pipeline_with_feedback(
                 description,
                 bitrate,

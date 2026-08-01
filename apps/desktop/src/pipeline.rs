@@ -721,31 +721,64 @@ pub fn build_sender_video_pipeline_for(
     ));
     let caps = video_caps(args.fps, args.width, args.height, use_d3d11_memory);
     let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
-    let fec_chain = sender_fec_chain(args.fec_percentage)?;
+    let fec_element = sender_fec_element(args.fec_percentage)?;
+    let transport_chain = sender_video_transport_chain(
+        args.mtu,
+        fec_element.as_deref(),
+        &clients,
+        args.udp_buffer_size,
+        args.qos_dscp,
+    );
 
     let video = format!(
         "{source} ! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream \
          ! {caps} \
          ! {encoder_chain} \
          ! h264parse config-interval=-1 \
-         ! rtph264pay name={SENDER_RTP_PAY_NAME} pt=96 mtu={} config-interval=-1 aggregate-mode=zero-latency \
-         {fec_chain}\
-         ! multiudpsink clients={} sync=false async=false buffer-size={} qos-dscp={} send-duplicates=false ttl=1",
-        args.mtu,
-        gst_string_literal(&clients),
-        args.udp_buffer_size,
-        args.qos_dscp
+         ! {transport_chain}"
     );
 
     Ok(video)
 }
 
-fn sender_fec_chain(percentage: u32) -> Result<String> {
+fn sender_fec_element(percentage: u32) -> Result<Option<String>> {
     if percentage == 0 {
-        return Ok(String::new());
+        return Ok(None);
     }
     require_element("rtpulpfecenc", ())?;
-    Ok(format!(" ! rtpulpfecenc percentage={percentage} pt=122"))
+    Ok(Some(format!("rtpulpfecenc percentage={percentage} pt=122")))
+}
+
+/// Builds the RTP/FEC/UDP portion as complete elements and inserts every `!` centrally.
+///
+/// Optional pipeline fragments must not own their surrounding delimiters. When FEC was first
+/// added, its fragment ended at `pt=122` and the following sink was interpolated without a space,
+/// producing `pt=122! multiudpsink`. Joining complete elements makes the FEC-on and FEC-off paths
+/// use the same separator logic.
+fn sender_video_transport_chain(
+    mtu: u32,
+    fec_element: Option<&str>,
+    clients: &str,
+    udp_buffer_size: u32,
+    qos_dscp: i32,
+) -> String {
+    let mut elements = vec![format!(
+        "rtph264pay name={SENDER_RTP_PAY_NAME} pt=96 mtu={mtu} config-interval=-1 aggregate-mode=zero-latency"
+    )];
+    if let Some(fec_element) = fec_element {
+        elements.push(fec_element.to_string());
+    }
+    elements.push(format!(
+        "multiudpsink clients={} sync=false async=false buffer-size={udp_buffer_size} qos-dscp={qos_dscp} send-duplicates=false ttl=1",
+        gst_string_literal(clients)
+    ));
+    elements.join(" ! ")
+}
+
+/// Parses a fully built pipeline before a supervisor reports its targets as active.
+pub fn validate_pipeline_description(description: &str) -> Result<()> {
+    let _ = gst::parse::launch(description).context("failed to parse GStreamer pipeline")?;
+    Ok(())
 }
 
 pub fn build_sender_audio_pipeline(args: &SendArgs) -> Result<String> {
@@ -2745,10 +2778,44 @@ mod tests {
 
     #[test]
     fn fec_is_disabled_by_default_and_percentage_is_bounded() {
-        assert_eq!(sender_fec_chain(0).unwrap(), "");
+        assert_eq!(sender_fec_element(0).unwrap(), None);
         assert!(validate_fec_percentage(0).is_ok());
         assert!(validate_fec_percentage(100).is_ok());
         assert!(validate_fec_percentage(101).is_err());
+    }
+
+    #[test]
+    fn fec_transport_keeps_element_boundaries_and_parses() {
+        let chain = sender_video_transport_chain(
+            1200,
+            Some("rtpulpfecenc percentage=20 pt=122"),
+            "127.0.0.1:5004",
+            1024 * 1024,
+            -1,
+        );
+
+        assert!(chain.contains("pt=122 ! multiudpsink"), "{chain}");
+        assert!(!chain.contains("pt=122!"), "{chain}");
+
+        gst::init().expect("GStreamer initialization");
+        if gst::ElementFactory::find("rtpulpfecenc").is_some() {
+            let (_, fec_and_sink) = chain
+                .split_once(" ! ")
+                .expect("payloader must be followed by the FEC and UDP elements");
+            let description = format!(
+                "fakesrc num-buffers=1 ! application/x-rtp,media=video,payload=96,clock-rate=90000,encoding-name=H264 ! {fec_and_sink}"
+            );
+            validate_pipeline_description(&description)
+                .expect("the FEC-to-UDP transport must be a valid GStreamer pipeline");
+        }
+    }
+
+    #[test]
+    fn pipeline_preflight_rejects_malformed_optional_element_boundaries() {
+        gst::init().expect("GStreamer initialization");
+        let malformed = "fakesrc ! application/x-rtp ! rtpulpfecenc pt=122! fakesink";
+
+        assert!(validate_pipeline_description(malformed).is_err());
     }
 
     fn h264_nal_types_from_rtp(packet: &[u8]) -> Vec<u8> {

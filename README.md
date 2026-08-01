@@ -22,13 +22,13 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.64`.
+The desktop and Android package versions for this release are `0.1.65`.
 
-Release `v0.1.64` hardens reconnection after receiver pipeline errors and keeps explicit-host tray
-senders under the same retry supervisor as auto-discovered senders. It includes the configurable
-video quality presets and optional RFC 5109 ULP-FEC packet-loss protection from `v0.1.63`. FEC is
-off by default and is negotiated only between compatible desktop receivers; Android and mixed
-receiver sets keep the standard H.264 RTP path.
+Release `v0.1.65` fixes the Windows sender pipeline generated when RFC 5109 ULP-FEC packet-loss
+protection is enabled. Optional transport elements are now composed with explicit boundaries and
+the complete pipeline is parsed before its targets are reported active. This prevents a malformed
+FEC pipeline from entering the discovery retry loop while receivers remain connected but receive
+no RTP packets.
 
 ## Transport Model
 

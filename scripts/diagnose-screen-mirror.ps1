@@ -608,6 +608,71 @@ function Get-ReceiverPlaybackRoute {
     }
 }
 
+function Get-ReceiverVisualCapture {
+    $logLines = Get-LogMessageTail 1000
+    $lastCapture = $logLines |
+        Where-Object { $_ -match '^receiver visual capture:' } |
+        Select-Object -Last 1
+    $lastCaptureText = if ($lastCapture) { $lastCapture.ToString() } else { '' }
+    $latestPath = $null
+    $anomalyPath = $null
+    if ($lastCaptureText -match 'latest="([^"]+)"') {
+        $latestPath = $Matches[1]
+    }
+    if ($lastCaptureText -match 'anomaly="([^"]+)"' -and $Matches[1]) {
+        $anomalyPath = $Matches[1]
+    }
+
+    $captureDirectory = Join-Path $env:LOCALAPPDATA 'ScreenMirror\Diagnostics'
+    $latestItem = if ($latestPath) {
+        Get-Item -LiteralPath $latestPath -ErrorAction SilentlyContinue
+    } else {
+        $fallback = Join-Path $captureDirectory 'receiver-window-latest.bmp'
+        Get-Item -LiteralPath $fallback -ErrorAction SilentlyContinue
+    }
+    $anomalyItems = @(Get-ChildItem -LiteralPath $captureDirectory -Filter 'receiver-window-anomaly-*.bmp' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    $newestAnomaly = if ($anomalyItems.Count -gt 0) { $anomalyItems[0] } else { $null }
+    if (-not $anomalyPath -and $newestAnomaly) {
+        $anomalyPath = $newestAnomaly.FullName
+    }
+
+    $verdict = if ($lastCaptureText -match 'verdict=([^\s]+)') {
+        $Matches[1]
+    } else {
+        'UNKNOWN'
+    }
+    $status = if (-not $lastCapture) {
+        'UNKNOWN - no receiver visual capture has been logged.'
+    } elseif ($lastCaptureText -match 'renderer window missing') {
+        'UNKNOWN - the receiver renderer window is not currently present.'
+    } elseif ($lastCaptureText -match 'status=error') {
+        'FAIL - the receiver window could not be captured.'
+    } elseif (-not $latestItem) {
+        'FAIL - capture metrics were logged but the BMP file is missing.'
+    } elseif ($verdict -match '^(?:blank|stale)') {
+        "FAIL - visual probe classified the receiver as $verdict."
+    } else {
+        'OK - receiver pixels are being captured and classified.'
+    }
+
+    [pscustomobject]@{
+        Status = $status
+        LatestVerdict = $verdict
+        LatestCapturePath = if ($latestItem) { $latestItem.FullName } elseif ($latestPath) { $latestPath } else { '(not recorded)' }
+        LatestCaptureExists = [bool]$latestItem
+        LatestCaptureSize = if ($latestItem) { "$($latestItem.Length) bytes" } else { '(unknown)' }
+        LatestCaptureAgeSeconds = if ($latestItem) {
+            [math]::Round(((Get-Date) - $latestItem.LastWriteTime).TotalSeconds, 1)
+        } else {
+            '(unknown)'
+        }
+        LatestAnomalyPath = if ($anomalyPath) { $anomalyPath } else { '(none)' }
+        AnomalyCaptureCount = $anomalyItems.Count
+        LastCaptureLog = if ($lastCapture) { $lastCapture } else { '(not recorded)' }
+    }
+}
+
 function Get-GpuAccelerationVerdict {
     $adapterNames = @()
     try {
@@ -1044,6 +1109,10 @@ Add-CommandOutput "GPU Acceleration Verdict" {
 
 Add-CommandOutput "Receiver Playback Route" {
     Get-ReceiverPlaybackRoute | Format-List
+}
+
+Add-CommandOutput "Receiver Visual Capture" {
+    Get-ReceiverVisualCapture | Format-List
 }
 
 Add-CommandOutput "Communication Health" {

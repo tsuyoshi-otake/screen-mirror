@@ -22,13 +22,14 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.65`.
+The desktop and Android package versions for this release are `0.1.66`.
 
-Release `v0.1.65` fixes the Windows sender pipeline generated when RFC 5109 ULP-FEC packet-loss
-protection is enabled. Optional transport elements are now composed with explicit boundaries and
-the complete pipeline is parsed before its targets are reported active. This prevents a malformed
-FEC pipeline from entering the discovery retry loop while receivers remain connected but receive
-no RTP packets.
+Release `v0.1.66` adds receiver visual diagnostics for blank or stale playback. While a receiver is
+active, the Windows client captures its visible renderer surface at low rate, stores the latest
+frame as a BMP, saves anomaly frames, and correlates pixel classification with decoder and sink
+flow. The diagnostic report now distinguishes a white/black renderer surface from a blank surface
+where no decoded frames reached the sink. This release also includes the RFC 5109 ULP-FEC sender
+pipeline validation introduced in `v0.1.65`.
 
 ## Transport Model
 
@@ -336,6 +337,14 @@ The tray app is launched after install/update and is registered under HKCU Run f
 Use tray menu `Run Diagnostics` to collect a local debug report. The report is saved under `%TEMP%`, opened in Notepad, and copied to the clipboard so it can be pasted into an issue or chat.
 Run it while sender mode is actively mirroring: the `Video Encode` result is sampled live for five seconds, while the AMF and D3D11 results describe the last sender route recorded in the log.
 
+While a Windows receiver is active, the diagnostics probe also captures the visible receiver client
+area once per second at up to 640x360. The latest image is kept at
+`%LOCALAPPDATA%\ScreenMirror\Diagnostics\receiver-window-latest.bmp`; a timestamped anomaly image is
+written when the probe sees a likely white/black surface or a frozen surface with no fresh sink
+buffers. The log and report include the capture path, image hash, mean/standard-deviation luma,
+white/black pixel ratios, decoder/sink frame flow, and a classification that separates a white
+surface with no frames from a white frame that reached the renderer.
+
 Use tray menu `Run Peer Diagnostics` on a receiver to collect diagnostics from a sender with the same PIN. The sender advertises a diagnostics endpoint while sender mode is active, and the receiver requests the report over TCP `47779`. The received report is saved under `%TEMP%`, opened in Notepad, and copied to the receiver clipboard.
 
 The report includes:
@@ -345,6 +354,7 @@ The report includes:
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
 - Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, GPU-engine usage, and `Video Decode` / Radeon `Video Codec` peak/current activity when Windows exposes those counters; negotiated D3D12/D3D11 memory is reported separately when a driver returns zero
+- Receiver visual capture status, the latest/anomaly BMP paths, pixel classification, and the last visual-probe log line
 - GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` / AMD `Video Codec` engine activity
 - Latest receiver playback route: selected hardware profile, PCI device ID, adapter LUID, decoder, negotiated D3D12/D3D11 memory path, and video sink
 - Bundled VDD device status and other virtual display candidates

@@ -218,6 +218,9 @@ pub struct RecvArgs {
 #[derive(Clone, Debug, Default)]
 pub struct ReceiverStreamStats {
     pub window_ms: u64,
+    /// Monotonic timestamp of the last report update. A stale snapshot must not be mistaken for
+    /// a healthy sink after the receiver pipeline has stopped.
+    pub last_update: Option<Instant>,
     pub received_packets: u64,
     pub lost_packets: u64,
     pub late_packets: u64,
@@ -1537,6 +1540,7 @@ impl ReceiverStreamReport {
                 let jitter_ms = jitter.map(|counts| counts.jitter_ms).unwrap_or_default();
                 *stats = ReceiverStreamStats {
                     window_ms: feedback_window.as_millis().min(u128::from(u64::MAX)) as u64,
+                    last_update: Some(now),
                     received_packets: since_last_report
                         .map(|counts| counts.pushed)
                         .unwrap_or_default(),

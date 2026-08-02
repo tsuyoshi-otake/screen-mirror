@@ -354,7 +354,7 @@ The report includes:
 - Update attempt state, last update-runner failure, and relevant MSI log lines
 - Installed version, autostart entry, and running process list
 - Per-process details and an aggregate summary for Screen Mirror CPU, RAM, GPU memory, GPU-engine usage, and `Video Decode` / Radeon `Video Codec` peak/current activity when Windows exposes those counters; negotiated D3D12/D3D11 memory is reported separately when a driver returns zero
-- Receiver visual capture status, the latest/anomaly BMP paths, pixel classification, and the last visual-probe log line
+- Receiver visual capture status, the latest/anomaly BMP paths, pixel classification, sink-flow verdict, GUI handle counts, and the last visual-probe log line. A `PARTIAL` result means decoded frames are reaching the sink but Windows did not allow the diagnostic surface capture at that moment.
 - GPU acceleration verdict for Radeon AMF availability/selection, D3D11 zero-copy, and sampled `Video Encode` / AMD `Video Codec` engine activity
 - Latest receiver playback route: selected hardware profile, PCI device ID, adapter LUID, decoder, negotiated D3D12/D3D11 memory path, and video sink
 - Bundled VDD device status and other virtual display candidates

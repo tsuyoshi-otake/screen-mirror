@@ -642,12 +642,42 @@ function Get-ReceiverVisualCapture {
     } else {
         'UNKNOWN'
     }
+    $pipelineFlow = if ($lastCaptureText -match 'flow=([^\s]+)') {
+        $Matches[1]
+    } else {
+        'unknown'
+    }
+    $pipelineActive = $pipelineFlow -eq 'active'
+    $decodedFps = if ($lastCaptureText -match 'decoded-fps=([0-9.]+)') {
+        $Matches[1]
+    } else {
+        '(unknown)'
+    }
+    $sinkInputFps = if ($lastCaptureText -match 'sink-input-fps=([0-9.]+)') {
+        $Matches[1]
+    } else {
+        '(unknown)'
+    }
+    $gdiHandles = if ($lastCaptureText -match 'gdi-handles=(\d+)') {
+        $Matches[1]
+    } else {
+        '(unknown)'
+    }
+    $userHandles = if ($lastCaptureText -match 'user-handles=(\d+)') {
+        $Matches[1]
+    } else {
+        '(unknown)'
+    }
     $status = if (-not $lastCapture) {
         'UNKNOWN - no receiver visual capture has been logged.'
     } elseif ($lastCaptureText -match 'renderer window missing') {
         'UNKNOWN - the receiver renderer window is not currently present.'
     } elseif ($lastCaptureText -match 'status=error') {
-        'FAIL - the receiver window could not be captured.'
+        if ($pipelineActive) {
+            'PARTIAL - receiver pipeline is active, but the visual surface could not be captured.'
+        } else {
+            'FAIL - the receiver window could not be captured and no active sink flow was observed.'
+        }
     } elseif (-not $latestItem) {
         'FAIL - capture metrics were logged but the BMP file is missing.'
     } elseif ($verdict -match '^(?:blank|stale)') {
@@ -669,6 +699,11 @@ function Get-ReceiverVisualCapture {
         }
         LatestAnomalyPath = if ($anomalyPath) { $anomalyPath } else { '(none)' }
         AnomalyCaptureCount = $anomalyItems.Count
+        PipelineVerdict = if ($pipelineActive) { 'healthy - sink flow is active' } else { $pipelineFlow }
+        DecodedFps = $decodedFps
+        SinkInputFps = $sinkInputFps
+        GdiHandles = $gdiHandles
+        UserHandles = $userHandles
         LastCaptureLog = if ($lastCapture) { $lastCapture } else { '(not recorded)' }
     }
 }

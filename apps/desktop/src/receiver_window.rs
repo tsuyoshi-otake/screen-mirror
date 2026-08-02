@@ -87,12 +87,46 @@ fn run_window_guard(stop_rx: &mpsc::Receiver<()>, stats: Option<Arc<Mutex<Receiv
 }
 
 #[cfg(windows)]
+fn receiver_window_icon() -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{LoadImageW, IMAGE_ICON, LR_LOADFROMFILE};
+
+    // LoadImageW creates a process-owned HICON when LR_LOADFROMFILE is used. The window-chrome
+    // loop runs every 250 ms, so loading it there leaked roughly four USER/GDI handles per second
+    // until GetDC began failing at the Windows per-process GUI handle limit. Keep one icon for the
+    // process lifetime; Windows releases the remaining process-owned handle at process exit.
+    static ICON: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+    *ICON.get_or_init(|| {
+        let icon_path = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.join("screen-mirror.ico")));
+        let Some(icon_path) = icon_path.filter(|path| path.exists()) else {
+            return 0;
+        };
+        let wide = icon_path
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            LoadImageW(
+                std::ptr::null_mut(),
+                wide.as_ptr(),
+                IMAGE_ICON,
+                32,
+                32,
+                LR_LOADFROMFILE,
+            ) as isize
+        }
+    })
+}
+
+#[cfg(windows)]
 fn apply_receiver_window_chrome() -> Option<windows_sys::Win32::Foundation::HWND> {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, LoadImageW,
-        SendMessageW, SetWindowTextW, ICON_BIG, ICON_SMALL, ICON_SMALL2, IMAGE_ICON,
-        LR_LOADFROMFILE, WM_SETICON,
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendMessageW,
+        SetWindowTextW, ICON_BIG, ICON_SMALL, ICON_SMALL2, WM_SETICON,
     };
 
     struct Context {
@@ -131,30 +165,7 @@ fn apply_receiver_window_chrome() -> Option<windows_sys::Win32::Foundation::HWND
         TRUE
     }
 
-    let icon_path = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("screen-mirror.ico")));
-    let icon = icon_path
-        .filter(|path| path.exists())
-        .map(|path| {
-            let wide = path
-                .as_os_str()
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect::<Vec<_>>();
-            unsafe {
-                LoadImageW(
-                    std::ptr::null_mut(),
-                    wide.as_ptr(),
-                    IMAGE_ICON,
-                    32,
-                    32,
-                    LR_LOADFROMFILE,
-                ) as isize
-            }
-        })
-        .unwrap_or(0);
+    let icon = receiver_window_icon();
     let mut context = Context {
         process_id: std::process::id(),
         title: "screen-mirror Receiver"
@@ -445,6 +456,20 @@ struct VisualCaptureState {
 }
 
 #[cfg(windows)]
+fn gui_resource_counts() -> (u32, u32) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS,
+    };
+
+    unsafe {
+        (
+            GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS),
+            GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
+        )
+    }
+}
+
+#[cfg(windows)]
 fn capture_visual_if_due(
     renderer: windows_sys::Win32::Foundation::HWND,
     stats: Option<&Arc<Mutex<ReceiverStreamStats>>>,
@@ -483,13 +508,21 @@ fn capture_visual_if_due(
     let image = match capture_receiver_window(renderer) {
         Ok(image) => image,
         Err(error) => {
+            let (gdi_handles, user_handles) = gui_resource_counts();
             let should_log = state
                 .last_log
                 .is_none_or(|last| now.duration_since(last) >= VISUAL_CAPTURE_LOG_INTERVAL);
             if should_log {
                 crate::logging::append(format!(
-                    "receiver visual capture: status=error window={:p} error=\"{error:#}\"",
-                    renderer
+                    "receiver visual capture: status=error window={:p} error=\"{error:#}\" flow={} stats-age-ms={} decoded-fps={:.1} sink-input-fps={:.1} sink-buffers={} gdi-handles={} user-handles={}",
+                    renderer,
+                    flow,
+                    stats_age_ms,
+                    snapshot.decoded_fps,
+                    snapshot.displayed_fps,
+                    snapshot.displayed_frames,
+                    gdi_handles,
+                    user_handles,
                 ));
                 state.last_log = Some(now);
             }
@@ -500,6 +533,7 @@ fn capture_visual_if_due(
     let metrics = analyze_capture(&image);
     let changed = state.last_hash != Some(metrics.hash);
     state.last_hash = Some(metrics.hash);
+    let (gdi_handles, user_handles) = gui_resource_counts();
     let classification = metrics.classification();
     let no_sink_frames = flow == "stale" || flow == "none";
     let verdict = if no_sink_frames && classification == "likely-white" {
@@ -547,7 +581,7 @@ fn capture_visual_if_due(
             .map(|error| format!("error:{error:#}"))
             .unwrap_or_else(|| "ok".to_string());
         crate::logging::append(format!(
-            "receiver visual capture: status=ok window={:p} source={} latest=\"{}\" anomaly=\"{}\" size={}x{} save={} classification={} verdict={} flow={} stats-age-ms={} decoded-fps={:.1} sink-input-fps={:.1} sink-buffers={} mean-luma={:.1} stddev-luma={:.1} white-ratio={:.3} black-ratio={:.3} hash={:016x} changed={}",
+            "receiver visual capture: status=ok window={:p} source={} latest=\"{}\" anomaly=\"{}\" size={}x{} save={} classification={} verdict={} flow={} stats-age-ms={} decoded-fps={:.1} sink-input-fps={:.1} sink-buffers={} mean-luma={:.1} stddev-luma={:.1} white-ratio={:.3} black-ratio={:.3} hash={:016x} changed={} gdi-handles={} user-handles={}",
             renderer,
             image.source,
             latest_path.display(),
@@ -568,6 +602,8 @@ fn capture_visual_if_due(
             metrics.black_ratio,
             metrics.hash,
             changed,
+            gdi_handles,
+            user_handles,
         ));
         state.last_log = Some(now);
     }

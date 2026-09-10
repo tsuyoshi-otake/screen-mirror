@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 const SENDER_VIDEO_ENCODER_NAME: &str = "sender_video_encoder";
 const SENDER_RTP_PAY_NAME: &str = "sender_rtp_pay";
+const SENDER_VIDEO_SINK_NAME: &str = "sender_video_sink";
 const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long the receiver waits for video packets before deciding the stream is gone.
 ///
@@ -361,42 +362,102 @@ impl ReceiverPipelinePlan {
 /// otherwise hit the access point as fast as the OS can enqueue it.
 const SENDER_PACING_RATE_MULTIPLIER: u64 = 2;
 
-struct SenderPacketPacer {
+/// Maximum duration the pacer is allowed to sleep in a single packet callback.
+/// If a large burst causes a deficit exceeding this threshold, the sleep is capped and the deficit
+/// clamped so scheduler delay or extreme burstiness does not cascade into seconds of pipeline stall.
+const MAX_PACING_DELAY: Duration = Duration::from_millis(25);
+
+pub trait PacerClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn sleep(&self, duration: Duration);
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemPacerClock;
+
+impl PacerClock for SystemPacerClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, duration: Duration) {
+        if !duration.is_zero() {
+            thread::sleep(duration);
+        }
+    }
+}
+
+pub struct SenderPacketPacer {
     bytes_per_second: u64,
-    next_send: Instant,
+    peer_count: usize,
+    clock: Box<dyn PacerClock>,
+    tokens: f64,
+    max_tokens: f64,
+    last_update: Instant,
 }
 
 impl SenderPacketPacer {
-    fn new(bitrate_kbit: u32) -> Self {
+    fn new(bitrate_kbit: u32, peer_count: usize) -> Self {
+        Self::with_clock(bitrate_kbit, peer_count, Box::new(SystemPacerClock))
+    }
+
+    fn with_clock(bitrate_kbit: u32, peer_count: usize, clock: Box<dyn PacerClock>) -> Self {
+        let bytes_per_second = paced_bytes_per_second(bitrate_kbit);
+        let max_tokens = compute_max_burst_bytes(bytes_per_second);
+        let now = clock.now();
         Self {
-            bytes_per_second: paced_bytes_per_second(bitrate_kbit),
-            next_send: Instant::now(),
+            bytes_per_second,
+            peer_count: peer_count.max(1),
+            clock,
+            tokens: max_tokens,
+            max_tokens,
+            last_update: now,
         }
     }
 
     fn set_bitrate(&mut self, bitrate_kbit: u32) {
         self.bytes_per_second = paced_bytes_per_second(bitrate_kbit);
-        self.next_send = Instant::now();
+        self.max_tokens = compute_max_burst_bytes(self.bytes_per_second);
+        if self.tokens > self.max_tokens {
+            self.tokens = self.max_tokens;
+        }
     }
 
     fn wait_for_packet(&mut self, packet_size: usize) {
-        let now = Instant::now();
-        if self.next_send < now {
-            self.next_send = now;
-        }
-        let delay = self.next_send.saturating_duration_since(now);
-        if !delay.is_zero() {
-            thread::sleep(delay);
-        }
+        let now = self.clock.now();
+        let elapsed = now.saturating_duration_since(self.last_update);
+        self.last_update = now;
 
-        // Schedule from the actual send time rather than the requested deadline.  Windows timer
-        // granularity can oversleep sub-millisecond intervals; carrying that error forward would
-        // turn a short keyframe burst into seconds of accumulated latency.
-        let nanos = ((packet_size as u128) * 1_000_000_000u128)
-            .div_ceil(u128::from(self.bytes_per_second))
-            .min(u128::from(u64::MAX)) as u64;
-        self.next_send = Instant::now() + Duration::from_nanos(nanos.max(1));
+        // Refill tokens based on elapsed time since the previous packet.
+        self.tokens = (self.tokens + (self.bytes_per_second as f64) * elapsed.as_secs_f64())
+            .min(self.max_tokens);
+
+        // Account for total network load across all receiver peers.
+        let cost = (packet_size.saturating_mul(self.peer_count)) as f64;
+        self.tokens -= cost;
+
+        if self.tokens < 0.0 {
+            let deficit = -self.tokens;
+            let wait_secs = deficit / (self.bytes_per_second as f64);
+            let wait_duration = Duration::from_secs_f64(wait_secs);
+
+            if wait_duration > MAX_PACING_DELAY {
+                // If the deficit would cause a long lag, cap the sleep to MAX_PACING_DELAY
+                // and clamp the deficit so old lag does not compound across subsequent packets.
+                self.clock.sleep(MAX_PACING_DELAY);
+                self.tokens = -((self.bytes_per_second as f64) * MAX_PACING_DELAY.as_secs_f64());
+                self.last_update = self.clock.now();
+            } else if wait_duration >= Duration::from_millis(1) {
+                self.clock.sleep(wait_duration);
+                self.last_update = self.clock.now();
+            }
+        }
     }
+}
+
+fn compute_max_burst_bytes(bytes_per_second: u64) -> f64 {
+    // 20ms worth of tokens at paced rate, clamped between 16KB and 256KB.
+    ((bytes_per_second as f64) * 0.02).clamp(16_384.0, 262_144.0)
 }
 
 fn paced_bytes_per_second(bitrate_kbit: u32) -> u64 {
@@ -406,24 +467,59 @@ fn paced_bytes_per_second(bitrate_kbit: u32) -> u64 {
     (bits_per_second / 8).max(1)
 }
 
+fn buffer_list_total_size(buffer_list: &gst::BufferListRef) -> usize {
+    buffer_list.iter().map(|b| b.size()).sum()
+}
+
+fn probe_info_packet_size(info: &gst::PadProbeInfo) -> usize {
+    if let Some(buffer) = info.buffer() {
+        buffer.size()
+    } else if let Some(buffer_list) = info.buffer_list() {
+        buffer_list_total_size(buffer_list)
+    } else {
+        0
+    }
+}
+
 fn attach_sender_packet_pacer(
     pipeline: &gst::Pipeline,
     bitrate_kbit: u32,
 ) -> Option<Arc<Mutex<SenderPacketPacer>>> {
-    let payloader = pipeline.by_name(SENDER_RTP_PAY_NAME)?;
-    let pad = payloader.static_pad("src")?;
-    let pacer = Arc::new(Mutex::new(SenderPacketPacer::new(bitrate_kbit)));
+    // Prefer monitoring multiudpsink sink pad so FEC recovery packets (rtpulpfecenc) and
+    // packetized fragments are paced accurately before UDP transmission.
+    // Fall back to rtph264pay src pad if multiudpsink is not present.
+    let (pad, peer_count, location_name) =
+        if let Some(sink) = pipeline.by_name(SENDER_VIDEO_SINK_NAME) {
+            let pad = sink.static_pad("sink")?;
+            let peer_count = sink
+                .find_property("clients")
+                .and_then(|_| sink.property_value("clients").get::<String>().ok())
+                .map(|clients| clients.split(',').filter(|c| !c.trim().is_empty()).count())
+                .unwrap_or(1)
+                .max(1);
+            (pad, peer_count, "multiudpsink:sink")
+        } else {
+            let payloader = pipeline.by_name(SENDER_RTP_PAY_NAME)?;
+            let pad = payloader.static_pad("src")?;
+            (pad, 1, "rtph264pay:src")
+        };
+
+    let pacer = Arc::new(Mutex::new(SenderPacketPacer::new(bitrate_kbit, peer_count)));
     let pacer_for_probe = Arc::clone(&pacer);
-    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-        if let Some(buffer) = info.buffer() {
-            if let Ok(mut pacer) = pacer_for_probe.lock() {
-                pacer.wait_for_packet(buffer.size());
+    pad.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+        move |_pad, info| {
+            let packet_size = probe_info_packet_size(info);
+            if packet_size > 0 {
+                if let Ok(mut pacer) = pacer_for_probe.lock() {
+                    pacer.wait_for_packet(packet_size);
+                }
             }
-        }
-        gst::PadProbeReturn::Ok
-    });
+            gst::PadProbeReturn::Ok
+        },
+    );
     crate::logging::append(format!(
-        "sender RTP packet pacing enabled: rate={}kbit/s",
+        "sender RTP packet pacing enabled: rate={}kbit/s, peers={peer_count}, target={location_name}",
         u64::from(bitrate_kbit) * SENDER_PACING_RATE_MULTIPLIER
     ));
     Some(pacer)
@@ -776,7 +872,7 @@ fn sender_video_transport_chain(
         elements.push(fec_element.to_string());
     }
     elements.push(format!(
-        "multiudpsink clients={} sync=false async=false buffer-size={udp_buffer_size} qos-dscp={qos_dscp} send-duplicates=false ttl=1",
+        "multiudpsink name={SENDER_VIDEO_SINK_NAME} clients={} sync=false async=false buffer-size={udp_buffer_size} qos-dscp={qos_dscp} send-duplicates=false ttl=1",
         gst_string_literal(clients)
     ));
     elements.join(" ! ")
@@ -1400,6 +1496,21 @@ impl AdaptiveBitrateController {
             return;
         }
 
+        let encoder = pipeline.by_name(SENDER_VIDEO_ENCODER_NAME);
+        let encoder_updated = encoder
+            .as_ref()
+            .map(|encoder| set_encoder_bitrate(encoder, target));
+
+        // If a video encoder is present but did not accept the bitrate update, skip reducing the
+        // pacer rate. Otherwise, the encoder would keep producing frames at the higher rate while
+        // the pacer throttles transmission, causing pipeline stalls and packet buildup.
+        if encoder.is_some() && encoder_updated != Some(true) {
+            crate::logging::append(format!(
+                "adaptive sender bitrate target {target} kbit/s skipped: encoder does not accept runtime bitrate update"
+            ));
+            return;
+        }
+
         let previous = self.current;
         self.current = target;
         if let Some(pacer) = sender_pacer {
@@ -1408,16 +1519,13 @@ impl AdaptiveBitrateController {
             }
         }
 
-        let encoder_updated = pipeline
-            .by_name(SENDER_VIDEO_ENCODER_NAME)
-            .map(|encoder| set_encoder_bitrate(&encoder, target))
-            .unwrap_or(false);
         crate::logging::append(format!(
-            "adaptive sender bitrate: {previous} -> {target} kbit/s (receivers={}, loss={:.2}%, late={:.2}%, jitter={}ms, encoder_property={encoder_updated})",
+            "adaptive sender bitrate: {previous} -> {target} kbit/s (receivers={}, loss={:.2}%, late={:.2}%, jitter={}ms, encoder_property={})",
             health.receiver_count,
             health.loss_ratio * 100.0,
             health.late_ratio * 100.0,
             health.jitter_ms.round() as u32,
+            encoder_updated.unwrap_or(false),
         ));
     }
 
@@ -3650,5 +3758,307 @@ mod tests {
         let caps = video_caps(30, None, None, true);
         assert!(!caps.contains("width="));
         assert!(!caps.contains("height="));
+    }
+
+    struct MockPacerClock {
+        current_time: Mutex<Instant>,
+        sleep_calls: Mutex<Vec<Duration>>,
+    }
+
+    impl MockPacerClock {
+        fn new(start_time: Instant) -> Self {
+            Self {
+                current_time: Mutex::new(start_time),
+                sleep_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn total_sleep(&self) -> Duration {
+            self.sleep_calls.lock().unwrap().iter().sum()
+        }
+
+        fn sleep_count(&self) -> usize {
+            self.sleep_calls.lock().unwrap().len()
+        }
+
+        fn advance(&self, duration: Duration) {
+            let mut time = self.current_time.lock().unwrap();
+            *time += duration;
+        }
+    }
+
+    impl PacerClock for MockPacerClock {
+        fn now(&self) -> Instant {
+            *self.current_time.lock().unwrap()
+        }
+
+        fn sleep(&self, duration: Duration) {
+            if !duration.is_zero() {
+                let mut time = self.current_time.lock().unwrap();
+                *time += duration;
+                self.sleep_calls.lock().unwrap().push(duration);
+            }
+        }
+    }
+
+    #[test]
+    fn pacer_burst_within_allowance_incurs_no_sleep() {
+        let base_time = Instant::now();
+        let clock = Arc::new(MockPacerClock::new(base_time));
+        struct ClockAdapter(Arc<MockPacerClock>);
+        impl PacerClock for ClockAdapter {
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.0.sleep(duration);
+            }
+        }
+
+        let mut pacer =
+            SenderPacketPacer::with_clock(10_000, 1, Box::new(ClockAdapter(Arc::clone(&clock))));
+        // 1400 bytes * 25 packets = 35,000 bytes. At 10Mbps (paced at 20Mbps = 2.5MB/s),
+        // 20ms burst capacity is 50,000 bytes, so 35,000 bytes must pass without any sleep.
+        for _ in 0..25 {
+            pacer.wait_for_packet(1400);
+        }
+
+        assert_eq!(clock.sleep_count(), 0);
+        assert_eq!(clock.total_sleep(), Duration::ZERO);
+    }
+
+    #[test]
+    fn pacer_burst_exceeded_triggers_paced_sleep() {
+        let base_time = Instant::now();
+        let clock = Arc::new(MockPacerClock::new(base_time));
+        struct ClockAdapter(Arc<MockPacerClock>);
+        impl PacerClock for ClockAdapter {
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.0.sleep(duration);
+            }
+        }
+
+        let mut pacer =
+            SenderPacketPacer::with_clock(10_000, 1, Box::new(ClockAdapter(Arc::clone(&clock))));
+        // 1400 bytes * 60 packets = 84,000 bytes. Exceeds the 50,000 bytes burst capacity,
+        // so pacing sleeps should occur for the excess 34,000 bytes.
+        for _ in 0..60 {
+            pacer.wait_for_packet(1400);
+        }
+
+        assert!(
+            clock.sleep_count() > 0,
+            "expected sleep calls once burst exceeded"
+        );
+        assert!(
+            clock.total_sleep() >= Duration::from_millis(10),
+            "total sleep {:?} was less than expected pacing time",
+            clock.total_sleep()
+        );
+    }
+
+    #[test]
+    fn pacer_caps_maximum_delay_on_huge_packet() {
+        let base_time = Instant::now();
+        let clock = Arc::new(MockPacerClock::new(base_time));
+        struct ClockAdapter(Arc<MockPacerClock>);
+        impl PacerClock for ClockAdapter {
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.0.sleep(duration);
+            }
+        }
+
+        let mut pacer =
+            SenderPacketPacer::with_clock(10_000, 1, Box::new(ClockAdapter(Arc::clone(&clock))));
+        // Send a huge buffer (1 MB) that would otherwise require hundreds of milliseconds of sleep.
+        pacer.wait_for_packet(1_000_000);
+
+        assert_eq!(clock.sleep_count(), 1);
+        let first_sleep = clock.sleep_calls.lock().unwrap()[0];
+        assert_eq!(
+            first_sleep, MAX_PACING_DELAY,
+            "sleep must be capped to MAX_PACING_DELAY"
+        );
+
+        // Immediately following normal packets must not compound into unbounded backlog.
+        pacer.wait_for_packet(1400);
+        let sleeps = clock.sleep_calls.lock().unwrap().clone();
+        for s in sleeps {
+            assert!(
+                s <= MAX_PACING_DELAY,
+                "sleep {:?} exceeded MAX_PACING_DELAY",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn pacer_multi_peer_scales_cost_proportionally() {
+        let base_time = Instant::now();
+        struct ClockAdapter(Arc<MockPacerClock>);
+        impl PacerClock for ClockAdapter {
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.0.sleep(duration);
+            }
+        }
+
+        let clock1 = Arc::new(MockPacerClock::new(base_time));
+        let mut pacer1 =
+            SenderPacketPacer::with_clock(10_000, 1, Box::new(ClockAdapter(Arc::clone(&clock1))));
+
+        let clock3 = Arc::new(MockPacerClock::new(base_time));
+        let mut pacer3 =
+            SenderPacketPacer::with_clock(10_000, 3, Box::new(ClockAdapter(Arc::clone(&clock3))));
+
+        // 25 packets of 1400 bytes = 35,000 bytes.
+        // For peer_count=1: cost = 35,000 bytes <= 50,000 burst -> no sleep.
+        // For peer_count=3: cost = 105,000 bytes > 50,000 burst -> sleeps occur.
+        for _ in 0..25 {
+            pacer1.wait_for_packet(1400);
+            pacer3.wait_for_packet(1400);
+        }
+
+        assert_eq!(
+            clock1.sleep_count(),
+            0,
+            "single peer should stay within burst allowance"
+        );
+        assert!(
+            clock3.sleep_count() > 0,
+            "triple peer fanout must account for multiplied network bandwidth"
+        );
+    }
+
+    #[test]
+    fn pacer_replenishes_tokens_over_time() {
+        let base_time = Instant::now();
+        let clock = Arc::new(MockPacerClock::new(base_time));
+        struct ClockAdapter(Arc<MockPacerClock>);
+        impl PacerClock for ClockAdapter {
+            fn now(&self) -> Instant {
+                self.0.now()
+            }
+            fn sleep(&self, duration: Duration) {
+                self.0.sleep(duration);
+            }
+        }
+
+        let mut pacer =
+            SenderPacketPacer::with_clock(10_000, 1, Box::new(ClockAdapter(Arc::clone(&clock))));
+
+        // Exhaust burst allowance and cause pacing sleeps.
+        for _ in 0..60 {
+            pacer.wait_for_packet(1400);
+        }
+        let initial_sleep_count = clock.sleep_count();
+        assert!(initial_sleep_count > 0);
+
+        // Advance simulated time by 25ms (more than the 20ms burst window).
+        clock.advance(Duration::from_millis(25));
+
+        // Now a new burst within allowance (20 packets = 28,000 bytes) should pass with no new sleep.
+        for _ in 0..20 {
+            pacer.wait_for_packet(1400);
+        }
+        assert_eq!(
+            clock.sleep_count(),
+            initial_sleep_count,
+            "replenished tokens should allow burst with zero additional sleep"
+        );
+    }
+
+    #[test]
+    fn adaptive_bitrate_skips_pacer_throttling_if_encoder_rejects() {
+        gst::init().expect("GStreamer initialization");
+
+        // Pipeline with an element named sender_video_encoder that does NOT have a bitrate property.
+        let pipeline =
+            gst::parse::launch("fakesrc ! identity name=sender_video_encoder ! fakesink")
+                .expect("valid pipeline")
+                .downcast::<gst::Pipeline>()
+                .expect("GstPipeline");
+
+        let mut controller = AdaptiveBitrateController::new(8_000, FeedbackStore::default());
+        // Populate store with congested feedback.
+        let stream_feedback =
+            sm_core::control::StreamFeedback::with_pin("1234", 1, 1_000, 90, 10, 10, 0, 30, 30, 70)
+                .expect("valid feedback");
+        controller
+            .feedback
+            .update(std::net::Ipv4Addr::LOCALHOST, stream_feedback);
+
+        let pacer = Arc::new(Mutex::new(SenderPacketPacer::new(8_000, 1)));
+        let initial_bytes_per_sec = pacer.lock().unwrap().bytes_per_second;
+
+        // Run update. Because identity cannot set bitrate, pacer rate MUST remain unchanged.
+        controller.update(Instant::now(), &pipeline, Some(&pacer));
+
+        assert_eq!(
+            pacer.lock().unwrap().bytes_per_second,
+            initial_bytes_per_sec,
+            "pacer must not be throttled when encoder rejects bitrate change"
+        );
+        assert_eq!(
+            controller.current, 8_000,
+            "controller current bitrate should not change if encoder rejects update"
+        );
+    }
+
+    #[test]
+    fn sender_pacer_monitors_multiudpsink_and_counts_peers() {
+        gst::init().expect("GStreamer initialization");
+
+        let description = format!(
+            "fakesrc num-buffers=3 ! application/x-rtp,media=video,payload=96,clock-rate=90000,encoding-name=H264 ! multiudpsink name={SENDER_VIDEO_SINK_NAME} clients=\"127.0.0.1:5004,127.0.0.1:5006\" sync=false async=false"
+        );
+        let pipeline = gst::parse::launch(&description)
+            .expect("valid pipeline")
+            .downcast::<gst::Pipeline>()
+            .expect("GstPipeline");
+
+        let pacer = attach_sender_packet_pacer(&pipeline, 10_000)
+            .expect("pacer attaches to multiudpsink sink pad");
+
+        assert_eq!(
+            pacer.lock().unwrap().peer_count,
+            2,
+            "pacer must parse 2 peers from clients property"
+        );
+
+        pipeline
+            .set_state(gst::State::Playing)
+            .expect("pipeline playing");
+        let bus = pipeline.bus().expect("bus");
+        let msg = bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(2),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        assert!(msg.is_some(), "pipeline should reach EOS without error");
+        pipeline.set_state(gst::State::Null).expect("pipeline null");
+    }
+
+    #[test]
+    fn buffer_list_total_size_sums_all_buffers() {
+        gst::init().expect("GStreamer initialization");
+
+        let mut list = gst::BufferList::new();
+        {
+            let list_mut = list.get_mut().expect("mutable buffer list");
+            let buf1 = gst::Buffer::from_slice(vec![0u8; 1000]);
+            let buf2 = gst::Buffer::from_slice(vec![0u8; 400]);
+            list_mut.add(buf1);
+            list_mut.add(buf2);
+        }
+
+        assert_eq!(buffer_list_total_size(&list), 1400);
     }
 }

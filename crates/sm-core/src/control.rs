@@ -90,7 +90,8 @@ pub struct StreamFeedback {
     pub late_packets: u64,
     pub duplicate_packets: u64,
     pub decoded_frames: u64,
-    pub displayed_frames: u64,
+    #[serde(rename = "displayed_frames")]
+    pub sink_input_frames: u64,
     pub jitter_ms: u32,
 }
 
@@ -105,7 +106,7 @@ impl StreamFeedback {
         late_packets: u64,
         duplicate_packets: u64,
         decoded_frames: u64,
-        displayed_frames: u64,
+        sink_input_frames: u64,
         jitter_ms: u32,
     ) -> Result<Self> {
         Ok(Self {
@@ -119,7 +120,7 @@ impl StreamFeedback {
             late_packets,
             duplicate_packets,
             decoded_frames,
-            displayed_frames,
+            sink_input_frames,
             jitter_ms,
         })
     }
@@ -168,8 +169,35 @@ mod tests {
         assert_eq!(decoded.late_packets, 2);
         assert_eq!(decoded.duplicate_packets, 1);
         assert_eq!(decoded.decoded_frames, 58);
-        assert_eq!(decoded.displayed_frames, 56);
+        assert_eq!(decoded.sink_input_frames, 56);
         assert_eq!(decoded.jitter_ms, 7);
+    }
+
+    #[test]
+    fn legacy_stream_feedback_json_decodes_into_sink_input_frames() {
+        // Simulates an older receiver client emitting `displayed_frames` in JSON.
+        let legacy_json = br#"{"protocol":"screen-mirror.feedback","version":1,"pin_hash":"a4ac39714ab01a7bb27a810f63b0a68d00ad20fa716e2eb9b329c29bfcaebc00","timestamp_ms":1000,"window_ms":500,"received_packets":100,"lost_packets":4,"late_packets":2,"duplicate_packets":1,"decoded_frames":58,"displayed_frames":56,"jitter_ms":7}"#;
+        let decoded = StreamFeedback::decode(legacy_json).expect("decode legacy feedback");
+        assert_eq!(decoded.sink_input_frames, 56);
+    }
+
+    #[test]
+    fn stream_feedback_encoded_json_preserves_legacy_displayed_frames_key() {
+        // Ensures that the serialized JSON contains `displayed_frames` rather than `sink_input_frames`,
+        // preserving wire compatibility with legacy senders/receivers.
+        let feedback = StreamFeedback::with_pin("1234", 1_000, 500, 100, 4, 2, 1, 58, 56, 7)
+            .expect("valid PIN");
+        let encoded = feedback.encode().expect("encode feedback");
+        let json_str = String::from_utf8(encoded).expect("valid utf-8");
+
+        assert!(
+            json_str.contains("\"displayed_frames\":56"),
+            "JSON wire format must contain 'displayed_frames': {json_str}"
+        );
+        assert!(
+            !json_str.contains("sink_input_frames"),
+            "JSON wire format must NOT contain internal 'sink_input_frames': {json_str}"
+        );
     }
 
     #[test]

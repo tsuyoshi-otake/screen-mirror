@@ -226,9 +226,13 @@ pub struct ReceiverStreamStats {
     pub late_packets: u64,
     pub duplicate_packets: u64,
     pub decoded_frames: u64,
-    pub displayed_frames: u64,
+    pub sink_input_frames: u64,
     pub decoded_fps: f32,
-    pub displayed_fps: f32,
+    pub sink_input_fps: f32,
+    /// Rendered frames per second if direct presentation completion can be verified,
+    /// or `None` if the platform or sink does not report it.
+    /// Never substituted with `sink_input_fps`.
+    pub rendered_fps: Option<f32>,
     pub jitter_ms: u32,
 }
 
@@ -1477,13 +1481,13 @@ fn set_encoder_bitrate(encoder: &gst::Element, bitrate_kbit: u32) -> bool {
 /// discarded, which is what says whether the frames that never arrived were late rather than absent.
 struct ReceiverStreamReport {
     decoded: Option<Arc<AtomicU64>>,
-    displayed: Arc<AtomicU64>,
+    sink_input: Arc<AtomicU64>,
     jitter: Option<gst::Element>,
     jitter_total: JitterCounts,
     stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
     feedback_window_started: Instant,
     report_window_started: Instant,
-    report_displayed: u64,
+    report_sink_input: u64,
     report_decoded: Option<u64>,
     report_jitter: JitterCounts,
 }
@@ -1495,7 +1499,7 @@ impl ReceiverStreamReport {
         stats: Option<Arc<Mutex<ReceiverStreamStats>>>,
     ) -> Option<Self> {
         let sink = pipeline.by_name(RECEIVER_VIDEO_SINK_NAME)?;
-        let displayed = count_buffers_on(&sink, "sink")?;
+        let sink_input = count_buffers_on(&sink, "sink")?;
         // `decodebin` exposes no static source pad, so its frames are counted at the sink only.
         let decoded = pipeline
             .by_name(RECEIVER_VIDEO_DECODER_NAME)
@@ -1507,13 +1511,13 @@ impl ReceiverStreamReport {
         let report_decoded = decoded.as_ref().map(|_| 0);
         Some(Self {
             decoded,
-            displayed,
+            sink_input,
             jitter,
             jitter_total,
             stats,
             feedback_window_started: now,
             report_window_started: now,
-            report_displayed: 0,
+            report_sink_input: 0,
             report_decoded,
             report_jitter: JitterCounts::default(),
         })
@@ -1532,7 +1536,7 @@ impl ReceiverStreamReport {
             self.jitter_total = counts;
         }
 
-        let displayed = take_count(&self.displayed);
+        let sink_input = take_count(&self.sink_input);
         let decoded = self.decoded.as_ref().map(take_count);
         if let Some(stats) = self.stats.as_ref() {
             if let Ok(mut stats) = stats.lock() {
@@ -1554,15 +1558,16 @@ impl ReceiverStreamReport {
                         .map(|counts| counts.duplicates)
                         .unwrap_or_default(),
                     decoded_frames: decoded.unwrap_or_default(),
-                    displayed_frames: displayed,
+                    sink_input_frames: sink_input,
                     decoded_fps: decoded.unwrap_or_default() as f32 / seconds,
-                    displayed_fps: displayed as f32 / seconds,
+                    sink_input_fps: sink_input as f32 / seconds,
+                    rendered_fps: None,
                     jitter_ms,
                 };
             }
         }
 
-        self.report_displayed = self.report_displayed.saturating_add(displayed);
+        self.report_sink_input = self.report_sink_input.saturating_add(sink_input);
         if let (Some(total), Some(decoded)) = (self.report_decoded.as_mut(), decoded) {
             *total = total.saturating_add(decoded);
         }
@@ -1578,11 +1583,11 @@ impl ReceiverStreamReport {
 
         crate::logging::append(stream_report_line(
             report_window,
-            self.report_displayed,
+            self.report_sink_input,
             self.report_decoded,
             self.jitter.as_ref().map(|_| self.report_jitter),
         ));
-        self.report_displayed = 0;
+        self.report_sink_input = 0;
         self.report_decoded = self.decoded.as_ref().map(|_| 0);
         self.report_jitter = JitterCounts::default();
     }
@@ -1660,7 +1665,7 @@ fn jitter_counts(jitter: &gst::Element) -> JitterCounts {
 /// and the count is what stays meaningful when a report window is stretched by a stalled pipeline.
 fn stream_report_line(
     window: Duration,
-    displayed: u64,
+    sink_input: u64,
     decoded: Option<u64>,
     jitter: Option<JitterCounts>,
 ) -> String {
@@ -1676,7 +1681,10 @@ fn stream_report_line(
     if let Some(decoded) = decoded {
         line.push_str(&format!(" decoded={decoded} ({})", rate(decoded)));
     }
-    line.push_str(&format!(" displayed={displayed} ({})", rate(displayed)));
+    line.push_str(&format!(
+        " sink-input={sink_input} ({}) rendered=N/A",
+        rate(sink_input)
+    ));
     if let Some(jitter) = jitter {
         line.push_str(&format!(
             " rtp pushed={} lost={} late={} duplicates={}",
@@ -2951,7 +2959,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "receiver stream 5.0s: decoded=70 (14.0 fps) displayed=35 (7.0 fps) \
+            "receiver stream 5.0s: decoded=70 (14.0 fps) sink-input=35 (7.0 fps) rendered=N/A \
              rtp pushed=3489 lost=12 late=4 duplicates=0"
         );
     }
@@ -2960,7 +2968,10 @@ mod tests {
     fn a_stream_report_still_names_a_rate_when_the_decoder_cannot_be_counted() {
         let line = stream_report_line(Duration::from_millis(5_000), 150, None, None);
 
-        assert_eq!(line, "receiver stream 5.0s: displayed=150 (30.0 fps)");
+        assert_eq!(
+            line,
+            "receiver stream 5.0s: sink-input=150 (30.0 fps) rendered=N/A"
+        );
     }
 
     #[test]

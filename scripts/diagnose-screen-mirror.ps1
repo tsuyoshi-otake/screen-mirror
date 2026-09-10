@@ -668,6 +668,11 @@ function Get-ReceiverVisualCapture {
     } else {
         '(unknown)'
     }
+    $saveStatus = if ($lastCaptureText -match 'save=([^\s]+)') {
+        $Matches[1]
+    } else {
+        'unknown'
+    }
     $status = if (-not $lastCapture) {
         'UNKNOWN - no receiver visual capture has been logged.'
     } elseif ($lastCaptureText -match 'renderer window missing') {
@@ -678,10 +683,14 @@ function Get-ReceiverVisualCapture {
         } else {
             'FAIL - the receiver window could not be captured and no active sink flow was observed.'
         }
-    } elseif (-not $latestItem) {
-        'FAIL - capture metrics were logged but the BMP file is missing.'
     } elseif ($verdict -match '^(?:blank|stale)') {
-        "FAIL - visual probe classified the receiver as $verdict."
+        if (-not $latestItem -and $saveStatus -like 'error*') {
+            "FAIL - visual probe classified the receiver as $verdict but failed to save diagnostic BMP."
+        } else {
+            "FAIL - visual probe classified the receiver as $verdict."
+        }
+    } elseif ($verdict -eq 'UNKNOWN') {
+        'UNKNOWN - visual probe verdict is not recorded.'
     } else {
         'OK - receiver pixels are being captured and classified.'
     }

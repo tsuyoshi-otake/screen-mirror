@@ -64,7 +64,7 @@ impl FeedbackStore {
         health
     }
 
-    fn update(&self, source: Ipv4Addr, feedback: StreamFeedback) {
+    pub(crate) fn update(&self, source: Ipv4Addr, feedback: StreamFeedback) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(
                 source,

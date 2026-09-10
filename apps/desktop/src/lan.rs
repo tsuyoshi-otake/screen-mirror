@@ -52,7 +52,7 @@ impl FeedbackSender {
                     stats.late_packets,
                     stats.duplicate_packets,
                     stats.decoded_frames,
-                    stats.displayed_frames,
+                    stats.sink_input_frames,
                     stats.jitter_ms,
                 ),
                 Err(_) => continue,

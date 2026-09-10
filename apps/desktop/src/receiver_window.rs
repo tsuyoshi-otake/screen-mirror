@@ -45,12 +45,13 @@ fn run_window_guard(stop_rx: &mpsc::Receiver<()>, stats: Option<Arc<Mutex<Receiv
     let mut overlay = None;
     let mut visual_capture = VisualCaptureState::default();
     let mut renderer_was_present = false;
+    let mut cached_renderer: Option<windows_sys::Win32::Foundation::HWND> = None;
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
         }
 
-        let renderer = apply_receiver_window_chrome();
+        let renderer = apply_receiver_window_chrome(&mut cached_renderer);
         if let Some(stats) = stats.as_ref() {
             overlay = sync_stats_overlay(renderer, overlay, Arc::clone(stats));
             pump_overlay_messages();
@@ -122,12 +123,46 @@ fn receiver_window_icon() -> isize {
 }
 
 #[cfg(windows)]
-fn apply_receiver_window_chrome() -> Option<windows_sys::Win32::Foundation::HWND> {
+fn is_valid_renderer_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    };
+
+    unsafe {
+        if IsWindow(hwnd) == 0 || IsWindowVisible(hwnd) == 0 {
+            return false;
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(hwnd, &mut process_id);
+        if process_id != std::process::id() {
+            return false;
+        }
+        let mut buffer = [0_u16; 256];
+        let length = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        let window_title = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+        let normalized = window_title.to_ascii_lowercase();
+        normalized.contains("direct3d11")
+            || normalized.contains("renderer")
+            || normalized.contains("screen-mirror receiver")
+    }
+}
+
+#[cfg(windows)]
+fn apply_receiver_window_chrome(
+    cached: &mut Option<windows_sys::Win32::Foundation::HWND>,
+) -> Option<windows_sys::Win32::Foundation::HWND> {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendMessageW,
         SetWindowTextW, ICON_BIG, ICON_SMALL, ICON_SMALL2, WM_SETICON,
     };
+
+    if let Some(hwnd) = *cached {
+        if is_valid_renderer_window(hwnd) {
+            return Some(hwnd);
+        }
+        *cached = None;
+    }
 
     struct Context {
         process_id: u32,
@@ -179,13 +214,20 @@ fn apply_receiver_window_chrome() -> Option<windows_sys::Win32::Foundation::HWND
     unsafe {
         EnumWindows(Some(enum_window), &mut context as *mut Context as isize);
     }
-    (!context.found.is_null()).then_some(context.found)
+    if !context.found.is_null() {
+        *cached = Some(context.found);
+        Some(context.found)
+    } else {
+        None
+    }
 }
 
 #[cfg(windows)]
 struct StatsOverlay {
     parent: windows_sys::Win32::Foundation::HWND,
     window: windows_sys::Win32::Foundation::HWND,
+    last_size: (i32, i32),
+    last_text: String,
 }
 
 #[cfg(windows)]
@@ -203,15 +245,15 @@ fn sync_stats_overlay(
         return None;
     };
 
-    let overlay = match overlay {
+    let mut overlay = match overlay {
         Some(overlay) if overlay.parent == renderer => overlay,
         Some(overlay) => {
             unsafe {
                 windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(overlay.window);
             }
-            create_stats_overlay(renderer, stats)?
+            create_stats_overlay(renderer, Arc::clone(&stats))?
         }
-        None => create_stats_overlay(renderer, stats)?,
+        None => create_stats_overlay(renderer, Arc::clone(&stats))?,
     };
 
     unsafe {
@@ -231,17 +273,29 @@ fn sync_stats_overlay(
         if GetClientRect(renderer, &mut rect) != 0 {
             let width = (rect.right - rect.left).clamp(280, 420);
             let height = (rect.bottom - rect.top).clamp(86, 120);
-            SetWindowPos(
-                overlay.window,
-                HWND_TOP,
-                14,
-                14,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW,
-            );
+            if overlay.last_size != (width, height) {
+                SetWindowPos(
+                    overlay.window,
+                    HWND_TOP,
+                    14,
+                    14,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW,
+                );
+                overlay.last_size = (width, height);
+            }
         }
-        InvalidateRect(overlay.window, std::ptr::null(), 1);
+
+        let current_text = stats
+            .lock()
+            .ok()
+            .map(|s| format_overlay_text(&s))
+            .unwrap_or_default();
+        if overlay.last_text != current_text {
+            InvalidateRect(overlay.window, std::ptr::null(), 1);
+            overlay.last_text = current_text;
+        }
     }
     Some(overlay)
 }
@@ -324,7 +378,12 @@ fn create_stats_overlay(
         }
         return None;
     }
-    Some(StatsOverlay { parent, window })
+    Some(StatsOverlay {
+        parent,
+        window,
+        last_size: (360, 102),
+        last_text: String::new(),
+    })
 }
 
 #[cfg(windows)]
@@ -418,10 +477,15 @@ unsafe extern "system" fn stats_overlay_proc(
 
 #[cfg(windows)]
 fn format_overlay_text(stats: &ReceiverStreamStats) -> String {
+    let rendered_text = stats
+        .rendered_fps
+        .map(|fps| format!("{:>5.1} fps", fps))
+        .unwrap_or_else(|| "  N/A    ".to_string());
     format!(
-        "screen-mirror\n decoded {:>5.1} fps  displayed {:>5.1} fps\n RTP +{}  loss {}  late {}  dup {}\n jitter {:>3} ms  window {} ms",
+        "screen-mirror\n decoded {:>5.1} fps  sink-in {:>5.1} fps  render {}\n RTP +{}  loss {}  late {}  dup {}\n jitter {:>3} ms  window {} ms",
         stats.decoded_fps,
-        stats.displayed_fps,
+        stats.sink_input_fps,
+        rendered_text,
         stats.received_packets,
         stats.lost_packets,
         stats.late_packets,
@@ -434,11 +498,19 @@ fn format_overlay_text(stats: &ReceiverStreamStats) -> String {
 #[cfg(windows)]
 const VISUAL_CAPTURE_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(windows)]
+const VISUAL_CAPTURE_NORMAL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(windows)]
 const VISUAL_CAPTURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const VISUAL_CAPTURE_MAX_WIDTH: f64 = 640.0;
 #[cfg(windows)]
 const VISUAL_CAPTURE_MAX_HEIGHT: f64 = 360.0;
+#[cfg(windows)]
+const MAX_ANOMALY_FILES: usize = 10;
+#[cfg(windows)]
+const MAX_CAPTURE_DIR_BYTES: u64 = 20 * 1024 * 1024; // 20 MB
+#[cfg(windows)]
+const MIN_ANOMALY_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// State for the low-rate visual probe. The probe deliberately runs beside the renderer window
 /// rather than inside the GStreamer streaming thread: a stopped pipeline must still be observable
@@ -448,6 +520,7 @@ const VISUAL_CAPTURE_MAX_HEIGHT: f64 = 360.0;
 struct VisualCaptureState {
     last_capture: Option<std::time::Instant>,
     last_log: Option<std::time::Instant>,
+    last_anomaly_save: Option<std::time::Instant>,
     last_hash: Option<u64>,
     last_verdict: Option<&'static str>,
     last_flow: Option<&'static str>,
@@ -470,15 +543,59 @@ fn gui_resource_counts() -> (u32, u32) {
 }
 
 #[cfg(windows)]
+fn enforce_capture_limits(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if file_name.starts_with("receiver-window-anomaly-") && file_name.ends_with(".bmp") {
+                if let Ok(meta) = entry.metadata() {
+                    let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    files.push((path, meta.len(), modified));
+                }
+            }
+        }
+    }
+    // Sort oldest first
+    files.sort_by_key(|&(_, _, modified)| modified);
+
+    // Enforce file count limit
+    while files.len() > MAX_ANOMALY_FILES {
+        let (path, _, _) = files.remove(0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Enforce total size limit
+    let mut total_size: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    while total_size > MAX_CAPTURE_DIR_BYTES && !files.is_empty() {
+        let (path, len, _) = files.remove(0);
+        let _ = std::fs::remove_file(path);
+        total_size = total_size.saturating_sub(len);
+    }
+}
+
+#[cfg(windows)]
 fn capture_visual_if_due(
     renderer: windows_sys::Win32::Foundation::HWND,
     stats: Option<&Arc<Mutex<ReceiverStreamStats>>>,
     state: &mut VisualCaptureState,
 ) {
     let now = std::time::Instant::now();
+    let interval = if state.last_verdict == Some("rendered") && state.last_flow == Some("active") {
+        VISUAL_CAPTURE_NORMAL_INTERVAL
+    } else {
+        VISUAL_CAPTURE_INTERVAL
+    };
     if state
         .last_capture
-        .is_some_and(|last| now.duration_since(last) < VISUAL_CAPTURE_INTERVAL)
+        .is_some_and(|last| now.duration_since(last) < interval)
     {
         return;
     }
@@ -499,7 +616,7 @@ fn capture_visual_if_due(
         "unknown"
     } else if !stats_fresh {
         "stale"
-    } else if snapshot.displayed_fps < 0.5 {
+    } else if snapshot.sink_input_fps < 0.5 {
         "none"
     } else {
         "active"
@@ -519,8 +636,8 @@ fn capture_visual_if_due(
                     flow,
                     stats_age_ms,
                     snapshot.decoded_fps,
-                    snapshot.displayed_fps,
-                    snapshot.displayed_frames,
+                    snapshot.sink_input_fps,
+                    snapshot.sink_input_frames,
                     gdi_handles,
                     user_handles,
                 ));
@@ -552,17 +669,35 @@ fn capture_visual_if_due(
 
     let capture_dir = receiver_capture_directory();
     let latest_path = capture_dir.join("receiver-window-latest.bmp");
-    let save_error = save_capture_bmp(&latest_path, &image).err();
+    let is_anomaly = verdict != "rendered";
+    let should_save_anomaly = is_anomaly
+        && (state.last_verdict != Some(verdict)
+            || state
+                .last_anomaly_save
+                .is_none_or(|last| now.duration_since(last) >= MIN_ANOMALY_SAVE_INTERVAL));
 
-    if verdict != "rendered" && state.last_verdict != Some(verdict) {
+    let save_status = if should_save_anomaly {
+        let _ = save_capture_bmp(&latest_path, &image);
+
         let anomaly_path = capture_dir.join(format!(
             "receiver-window-anomaly-{}.bmp",
             capture_timestamp()
         ));
-        if save_capture_bmp(&anomaly_path, &image).is_ok() {
-            state.last_anomaly_path = Some(anomaly_path.display().to_string());
-        }
-    }
+        let result = match save_capture_bmp(&anomaly_path, &image) {
+            Ok(()) => {
+                state.last_anomaly_path = Some(anomaly_path.display().to_string());
+                state.last_anomaly_save = Some(now);
+                enforce_capture_limits(&capture_dir);
+                "saved(anomaly)".to_string()
+            }
+            Err(error) => format!("error:{error:#}"),
+        };
+        result
+    } else if is_anomaly {
+        "skipped(rate-limited)".to_string()
+    } else {
+        "skipped(normal)".to_string()
+    };
 
     let state_changed = state.last_verdict != Some(verdict)
         || state.last_flow != Some(flow)
@@ -576,10 +711,6 @@ fn capture_visual_if_due(
         } else {
             state.last_anomaly_path.clone().unwrap_or_default()
         };
-        let save_status = save_error
-            .as_ref()
-            .map(|error| format!("error:{error:#}"))
-            .unwrap_or_else(|| "ok".to_string());
         crate::logging::append(format!(
             "receiver visual capture: status=ok window={:p} source={} latest=\"{}\" anomaly=\"{}\" size={}x{} save={} classification={} verdict={} flow={} stats-age-ms={} decoded-fps={:.1} sink-input-fps={:.1} sink-buffers={} mean-luma={:.1} stddev-luma={:.1} white-ratio={:.3} black-ratio={:.3} hash={:016x} changed={} gdi-handles={} user-handles={}",
             renderer,
@@ -594,8 +725,8 @@ fn capture_visual_if_due(
             flow,
             stats_age_ms,
             snapshot.decoded_fps,
-            snapshot.displayed_fps,
-            snapshot.displayed_frames,
+            snapshot.sink_input_fps,
+            snapshot.sink_input_frames,
             metrics.mean_luma,
             metrics.stddev_luma,
             metrics.white_ratio,
@@ -1007,5 +1138,40 @@ mod tests {
         assert_eq!(metrics.classification(), "mixed");
         assert!(metrics.white_ratio < 0.98);
         assert!(metrics.black_ratio < 0.98);
+    }
+
+    #[test]
+    fn enforce_capture_limits_prunes_excess_anomaly_files() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "screen_mirror_test_capture_limits_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Create 15 dummy anomaly files
+        for i in 0..15 {
+            let path = temp_dir.join(format!("receiver-window-anomaly-{:04}.bmp", i));
+            std::fs::write(&path, vec![0u8; 1024]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        super::enforce_capture_limits(&temp_dir);
+
+        let remaining = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_str()
+                    .unwrap_or_default()
+                    .starts_with("receiver-window-anomaly-")
+            })
+            .count();
+
+        assert_eq!(remaining, super::MAX_ANOMALY_FILES);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

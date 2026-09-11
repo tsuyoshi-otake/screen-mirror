@@ -14,6 +14,9 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 final class RtpH264Receiver {
@@ -36,15 +39,20 @@ final class RtpH264Receiver {
     private static final int DSCP_EF_TRAFFIC_CLASS = 0xB8;
     private static final int NAL_TYPE_IDR = 5;
     private static final int NAL_TYPE_SPS = 7;
+    private static final int NAL_TYPE_PPS = 8;
     private static final int NAL_TYPE_STAP_A = 24;
     private static final int NAL_TYPE_FU_A = 28;
     private static final int RTP_HEADER_SIZE = 12;
     private static final int H264_PAYLOAD_TYPE = 96;
+    private static final int RTP_CLOCK_RATE_HZ = 90_000;
+    private static final int MAX_PENDING_NALS = 60;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final byte[] receiveBuffer = new byte[2048];
     private final DatagramPacket receivePacket = new DatagramPacket(receiveBuffer, receiveBuffer.length);
     private final FuState fuState = new FuState();
+    private final BlockingQueue<PendingNal> nalQueue = new ArrayBlockingQueue<>(MAX_PENDING_NALS);
+    private final PtsTracker ptsTracker = new PtsTracker();
     /**
      * Refilled in place for every packet instead of allocated: at 30 fps a 1080p stream arrives as
      * thousands of packets a second, and this object never outlives the call that parses it.
@@ -57,7 +65,8 @@ final class RtpH264Receiver {
 
     private volatile Listener listener;
     private volatile DatagramSocket socket;
-    private Thread thread;
+    private Thread receiveThread;
+    private Thread decodeThread;
     /**
      * The decoder outlives no lock-free access: the receive thread feeds it while the UI thread may
      * tear the session down, so every touch happens under {@link #decoderLock}.
@@ -118,11 +127,15 @@ final class RtpH264Receiver {
         cachedSenderAddress = null;
         cachedSenderHost = null;
         fuState.reset();
+        ptsTracker.reset();
+        nalQueue.clear();
         watchdog.reset();
         streamLock.reset();
         running.set(true);
-        thread = new Thread(() -> receiveLoop(localSocket), "rtp-h264-receiver");
-        thread.start();
+        receiveThread = new Thread(() -> receiveLoop(localSocket), "rtp-h264-receiver");
+        decodeThread = new Thread(this::decodeLoop, "rtp-h264-decoder");
+        receiveThread.start();
+        decodeThread.start();
         AppLog.info("video receiver started on UDP " + port);
     }
 
@@ -134,13 +147,22 @@ final class RtpH264Receiver {
             activeSocket.close();
         }
 
-        Thread worker = thread;
-        thread = null;
-        joinWorker(worker, "video receiver");
+        Thread rWorker = receiveThread;
+        receiveThread = null;
+        joinWorker(rWorker, "video receiver");
 
+        Thread dWorker = decodeThread;
+        decodeThread = null;
+        if (dWorker != null) {
+            dWorker.interrupt();
+        }
+        joinWorker(dWorker, "video decoder");
+
+        nalQueue.clear();
         releaseDecoder();
         lastSenderHost = null;
         fuState.reset();
+        ptsTracker.reset();
         watchdog.reset();
         streamLock.reset();
     }
@@ -246,6 +268,8 @@ final class RtpH264Receiver {
         Surface surface = decoderSurface;
         decoder = null;
         awaitingKeyFrame = true;
+        nalQueue.clear();
+        ptsTracker.reset();
         if (failed != null) {
             try {
                 failed.stop();
@@ -307,9 +331,6 @@ final class RtpH264Receiver {
                         }
                     }
                     depacketizeAndQueue(receiveBuffer, header);
-                    // Draining unconditionally: skipping it while the input queue is full starves
-                    // the codec of buffers and it eventually gives up with a fatal error.
-                    drainDecoder();
                 } catch (SocketTimeoutException timeout) {
                     disconnectIfSelectedStreamTimedOut();
                 } catch (SocketException error) {
@@ -326,6 +347,68 @@ final class RtpH264Receiver {
             localSocket.close();
             if (socket == localSocket) {
                 socket = null;
+            }
+        }
+    }
+
+    private void decodeLoop() {
+        while (running.get()) {
+            try {
+                PendingNal nal = nalQueue.poll(10, TimeUnit.MILLISECONDS);
+                if (nal != null) {
+                    feedDecoder(nal);
+                }
+                drainDecoder();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception error) {
+                if (running.get()) {
+                    fail(error);
+                }
+            }
+        }
+    }
+
+    private void feedDecoder(PendingNal nal) {
+        synchronized (decoderLock) {
+            // A fresh codec chokes on data that starts mid-picture. Wait for an SPS/PPS to configure
+            // the decoder, but only consider recovery complete once an IDR frame arrives.
+            if (awaitingKeyFrame) {
+                if (nal.nalType == NAL_TYPE_SPS || nal.nalType == NAL_TYPE_PPS) {
+                    // Feed parameter set to initialize decoder state, but keep waiting for IDR.
+                } else if (nal.nalType == NAL_TYPE_IDR) {
+                    awaitingKeyFrame = false;
+                } else {
+                    return;
+                }
+            }
+            MediaCodec activeDecoder = decoder;
+            if (activeDecoder == null) {
+                return;
+            }
+
+            try {
+                int index = activeDecoder.dequeueInputBuffer(10_000);
+                if (index < 0) {
+                    // Half a picture is worse than none: drop queued frames and resync on the next key frame instead.
+                    awaitingKeyFrame = true;
+                    nalQueue.clear();
+                    return;
+                }
+
+                ByteBuffer input = activeDecoder.getInputBuffer(index);
+                if (input == null || input.capacity() < nal.data.length) {
+                    activeDecoder.queueInputBuffer(index, 0, 0, nal.presentationTimeUs, 0);
+                    AppLog.warn("video decoder input buffer was too small", null);
+                    return;
+                }
+
+                input.clear();
+                input.put(nal.data);
+                activeDecoder.queueInputBuffer(index, 0, nal.data.length, nal.presentationTimeUs, 0);
+            } catch (IllegalStateException error) {
+                restartDecoderLocked(error);
             }
         }
     }
@@ -418,6 +501,8 @@ final class RtpH264Receiver {
 
     private void resyncForStreamTakeover() {
         fuState.reset();
+        nalQueue.clear();
+        ptsTracker.reset();
         synchronized (decoderLock) {
             awaitingKeyFrame = true;
             renderedAFrame = false;
@@ -430,13 +515,13 @@ final class RtpH264Receiver {
 
         int nalType = packet[payloadOffset] & 0x1f;
         if (nalType >= 1 && nalType <= 23) {
-            queueNal(packet, payloadOffset, payloadLength);
+            queueNal(packet, payloadOffset, payloadLength, header.timestamp);
             return true;
         }
 
         // The sender aggregates its parameter sets, so a stream without STAP-A support never decodes.
         if (nalType == NAL_TYPE_STAP_A) {
-            return queueAggregatedNals(packet, payloadOffset + 1, payloadLength - 1);
+            return queueAggregatedNals(packet, payloadOffset + 1, payloadLength - 1, header.timestamp);
         }
 
         if (nalType != NAL_TYPE_FU_A || payloadLength < 3) {
@@ -470,7 +555,7 @@ final class RtpH264Receiver {
             return false;
         }
         if (end) {
-            queueNal(fuState.data, 0, fuState.size);
+            queueNal(fuState.data, 0, fuState.size, fuState.timestamp);
             fuState.reset();
             return true;
         }
@@ -478,7 +563,7 @@ final class RtpH264Receiver {
     }
 
     /** Unpacks a STAP-A packet: a series of 2-byte lengths, each followed by one whole NAL unit. */
-    private boolean queueAggregatedNals(byte[] packet, int offset, int available) {
+    private boolean queueAggregatedNals(byte[] packet, int offset, int available, int timestamp) {
         boolean queued = false;
         int cursor = offset;
         int end = offset + available;
@@ -492,57 +577,53 @@ final class RtpH264Receiver {
                 }
                 break;
             }
-            queueNal(packet, cursor, size);
+            queueNal(packet, cursor, size, timestamp);
             cursor += size;
             queued = true;
         }
         return queued;
     }
 
-    private void queueNal(byte[] source, int offset, int length) {
+    private void queueNal(byte[] source, int offset, int length, int timestamp) {
         if (length <= 0) {
             return;
         }
         int nalType = source[offset] & 0x1f;
+        long ptsUs = ptsTracker.computePtsUs(timestamp);
 
-        synchronized (decoderLock) {
-            // A fresh codec chokes on data that starts mid-picture, so wait for a parameter
-            // set or IDR only when the decoder itself has been restarted.
-            if (awaitingKeyFrame) {
-                if (nalType != NAL_TYPE_SPS && nalType != NAL_TYPE_IDR) {
-                    return;
-                }
-                awaitingKeyFrame = false;
+        byte[] payload = new byte[START_CODE.length + length];
+        System.arraycopy(START_CODE, 0, payload, 0, START_CODE.length);
+        System.arraycopy(source, offset, payload, START_CODE.length, length);
+
+        PendingNal nal = new PendingNal(payload, nalType, ptsUs);
+        if (!nalQueue.offer(nal)) {
+            nalQueue.clear();
+            synchronized (decoderLock) {
+                awaitingKeyFrame = true;
             }
-            MediaCodec activeDecoder = decoder;
-            if (activeDecoder == null) {
-                return;
-            }
-
-            try {
-                int index = activeDecoder.dequeueInputBuffer(10_000);
-                if (index < 0) {
-                    // Half a picture is worse than none: resync on the next key frame instead.
-                    awaitingKeyFrame = true;
-                    return;
-                }
-
-                ByteBuffer input = activeDecoder.getInputBuffer(index);
-                long presentationTimeUs = System.nanoTime() / 1000L;
-                if (input == null || input.capacity() < length + START_CODE.length) {
-                    activeDecoder.queueInputBuffer(index, 0, 0, presentationTimeUs, 0);
-                    AppLog.warn("video decoder input buffer was too small", null);
-                    return;
-                }
-
-                input.clear();
-                input.put(START_CODE);
-                input.put(source, offset, length);
-                activeDecoder.queueInputBuffer(index, 0, length + START_CODE.length, presentationTimeUs, 0);
-            } catch (IllegalStateException error) {
-                restartDecoderLocked(error);
+            AppLog.warn("video decoder queue overflow; dropping frames to resync", null);
+            if (nalType == NAL_TYPE_IDR || nalType == NAL_TYPE_SPS || nalType == NAL_TYPE_PPS) {
+                nalQueue.offer(nal);
             }
         }
+    }
+
+    int queuedNalCount() {
+        return nalQueue.size();
+    }
+
+    PendingNal pollQueuedNal() {
+        return nalQueue.poll();
+    }
+
+    boolean isAwaitingKeyFrame() {
+        synchronized (decoderLock) {
+            return awaitingKeyFrame;
+        }
+    }
+
+    void simulateFeedDecoder(PendingNal nal) {
+        feedDecoder(nal);
     }
 
     /**
@@ -784,6 +865,57 @@ final class RtpH264Receiver {
             if (size + length > data.length) {
                 data = Arrays.copyOf(data, Math.max(data.length * 2, size + length));
             }
+        }
+    }
+
+    static final class PendingNal {
+        final byte[] data;
+        final int nalType;
+        final long presentationTimeUs;
+
+        PendingNal(byte[] data, int nalType, long presentationTimeUs) {
+            this.data = data;
+            this.nalType = nalType;
+            this.presentationTimeUs = presentationTimeUs;
+        }
+    }
+
+    static final class PtsTracker {
+        private boolean initialized = false;
+        private int lastRtpTimestamp = 0;
+        private long currentPtsUs = 0;
+
+        synchronized void reset() {
+            initialized = false;
+            lastRtpTimestamp = 0;
+            currentPtsUs = 0;
+        }
+
+        synchronized long computePtsUs(int rtpTimestamp) {
+            long nowUs = System.nanoTime() / 1000L;
+            if (!initialized) {
+                initialized = true;
+                lastRtpTimestamp = rtpTimestamp;
+                currentPtsUs = nowUs;
+                return currentPtsUs;
+            }
+            int deltaRtp = rtpTimestamp - lastRtpTimestamp;
+            lastRtpTimestamp = rtpTimestamp;
+
+            if (deltaRtp >= 0 && deltaRtp < RTP_CLOCK_RATE_HZ * 10) {
+                currentPtsUs += ((long) deltaRtp * 1_000_000L) / RTP_CLOCK_RATE_HZ;
+            } else {
+                currentPtsUs = nowUs;
+            }
+            return currentPtsUs;
+        }
+
+        synchronized boolean isInitialized() {
+            return initialized;
+        }
+
+        synchronized long getCurrentPtsUs() {
+            return currentPtsUs;
         }
     }
 }

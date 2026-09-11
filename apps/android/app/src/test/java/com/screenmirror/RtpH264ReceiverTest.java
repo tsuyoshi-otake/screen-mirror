@@ -2,6 +2,7 @@ package com.screenmirror;
 
 import org.junit.Test;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -131,6 +132,106 @@ public final class RtpH264ReceiverTest {
     public void fragmentedNalSequenceCanWrap() throws Exception {
         assertFalse(receiver.depacketizeAndQueue(fuPacket(0xffff, 700, true, false, (byte) 0x11), 15));
         assertTrue(receiver.depacketizeAndQueue(fuPacket(0, 700, false, true, (byte) 0x22), 15));
+    }
+
+    @Test
+    public void queuedNalsPreserveOwnershipAndContainStartCode() throws Exception {
+        byte[] packet = new byte[16];
+        packet[0] = (byte) 0x80;
+        packet[1] = 96;
+        packet[12] = 0x65; // IDR slice
+        packet[13] = 0x11;
+        packet[14] = 0x22;
+        packet[15] = 0x33;
+
+        assertTrue(receiver.depacketizeAndQueue(packet, packet.length));
+        assertEquals(1, receiver.queuedNalCount());
+
+        // Mutate original packet buffer to verify buffer ownership independence.
+        packet[12] = 0x00;
+        packet[13] = 0x00;
+
+        RtpH264Receiver.PendingNal nal = receiver.pollQueuedNal();
+        assertEquals(5, nal.nalType);
+        // Start code {0, 0, 0, 1} prepended
+        assertEquals(0, nal.data[0]);
+        assertEquals(0, nal.data[1]);
+        assertEquals(0, nal.data[2]);
+        assertEquals(1, nal.data[3]);
+        // Original payload untouched by mutation
+        assertEquals(0x65, nal.data[4]);
+        assertEquals(0x11, nal.data[5]);
+        assertEquals(0x22, nal.data[6]);
+        assertEquals(0x33, nal.data[7]);
+    }
+
+    @Test
+    public void ptsTrackerComputesAccurateUsAndHandles32BitWraparound() {
+        RtpH264Receiver.PtsTracker tracker = new RtpH264Receiver.PtsTracker();
+        assertFalse(tracker.isInitialized());
+
+        int baseRtp = 0xffff_0000;
+        long pts1 = tracker.computePtsUs(baseRtp);
+        assertTrue(tracker.isInitialized());
+        assertEquals(pts1, tracker.getCurrentPtsUs());
+
+        // 90,000 ticks in 90kHz clock corresponds to exactly 1,000,000 microseconds (1 second).
+        // Wrapping around 32-bit boundary: 0xffff_0000 + 90,000 = 0x0000_5f90
+        int nextRtp = baseRtp + 90_000;
+        long pts2 = tracker.computePtsUs(nextRtp);
+        assertEquals(pts1 + 1_000_000L, pts2);
+
+        // Frame advance by 1500 ticks (60fps = 16.666ms)
+        long pts3 = tracker.computePtsUs(nextRtp + 1500);
+        assertEquals(pts2 + (1500L * 1_000_000L / 90_000L), pts3);
+    }
+
+    @Test
+    public void awaitingKeyFrameRequiresIdrToRecoverNotJustSps() {
+        // Initial state is awaitingKeyFrame = true
+        assertTrue(receiver.isAwaitingKeyFrame());
+
+        // SPS (type 7) should not clear awaitingKeyFrame
+        byte[] sps = new byte[]{0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f};
+        RtpH264Receiver.PendingNal spsNal = new RtpH264Receiver.PendingNal(sps, 7, 1000L);
+        receiver.simulateFeedDecoder(spsNal);
+        assertTrue(receiver.isAwaitingKeyFrame());
+
+        // PPS (type 8) should not clear awaitingKeyFrame
+        byte[] pps = new byte[]{0x00, 0x00, 0x00, 0x01, 0x68, (byte) 0xce, 0x3c, (byte) 0x80};
+        RtpH264Receiver.PendingNal ppsNal = new RtpH264Receiver.PendingNal(pps, 8, 1000L);
+        receiver.simulateFeedDecoder(ppsNal);
+        assertTrue(receiver.isAwaitingKeyFrame());
+
+        // P-frame (non-IDR slice, type 1) should be ignored while awaiting keyframe
+        byte[] pSlice = new byte[]{0x00, 0x00, 0x00, 0x01, 0x61, 0x01};
+        RtpH264Receiver.PendingNal pNal = new RtpH264Receiver.PendingNal(pSlice, 1, 1000L);
+        receiver.simulateFeedDecoder(pNal);
+        assertTrue(receiver.isAwaitingKeyFrame());
+
+        // IDR (type 5) clears awaitingKeyFrame
+        byte[] idr = new byte[]{0x00, 0x00, 0x00, 0x01, 0x65, 0x05};
+        RtpH264Receiver.PendingNal idrNal = new RtpH264Receiver.PendingNal(idr, 5, 1000L);
+        receiver.simulateFeedDecoder(idrNal);
+        assertFalse(receiver.isAwaitingKeyFrame());
+    }
+
+    @Test
+    public void queueOverflowClearsOldFramesAndEnforcesKeyFrameWait() throws Exception {
+        // Fill queue up to MAX_PENDING_NALS (60) with regular P-frames
+        for (int i = 0; i < 60; i++) {
+            byte[] packet = h264Packet(i, i * 1500, (byte) 0x61);
+            assertTrue(receiver.depacketizeAndQueue(packet, packet.length));
+        }
+        assertEquals(60, receiver.queuedNalCount());
+
+        // 61st frame causes queue overflow: clears old frames and waits for key frame
+        byte[] overflowingPFrame = h264Packet(60, 60 * 1500, (byte) 0x61);
+        assertTrue(receiver.depacketizeAndQueue(overflowingPFrame, overflowingPFrame.length));
+
+        // Queue was cleared, and regular P-frame was dropped
+        assertEquals(0, receiver.queuedNalCount());
+        assertTrue(receiver.isAwaitingKeyFrame());
     }
 
     private static byte[] stapA(byte[]... nals) {

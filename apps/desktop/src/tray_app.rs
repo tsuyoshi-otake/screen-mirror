@@ -8,7 +8,9 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::autostart;
-use crate::config::{AppConfig, ConfigEncoder, ConfigNvidiaTuning, ConfigSampling, StartupMode};
+use crate::config::{
+    AppConfig, ConfigEncoder, ConfigH264Profile, ConfigNvidiaTuning, ConfigSampling, StartupMode,
+};
 use crate::pipeline::{self, PipelineHandle};
 
 const ID_START_SENDER: &str = "start-sender";
@@ -20,6 +22,7 @@ const ID_GPU_RECV_PREFIX: &str = "gpu-recv:";
 const ID_FRAME_RATE_PREFIX: &str = "fps:";
 const ID_SAMPLING_PREFIX: &str = "sampling:";
 const ID_ENCODER_PREFIX: &str = "encoder:";
+const ID_PROFILE_PREFIX: &str = "profile:";
 const ID_QUALITY_PREFIX: &str = "quality:";
 const ID_BITRATE_PREFIX: &str = "bitrate:";
 const ID_FEC_PREFIX: &str = "fec:";
@@ -154,6 +157,7 @@ struct TrayItems {
     frame_rates: Vec<FrameRateMenuChoice>,
     sampling: Vec<SamplingMenuChoice>,
     encoders: Vec<EncoderMenuChoice>,
+    profiles: Vec<ProfileMenuChoice>,
     qualities: Vec<QualityMenuChoice>,
     bitrates: Vec<BitrateMenuChoice>,
     fec: Vec<FecMenuChoice>,
@@ -190,6 +194,11 @@ struct SamplingMenuChoice {
 
 struct EncoderMenuChoice {
     encoder: ConfigEncoder,
+    item: CheckMenuItem,
+}
+
+struct ProfileMenuChoice {
+    profile: ConfigH264Profile,
     item: CheckMenuItem,
 }
 
@@ -387,6 +396,7 @@ impl TrayApp {
         menu.append(&PredefinedMenuItem::separator())?;
         menu.append(&frame_rate_submenu(&items.frame_rates)?)?;
         menu.append(&encoder_submenu(&items.encoders)?)?;
+        menu.append(&profile_submenu(&items.profiles)?)?;
         menu.append(&quality_submenu(&items.qualities)?)?;
         menu.append(&bitrate_submenu(&items.bitrates)?)?;
         menu.append(&fec_submenu(&items.fec)?)?;
@@ -475,6 +485,7 @@ impl TrayApp {
             id if id.starts_with(ID_GPU_RECV_PREFIX) => self.select_gpu(GpuSide::Receiver, id),
             id if id.starts_with(ID_FRAME_RATE_PREFIX) => self.select_frame_rate(id),
             id if id.starts_with(ID_ENCODER_PREFIX) => self.select_encoder(id),
+            id if id.starts_with(ID_PROFILE_PREFIX) => self.select_profile(id),
             id if id.starts_with(ID_QUALITY_PREFIX) => self.select_quality(id),
             id if id.starts_with(ID_BITRATE_PREFIX) => self.select_bitrate(id),
             id if id.starts_with(ID_FEC_PREFIX) => self.select_fec(id),
@@ -965,6 +976,35 @@ impl TrayApp {
         self.config.send.encoder = encoder;
         self.save_config();
         crate::logging::append(format!("sender encoder set to {}", encoder.key()));
+        self.sync_menu();
+        if self.active_mode == ActiveMode::Sender {
+            self.start_sender();
+        }
+    }
+
+    /// Applies the H.264 profile selected from the tray and restarts the sender when needed.
+    fn select_profile(&mut self, id: &str) {
+        let Some(profile) = self
+            .items
+            .as_ref()
+            .and_then(|items| {
+                items
+                    .profiles
+                    .iter()
+                    .find(|choice| choice.item.id().as_ref() == id)
+            })
+            .map(|choice| choice.profile)
+        else {
+            return;
+        };
+        if self.config.send.h264_profile == profile {
+            self.sync_menu();
+            return;
+        }
+
+        self.config.send.h264_profile = profile;
+        self.save_config();
+        crate::logging::append(format!("sender H.264 profile set to {}", profile.key()));
         self.sync_menu();
         if self.active_mode == ActiveMode::Sender {
             self.start_sender();
@@ -1463,6 +1503,11 @@ impl TrayApp {
                 .item
                 .set_checked(choice.encoder == self.config.send.encoder);
         }
+        for choice in &items.profiles {
+            choice
+                .item
+                .set_checked(choice.profile == self.config.send.h264_profile);
+        }
         let quality =
             QualityPreset::from_settings(self.config.send.bitrate, self.config.send.nvidia_tuning);
         for choice in &items.qualities {
@@ -1570,6 +1615,7 @@ impl TrayItems {
             frame_rates: frame_rate_choices(config.send.fps),
             sampling: sampling_choices(config.recv.sampling),
             encoders: encoder_choices(config.send.encoder),
+            profiles: profile_choices(config.send.h264_profile),
             qualities: quality_choices(config.send.bitrate, config.send.nvidia_tuning),
             bitrates: bitrate_choices(config.send.bitrate),
             fec: fec_choices(config.send.fec_percentage),
@@ -1638,6 +1684,30 @@ fn encoder_choices(configured: ConfigEncoder) -> Vec<EncoderMenuChoice> {
                 encoder.label(),
                 true,
                 encoder == configured,
+                None,
+            ),
+        })
+        .collect()
+}
+
+fn profile_submenu(choices: &[ProfileMenuChoice]) -> Result<Submenu> {
+    let submenu = Submenu::new("H.264 Profile", true);
+    for choice in choices {
+        submenu.append(&choice.item)?;
+    }
+    Ok(submenu)
+}
+
+fn profile_choices(configured: ConfigH264Profile) -> Vec<ProfileMenuChoice> {
+    ConfigH264Profile::ALL
+        .into_iter()
+        .map(|profile| ProfileMenuChoice {
+            profile,
+            item: CheckMenuItem::with_id(
+                format!("{ID_PROFILE_PREFIX}{}", profile.key()),
+                profile.label(),
+                true,
+                profile == configured,
                 None,
             ),
         })
@@ -2077,6 +2147,20 @@ mod tests {
             assert!(choice.item.id().as_ref().starts_with(ID_ENCODER_PREFIX));
             assert_eq!(
                 choice.encoder.key(),
+                choice.item.id().as_ref().split(':').nth(1).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn profile_menu_ids_round_trip_to_the_configured_profiles() {
+        let choices = profile_choices(ConfigH264Profile::Auto);
+
+        assert_eq!(choices.len(), ConfigH264Profile::ALL.len());
+        for choice in &choices {
+            assert!(choice.item.id().as_ref().starts_with(ID_PROFILE_PREFIX));
+            assert_eq!(
+                choice.profile.key(),
                 choice.item.id().as_ref().split(':').nth(1).unwrap()
             );
         }

@@ -33,6 +33,11 @@ pub struct PeerAnnouncement {
     /// cannot understand into a mixed receiver set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub supports_fec: bool,
+    /// Whether this receiver supports H.264 High profile decoding. Older peers and peers
+    /// without explicit support omit the field and are treated as unsupported so a sender can
+    /// safely fall back to Constrained Baseline.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub supports_high_profile: bool,
     pub timestamp_ms: u64,
 }
 
@@ -198,6 +203,7 @@ impl PeerAnnouncement {
             pin_hash: None,
             display: None,
             supports_fec: false,
+            supports_high_profile: false,
             timestamp_ms: now_ms(),
         }
     }
@@ -224,6 +230,11 @@ impl PeerAnnouncement {
 
     pub fn with_fec_support(mut self, supports_fec: bool) -> Self {
         self.supports_fec = supports_fec;
+        self
+    }
+
+    pub fn with_high_profile_support(mut self, supports_high_profile: bool) -> Self {
+        self.supports_high_profile = supports_high_profile;
         self
     }
 
@@ -663,19 +674,23 @@ mod tests {
             .with_display(
                 DisplayInfo::new(1920, 1080, Some(60)).with_decode_limits(Some((1920, 1088))),
             )
-            .with_fec_support(true);
+            .with_fec_support(true)
+            .with_high_profile_support(true);
         let decoded = PeerAnnouncement::decode(&announced.encode().unwrap()).unwrap();
         assert_eq!(decoded.display.unwrap().decode_limits(), Some((1920, 1088)));
         assert!(decoded.supports_fec);
+        assert!(decoded.supports_high_profile);
 
         let older = PeerAnnouncement::new("receiver-2", "receiver", PeerRole::Receiver, 5004)
             .with_display(DisplayInfo::new(1920, 1080, Some(60)));
         let encoded = String::from_utf8(older.encode().unwrap()).unwrap();
         assert!(!encoded.contains("max_decode"));
         assert!(!encoded.contains("supports_fec"));
+        assert!(!encoded.contains("supports_high_profile"));
         let decoded = PeerAnnouncement::decode(encoded.as_bytes()).unwrap();
         assert_eq!(decoded.display.unwrap().decode_limits(), None);
         assert!(!decoded.supports_fec);
+        assert!(!decoded.supports_high_profile);
     }
 
     #[test]

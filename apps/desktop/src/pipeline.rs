@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 const SENDER_VIDEO_ENCODER_NAME: &str = "sender_video_encoder";
 const SENDER_RTP_PAY_NAME: &str = "sender_rtp_pay";
 const SENDER_VIDEO_SINK_NAME: &str = "sender_video_sink";
-const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(1);
+const FORCE_KEY_UNIT_INTERVAL: Duration = Duration::from_secs(2);
+const MIN_KEY_UNIT_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 /// How long the receiver waits for video packets before deciding the stream is gone.
 ///
 /// Wi-Fi roaming, VPN tunnels, and radio power saving all produce gaps of a few seconds that the
@@ -120,6 +121,10 @@ pub struct SendArgs {
     /// Encoder to use. auto prefers GPU encoders.
     #[arg(long, value_enum, default_value_t = Encoder::Auto)]
     pub encoder: Encoder,
+
+    /// H.264 profile to negotiate or force. auto negotiates High when all peers advertise support.
+    #[arg(long, value_enum, default_value_t = H264Profile::Auto)]
+    pub h264_profile: H264Profile,
 
     /// GPU to encode on: "auto", a DXGI adapter index, or part of the adapter name.
     #[arg(long, default_value = crate::gpu::AUTO)]
@@ -245,6 +250,25 @@ pub enum Encoder {
     MediaFoundation,
     QuickSync,
     X264,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum H264Profile {
+    #[default]
+    Auto,
+    ConstrainedBaseline,
+    Main,
+    High,
+}
+
+impl H264Profile {
+    pub fn as_gst_profile(self) -> &'static str {
+        match self {
+            Self::Auto | Self::High => "high",
+            Self::Main => "main",
+            Self::ConstrainedBaseline => "constrained-baseline",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -529,6 +553,7 @@ struct SenderKeyUnitRequester {
     request_src: gst::Pad,
     schedule: KeyUnitSchedule,
     last_accepted: Option<bool>,
+    last_requested_at: Instant,
 }
 
 struct KeyUnitSchedule {
@@ -554,6 +579,13 @@ impl KeyUnitSchedule {
         self.next_request = now + FORCE_KEY_UNIT_INTERVAL;
         Some(count)
     }
+
+    fn next_count(&mut self, now: Instant) -> u32 {
+        let count = self.count;
+        self.count = self.count.wrapping_add(1);
+        self.next_request = now + FORCE_KEY_UNIT_INTERVAL;
+        count
+    }
 }
 
 impl SenderKeyUnitRequester {
@@ -566,10 +598,12 @@ impl SenderKeyUnitRequester {
             return None;
         };
 
+        let now = Instant::now();
         Some(Self {
             request_src,
-            schedule: KeyUnitSchedule::new(Instant::now()),
+            schedule: KeyUnitSchedule::new(now),
             last_accepted: None,
+            last_requested_at: now - MIN_KEY_UNIT_REQUEST_INTERVAL,
         })
     }
 
@@ -578,6 +612,20 @@ impl SenderKeyUnitRequester {
             return false;
         };
 
+        self.send_request(count, now)
+    }
+
+    fn request_immediate(&mut self, now: Instant) -> bool {
+        if now < self.last_requested_at + MIN_KEY_UNIT_REQUEST_INTERVAL {
+            return false;
+        }
+
+        let count = self.schedule.next_count(now);
+        self.send_request(count, now)
+    }
+
+    fn send_request(&mut self, count: u32, now: Instant) -> bool {
+        self.last_requested_at = now;
         let accepted = self
             .request_src
             .send_event(upstream_force_key_unit_event(count));
@@ -815,15 +863,21 @@ pub fn build_sender_video_pipeline_for(
         ));
     }
     crate::logging::append(format!(
-        "sender encoder={} frame-memory={} fps={} bitrate={}kbit/s udp-buffer={}bytes",
+        "sender encoder={} profile={:?} frame-memory={} fps={} bitrate={}kbit/s udp-buffer={}bytes",
         encoder.name(),
+        args.h264_profile,
         if use_d3d11_memory { "D3D11" } else { "system" },
         args.fps,
         args.bitrate,
         args.udp_buffer_size
     ));
     let caps = video_caps(args.fps, args.width, args.height, use_d3d11_memory);
-    let encoder_chain = encoder.chain(args.bitrate, args.fps, args.nvidia_tuning);
+    let encoder_chain = encoder.chain(
+        args.bitrate,
+        args.fps,
+        args.nvidia_tuning,
+        args.h264_profile,
+    );
     let fec_element = sender_fec_element(args.fec_percentage)?;
     let transport_chain = sender_video_transport_chain(
         args.mtu,
@@ -1374,7 +1428,12 @@ fn run_pipeline_until_stop_with_pacer(
         }
 
         if let Some(controller) = adaptive_bitrate.as_mut() {
-            controller.update(Instant::now(), &pipeline, sender_pacer.as_ref());
+            let loss_detected = controller.update(Instant::now(), &pipeline, sender_pacer.as_ref());
+            if loss_detected {
+                if let Some(requester) = key_unit_requester.as_mut() {
+                    requester.request_immediate(Instant::now());
+                }
+            }
         }
 
         if let Some(logged) = receiver_runtime_logged.as_mut() {
@@ -1482,18 +1541,20 @@ impl AdaptiveBitrateController {
         now: Instant,
         pipeline: &gst::Pipeline,
         sender_pacer: Option<&Arc<Mutex<SenderPacketPacer>>>,
-    ) {
+    ) -> bool {
         if now < self.next_update {
-            return;
+            return false;
         }
         self.next_update = now + ADAPTIVE_BITRATE_INTERVAL;
 
         let health = self.feedback.health();
+        let loss_detected =
+            health.receiver_count > 0 && (health.loss_ratio >= 0.02 || health.late_ratio >= 0.05);
         let Some(target) = self.next_target(health) else {
-            return;
+            return loss_detected;
         };
         if target == self.current {
-            return;
+            return loss_detected;
         }
 
         let encoder = pipeline.by_name(SENDER_VIDEO_ENCODER_NAME);
@@ -1508,7 +1569,7 @@ impl AdaptiveBitrateController {
             crate::logging::append(format!(
                 "adaptive sender bitrate target {target} kbit/s skipped: encoder does not accept runtime bitrate update"
             ));
-            return;
+            return loss_detected;
         }
 
         let previous = self.current;
@@ -1527,6 +1588,7 @@ impl AdaptiveBitrateController {
             health.jitter_ms.round() as u32,
             encoder_updated.unwrap_or(false),
         ));
+        loss_detected
     }
 
     fn next_target(&mut self, health: FeedbackHealth) -> Option<u32> {
@@ -1979,14 +2041,24 @@ impl SelectedEncoder {
         &self.element
     }
 
-    fn chain(&self, bitrate: u32, fps: u32, nvidia_tuning: NvidiaTuning) -> String {
+    fn chain(
+        &self,
+        bitrate: u32,
+        fps: u32,
+        nvidia_tuning: NvidiaTuning,
+        profile: H264Profile,
+    ) -> String {
         let element = &self.element;
+        let gop_size = (fps * 2).max(1);
         let properties = match self.family {
-            EncoderFamily::Nvidia => nvidia_encoder_properties(bitrate, fps, nvidia_tuning),
+            EncoderFamily::Nvidia => {
+                nvidia_encoder_properties(bitrate, fps, gop_size, nvidia_tuning)
+            }
             EncoderFamily::Amf => vec![
                 format!("bitrate={bitrate}"),
                 format!("max-bitrate={bitrate}"),
-                format!("gop-size={fps}"),
+                format!("gop-size={gop_size}"),
+                "b-frames=0".to_string(),
                 "usage=ultra-low-latency".to_string(),
                 "preset=speed".to_string(),
                 "rate-control=cbr".to_string(),
@@ -1995,34 +2067,38 @@ impl SelectedEncoder {
             EncoderFamily::MediaFoundation => vec![
                 format!("bitrate={bitrate}"),
                 format!("max-bitrate={bitrate}"),
-                format!("gop-size={fps}"),
+                format!("gop-size={gop_size}"),
                 "bframes=0".to_string(),
                 "low-latency=true".to_string(),
                 "rc-mode=cbr".to_string(),
                 "quality-vs-speed=0".to_string(),
+                "cabac=true".to_string(),
             ],
             EncoderFamily::QuickSync => vec![
                 format!("bitrate={bitrate}"),
-                format!("gop-size={fps}"),
+                format!("gop-size={gop_size}"),
                 "b-frames=0".to_string(),
                 "rc-lookahead=0".to_string(),
                 "rate-control=cbr".to_string(),
+                "target-usage=1".to_string(),
             ],
             EncoderFamily::X264 => vec![
                 format!("bitrate={bitrate}"),
                 "speed-preset=ultrafast".to_string(),
                 "tune=zerolatency".to_string(),
-                format!("key-int-max={fps}"),
+                format!("key-int-max={gop_size}"),
                 "bframes=0".to_string(),
+                "pass=cbr".to_string(),
                 "sliced-threads=true".to_string(),
                 "byte-stream=true".to_string(),
             ],
         };
         let properties = supported_properties(element, &properties);
+        let profile_str = profile.as_gst_profile();
 
         format!(
             "{element} name={SENDER_VIDEO_ENCODER_NAME}{properties} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au,profile=constrained-baseline"
+             ! video/x-h264,stream-format=byte-stream,alignment=au,profile={profile_str}"
         )
     }
 }
@@ -2060,14 +2136,20 @@ fn supported_properties(element: &str, properties: &[String]) -> String {
     kept
 }
 
-fn nvidia_encoder_properties(bitrate: u32, fps: u32, tuning: NvidiaTuning) -> Vec<String> {
+fn nvidia_encoder_properties(
+    bitrate: u32,
+    fps: u32,
+    gop_size: u32,
+    tuning: NvidiaTuning,
+) -> Vec<String> {
     let tuning = resolve_nvidia_tuning(tuning);
     let vbv_buffer_size = (bitrate / fps.max(1)).max(128);
     let mut properties = vec![
         format!("bitrate={bitrate}"),
         format!("max-bitrate={bitrate}"),
         format!("vbv-buffer-size={vbv_buffer_size}"),
-        format!("gop-size={fps}"),
+        format!("gop-size={gop_size}"),
+        "rc-mode=cbr".to_string(),
         "bframes=0".to_string(),
         "rc-lookahead=0".to_string(),
         "zerolatency=true".to_string(),
@@ -3481,18 +3563,33 @@ mod tests {
             element: "amfh264enc".to_string(),
             adapter_luid: None,
         }
-        .chain(8_000, 30, NvidiaTuning::Auto);
+        .chain(8_000, 30, NvidiaTuning::Auto, H264Profile::High);
         let media_foundation = SelectedEncoder {
             family: EncoderFamily::MediaFoundation,
             element: "mfh264enc".to_string(),
             adapter_luid: None,
         }
-        .chain(8_000, 30, NvidiaTuning::Auto);
+        .chain(8_000, 30, NvidiaTuning::Auto, H264Profile::High);
+        let x264 = SelectedEncoder {
+            family: EncoderFamily::X264,
+            element: "x264enc".to_string(),
+            adapter_luid: None,
+        }
+        .chain(
+            8_000,
+            30,
+            NvidiaTuning::Auto,
+            H264Profile::ConstrainedBaseline,
+        );
 
         assert!(amf.contains("usage=ultra-low-latency"));
         assert!(amf.contains("preset=speed"));
+        assert!(amf.contains("profile=high"));
         assert!(media_foundation.contains("quality-vs-speed=0"));
+        assert!(media_foundation.contains("profile=high"));
         assert!(!media_foundation.contains("quality-vs-speed=100"));
+        assert!(x264.contains("pass=cbr"));
+        assert!(x264.contains("profile=constrained-baseline"));
     }
 
     #[test]
@@ -3510,7 +3607,7 @@ mod tests {
                 element: family.base_element().to_string(),
                 adapter_luid: None,
             }
-            .chain(8_000, 30, NvidiaTuning::Auto);
+            .chain(8_000, 30, NvidiaTuning::Auto, H264Profile::High);
 
             assert!(
                 chain.contains(&format!("name={SENDER_VIDEO_ENCODER_NAME}")),
@@ -3532,7 +3629,7 @@ mod tests {
             let Some(encoder) = encoder_on_gpu(family, None) else {
                 continue;
             };
-            let chain = encoder.chain(8_000, 30, NvidiaTuning::Auto);
+            let chain = encoder.chain(8_000, 30, NvidiaTuning::Auto, H264Profile::High);
             // Only the element and its properties: the caps filter that follows uses commas, which
             // `bin.( ... )` reads as its own property separators.
             let element = chain.split(" ! ").next().expect("encoder element");
@@ -3554,6 +3651,15 @@ mod tests {
             None
         );
         assert_eq!(schedule.take_due(start + FORCE_KEY_UNIT_INTERVAL), Some(1));
+
+        // Immediate count advances schedule count and resets next periodic request
+        let immediate_count =
+            schedule.next_count(start + FORCE_KEY_UNIT_INTERVAL + Duration::from_millis(100));
+        assert_eq!(immediate_count, 2);
+        assert_eq!(
+            schedule.take_due(start + FORCE_KEY_UNIT_INTERVAL + Duration::from_millis(200)),
+            None
+        );
     }
 
     #[test]

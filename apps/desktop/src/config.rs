@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::pipeline::{
-    CaptureApi, Decoder, Encoder, NvidiaTuning, RecvArgs, Sampling, SendArgs, Sink,
+    CaptureApi, Decoder, Encoder, H264Profile, NvidiaTuning, RecvArgs, Sampling, SendArgs, Sink,
 };
 
 const CURRENT_CONFIG_VERSION: u32 = 4;
@@ -82,6 +82,8 @@ pub struct SendConfig {
     #[serde(default)]
     pub nvidia_tuning: ConfigNvidiaTuning,
     pub encoder: ConfigEncoder,
+    #[serde(default)]
+    pub h264_profile: ConfigH264Profile,
     /// GPU to encode on: "auto", a DXGI adapter index, or part of the adapter name.
     #[serde(default = "default_gpu")]
     pub gpu: String,
@@ -243,6 +245,43 @@ impl ConfigEncoder {
 
 #[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum ConfigH264Profile {
+    #[default]
+    Auto,
+    High,
+    Main,
+    ConstrainedBaseline,
+}
+
+impl ConfigH264Profile {
+    pub const ALL: [Self; 4] = [
+        Self::Auto,
+        Self::High,
+        Self::Main,
+        Self::ConstrainedBaseline,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::High => "high",
+            Self::Main => "main",
+            Self::ConstrainedBaseline => "constrained-baseline",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic (High when supported)",
+            Self::High => "High (Best Quality)",
+            Self::Main => "Main",
+            Self::ConstrainedBaseline => "Constrained Baseline (Maximum Compatibility)",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ConfigNvidiaTuning {
     #[default]
     Auto,
@@ -360,6 +399,7 @@ impl Default for SendConfig {
             allow_software_encoder: false,
             nvidia_tuning: ConfigNvidiaTuning::Auto,
             encoder: ConfigEncoder::Auto,
+            h264_profile: ConfigH264Profile::Auto,
             gpu: default_gpu(),
             capture_api: ConfigCaptureApi::Dxgi,
             zero_copy: true,
@@ -464,6 +504,7 @@ impl From<SendConfig> for SendArgs {
             allow_software_encoder: config.allow_software_encoder,
             nvidia_tuning: config.nvidia_tuning.into(),
             encoder: config.encoder.into(),
+            h264_profile: config.h264_profile.into(),
             gpu: config.gpu,
             capture_api: config.capture_api.into(),
             zero_copy: config.zero_copy,
@@ -506,6 +547,28 @@ impl From<ConfigEncoder> for Encoder {
             ConfigEncoder::MediaFoundation => Self::MediaFoundation,
             ConfigEncoder::QuickSync => Self::QuickSync,
             ConfigEncoder::X264 => Self::X264,
+        }
+    }
+}
+
+impl From<ConfigH264Profile> for H264Profile {
+    fn from(value: ConfigH264Profile) -> Self {
+        match value {
+            ConfigH264Profile::Auto => Self::Auto,
+            ConfigH264Profile::High => Self::High,
+            ConfigH264Profile::Main => Self::Main,
+            ConfigH264Profile::ConstrainedBaseline => Self::ConstrainedBaseline,
+        }
+    }
+}
+
+impl From<H264Profile> for ConfigH264Profile {
+    fn from(value: H264Profile) -> Self {
+        match value {
+            H264Profile::Auto => Self::Auto,
+            H264Profile::High => Self::High,
+            H264Profile::Main => Self::Main,
+            H264Profile::ConstrainedBaseline => Self::ConstrainedBaseline,
         }
     }
 }

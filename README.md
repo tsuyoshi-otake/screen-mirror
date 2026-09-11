@@ -22,14 +22,22 @@ The current published build is available from the [latest GitHub Release](https:
 adb install -r .\ScreenMirror-Android-debug.apk
 ```
 
-The desktop and Android package versions for this release are `0.1.66`.
+The desktop and Android package versions for this release are `0.1.67`.
 
-Release `v0.1.66` adds receiver visual diagnostics for blank or stale playback. While a receiver is
-active, the Windows client captures its visible renderer surface at low rate, stores the latest
-frame as a BMP, saves anomaly frames, and correlates pixel classification with decoder and sink
-flow. The diagnostic report now distinguishes a white/black renderer surface from a blank surface
-where no decoded frames reached the sink. This release also includes the RFC 5109 ULP-FEC sender
-pipeline validation introduced in `v0.1.65`.
+Release `v0.1.67` introduces comprehensive performance and pipeline optimizations across both
+desktop and Android:
+- **Desktop receiver overhead reduction**: Stopped continuous per-second BMP saving during normal
+  playback, throttled window enumeration and icon re-application, and separated sink-input FPS
+  from rendered FPS while maintaining wire compatibility.
+- **Redesigned RTP sender pacer**: Replaced per-packet sleeps with a token bucket rate limiter
+  (20ms burst allowance, 25ms delay cap), monitoring post-FEC packets and factoring multi-peer
+  fanout into pacing cost.
+- **H.264 profile negotiation & GPU encoding tuning**: Added dynamic negotiation for High/Main/Baseline
+  profiles, tuned vendor GPU encoders (NVIDIA, AMF, QuickSync, MediaFoundation) for ultra-low latency CBR,
+  relaxed periodic IDR to 2s, and introduced on-demand keyframe requests on packet loss.
+- **Android decoupled receiver pipeline**: Separated UDP packet reception from MediaCodec decoding,
+  added RTP 90kHz timestamp-based PTS tracking, ensured buffer ownership isolation, and enforced
+  strict IDR-based resynchronization.
 
 ## Transport Model
 

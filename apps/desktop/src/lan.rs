@@ -121,6 +121,7 @@ struct ReceiverTarget {
     host: String,
     display: Option<DisplayInfo>,
     supports_fec: bool,
+    supports_high_profile: bool,
 }
 
 #[derive(Default)]
@@ -466,7 +467,8 @@ impl Announcer {
                 .with_diagnostics_port(DIAGNOSTICS_PORT)
                 .with_fec_support(
                     matches!(role, PeerRole::Receiver) && crate::pipeline::fec_supported(),
-                );
+                )
+                .with_high_profile_support(matches!(role, PeerRole::Receiver));
         if let Some(display) = crate::monitors::primary_display_info() {
             announcement = announcement.with_display(display.with_decode_limits(decode_limits));
         }
@@ -577,9 +579,31 @@ pub fn resolve_sender_args(
     Ok((resolved.args, target))
 }
 
+fn negotiate_h264_profile(
+    configured: crate::pipeline::H264Profile,
+    receivers: &[ReceiverTarget],
+) -> crate::pipeline::H264Profile {
+    if configured != crate::pipeline::H264Profile::Auto {
+        return configured;
+    }
+    let all_support_high = !receivers.is_empty()
+        && receivers
+            .iter()
+            .all(|receiver| receiver.supports_high_profile);
+    if all_support_high {
+        log_sender("negotiated H.264 profile: High (supported by all discovered receivers)");
+        crate::pipeline::H264Profile::High
+    } else {
+        log_sender(
+            "negotiated H.264 profile: Constrained Baseline (one or more receivers do not advertise High profile support)",
+        );
+        crate::pipeline::H264Profile::ConstrainedBaseline
+    }
+}
+
 fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
     if !is_auto_host(&args.host) {
-        let receivers = args
+        let receivers: Vec<ReceiverTarget> = args
             .host
             .split(',')
             .map(str::trim)
@@ -588,10 +612,12 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
                 host: host.to_string(),
                 display: None,
                 // An explicit host is an operator assertion that the peer understands the
-                // optional FEC stream. Auto-discovery below is conservative and negotiates it.
+                // optional FEC stream and High profile. Auto-discovery below is conservative and negotiates it.
                 supports_fec: true,
+                supports_high_profile: true,
             })
             .collect();
+        args.h264_profile = negotiate_h264_profile(args.h264_profile, &receivers);
         return Ok(ResolvedSender { args, receivers });
     }
 
@@ -619,6 +645,7 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
             host: format!("{}:{}", peer.address, peer.announcement.stream_port),
             display: peer.announcement.display.clone(),
             supports_fec: peer.announcement.supports_fec,
+            supports_high_profile: peer.announcement.supports_high_profile,
         })
         .collect();
     args.host = selected
@@ -633,6 +660,8 @@ fn discover_sender_args(mut args: SendArgs) -> Result<ResolvedSender> {
         ));
         args.fec_percentage = 0;
     }
+
+    args.h264_profile = negotiate_h264_profile(args.h264_profile, &selected);
     Ok(ResolvedSender {
         args,
         receivers: selected,
@@ -665,7 +694,7 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
         .iter()
         .map(|receiver| match receiver.display.as_ref() {
             Some(display) => format!(
-                "{}@{}x{}@{}@{}@{}",
+                "{}@{}x{}@{}@{}@{}-profile@{}",
                 receiver.host,
                 display.width,
                 display.height,
@@ -676,6 +705,11 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
                     Some((width, height)) => format!("{width}x{height}"),
                     None => "unlimited".to_string(),
                 },
+                if receiver.supports_high_profile {
+                    "high"
+                } else {
+                    "baseline"
+                },
                 if receiver.supports_fec {
                     "fec"
                 } else {
@@ -683,8 +717,13 @@ fn receiver_set_key(receivers: &[ReceiverTarget]) -> String {
                 }
             ),
             None => format!(
-                "{}@unknown@{}",
+                "{}@unknown@{}-profile@{}",
                 receiver.host,
+                if receiver.supports_high_profile {
+                    "high"
+                } else {
+                    "baseline"
+                },
                 if receiver.supports_fec {
                     "fec"
                 } else {
@@ -887,8 +926,8 @@ fn device_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_video_size, ensure_virtual_target_count, receiver_set_key,
-        stable_unique_receivers, ReceiverTarget, SenderPreparationState,
+        effective_video_size, ensure_virtual_target_count, negotiate_h264_profile,
+        receiver_set_key, stable_unique_receivers, ReceiverTarget, SenderPreparationState,
     };
     use crate::monitors::DisplayMode;
     use sm_core::discovery::{DiscoveredPeer, DisplayInfo, PeerAnnouncement, PeerRole};
@@ -927,6 +966,7 @@ mod tests {
             host: "10.0.0.2:5004".to_string(),
             display: Some(DisplayInfo::new(1366, 768, Some(60))),
             supports_fec: false,
+            supports_high_profile: false,
         }];
         let initial = receiver_set_key(&receivers);
         receivers[0].display = Some(DisplayInfo::new(1920, 1080, Some(60)));
@@ -943,6 +983,48 @@ mod tests {
         let fec = receiver_set_key(&receivers);
         receivers[0].supports_fec = false;
         assert_ne!(fec, receiver_set_key(&receivers));
+
+        receivers[0].supports_high_profile = true;
+        let high_prof = receiver_set_key(&receivers);
+        receivers[0].supports_high_profile = false;
+        assert_ne!(high_prof, receiver_set_key(&receivers));
+    }
+
+    #[test]
+    fn profile_negotiation_picks_high_only_when_all_receivers_support_it() {
+        let mut receivers = vec![
+            ReceiverTarget {
+                host: "10.0.0.1:5004".to_string(),
+                display: None,
+                supports_fec: false,
+                supports_high_profile: true,
+            },
+            ReceiverTarget {
+                host: "10.0.0.2:5004".to_string(),
+                display: None,
+                supports_fec: false,
+                supports_high_profile: false,
+            },
+        ];
+
+        // Mixed: one does not support High -> ConstrainedBaseline
+        assert_eq!(
+            negotiate_h264_profile(crate::pipeline::H264Profile::Auto, &receivers),
+            crate::pipeline::H264Profile::ConstrainedBaseline
+        );
+
+        // Both support High -> High
+        receivers[1].supports_high_profile = true;
+        assert_eq!(
+            negotiate_h264_profile(crate::pipeline::H264Profile::Auto, &receivers),
+            crate::pipeline::H264Profile::High
+        );
+
+        // Explicit override: Main -> Main
+        assert_eq!(
+            negotiate_h264_profile(crate::pipeline::H264Profile::Main, &receivers),
+            crate::pipeline::H264Profile::Main
+        );
     }
 
     #[test]
